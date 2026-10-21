@@ -67,6 +67,7 @@ import {
   FolderIcon,
   FolderPlusIcon,
   MessageSquareDashedIcon,
+  LayoutDashboardIcon,
   LinkIcon,
   MessageSquareIcon,
   MonitorIcon,
@@ -2026,6 +2027,17 @@ function OpenCommandPaletteDialog(props: {
       },
     });
   }
+
+  actionItems.push({
+    kind: "action",
+    value: "action:operations",
+    searchTerms: ["operations", "dashboard", "board", "kanban", "agents", "workspace"],
+    title: "Open operations",
+    icon: <LayoutDashboardIcon className={ITEM_ICON_CLASS} />,
+    run: async () => {
+      await navigate({ to: "/operations" });
+    },
+  });
 
   actionItems.push({
     kind: "action",

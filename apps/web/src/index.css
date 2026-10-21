@@ -2383,3 +2383,176 @@ code {
     }
   }
 }
+
+/* Operations mockup visuals. Orbit, flow, and conflict pulse are compositor
+   transforms or stepped opacity, and they stop under reduced motion. */
+.ops-visual {
+  --ops-cluster-white: var(--color-zinc-100);
+  --ops-cluster-yellow: var(--color-yellow-300);
+  --ops-cluster-blue: var(--color-blue-400);
+  --ops-cluster-violet: var(--color-violet-400);
+  --ops-cluster-pink: var(--color-pink-400);
+  --ops-cluster-amber: var(--color-amber-400);
+  --ops-cluster-mint: var(--color-emerald-300);
+  --ops-cluster-sky: var(--color-sky-300);
+  --ops-link: rgb(255 255 255 / 22%);
+  --ops-link-strong: rgb(255 255 255 / 42%);
+}
+
+.ops-starfield {
+  background-color: var(--color-zinc-950);
+  background-image:
+    radial-gradient(1.2px 1.2px at 8% 16%, rgb(255 255 255 / 70%) 50%, transparent 52%),
+    radial-gradient(1px 1px at 18% 42%, rgb(255 255 255 / 40%) 50%, transparent 52%),
+    radial-gradient(1.4px 1.4px at 27% 12%, rgb(255 255 255 / 65%) 50%, transparent 52%),
+    radial-gradient(1px 1px at 36% 68%, rgb(255 255 255 / 35%) 50%, transparent 52%),
+    radial-gradient(1.2px 1.2px at 48% 22%, rgb(255 255 255 / 55%) 50%, transparent 52%),
+    radial-gradient(1px 1px at 58% 78%, rgb(255 255 255 / 40%) 50%, transparent 52%),
+    radial-gradient(1.3px 1.3px at 66% 30%, rgb(255 255 255 / 60%) 50%, transparent 52%),
+    radial-gradient(1px 1px at 74% 58%, rgb(255 255 255 / 32%) 50%, transparent 52%),
+    radial-gradient(1.2px 1.2px at 82% 18%, rgb(255 255 255 / 50%) 50%, transparent 52%),
+    radial-gradient(1px 1px at 90% 46%, rgb(255 255 255 / 38%) 50%, transparent 52%),
+    radial-gradient(1px 1px at 14% 82%, rgb(255 255 255 / 45%) 50%, transparent 52%),
+    radial-gradient(1.2px 1.2px at 42% 88%, rgb(255 255 255 / 30%) 50%, transparent 52%),
+    radial-gradient(1px 1px at 70% 90%, rgb(255 255 255 / 34%) 50%, transparent 52%),
+    radial-gradient(ellipse at 50% 46%, rgb(70 96 180 / 22%), transparent 62%);
+}
+
+.ops-starfield text {
+  fill: var(--color-zinc-100);
+}
+
+.ops-avatar-mark {
+  color: var(--color-zinc-950);
+}
+
+.ops-live {
+  position: relative;
+}
+
+.ops-live::after {
+  content: "";
+  position: absolute;
+  inset: -3px;
+  border-radius: inherit;
+  border: 2px solid var(--success);
+  animation: ops-pulse 2.4s steps(6) infinite;
+}
+
+.ops-orbit {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: ops-orbit 80s linear infinite;
+}
+
+.ops-flow {
+  stroke-dasharray: 3 8;
+  animation: ops-flow 2.8s linear infinite;
+}
+
+.ops-pulse {
+  animation: ops-pulse 2.4s steps(6) infinite;
+}
+
+.ops-sparkle {
+  animation: ops-sparkle 3.2s steps(4) infinite;
+}
+
+.ops-hatch {
+  background-color: var(--muted);
+  background-image: repeating-linear-gradient(
+    -45deg,
+    transparent,
+    transparent 3px,
+    color-mix(in srgb, var(--muted-foreground) 70%, transparent) 3px,
+    color-mix(in srgb, var(--muted-foreground) 70%, transparent) 4px
+  );
+}
+
+.ops-switch {
+  position: relative;
+  width: 2rem;
+  height: 1.125rem;
+  border: 1px solid var(--contrast-border);
+  border-radius: 999px;
+  background: var(--muted);
+}
+
+.ops-switch::after {
+  content: "";
+  position: absolute;
+  top: 1px;
+  left: 1px;
+  width: 0.8rem;
+  height: 0.8rem;
+  border-radius: 999px;
+  background: var(--color-zinc-50);
+  transition: transform 160ms ease;
+}
+
+.ops-switch[aria-checked="true"] {
+  background: var(--info);
+}
+
+.ops-switch[aria-checked="true"]::after {
+  transform: translateX(0.85rem);
+}
+
+.ops-refresh {
+  background-image: linear-gradient(
+    100deg,
+    var(--color-blue-500),
+    var(--color-violet-500) 55%,
+    var(--color-pink-500)
+  );
+  color: var(--color-zinc-50);
+}
+
+@keyframes ops-orbit {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes ops-flow {
+  to {
+    stroke-dashoffset: -44;
+  }
+}
+
+@keyframes ops-pulse {
+  0%,
+  40% {
+    opacity: 0.95;
+  }
+
+  50%,
+  90% {
+    opacity: 0.35;
+  }
+}
+
+@keyframes ops-sparkle {
+  0%,
+  40% {
+    opacity: 0.2;
+  }
+
+  55%,
+  100% {
+    opacity: 0.95;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ops-orbit,
+  .ops-flow,
+  .ops-pulse,
+  .ops-sparkle,
+  .ops-live::after,
+  .ops-switch::after,
+  .ops-drawer {
+    animation: none;
+    transition: none;
+  }
+}

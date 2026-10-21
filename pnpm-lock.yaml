@@ -826,6 +826,9 @@ importers:
       '@pierre/trees':
         specifier: 1.0.0-beta.6
         version: 1.0.0-beta.6(@pierre/theme@1.1.0)(@shikijs/themes@4.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)(shiki@4.2.0)
+      '@t3tools/ai-os-contracts':
+        specifier: workspace:*
+        version: link:../../packages/ai-os-contracts
       '@t3tools/client-runtime':
         specifier: workspace:*
         version: link:../../packages/client-runtime
