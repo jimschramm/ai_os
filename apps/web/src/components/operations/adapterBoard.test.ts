@@ -7,7 +7,14 @@ import {
 } from "@t3tools/ai-os-contracts";
 import * as Effect from "effect/Effect";
 
+import { encodeAdapterBoard } from "@t3tools/ai-os-adapter";
+
 import { tasksForBoard } from "./adapterBoard";
+import {
+  applyAdapterBoardPayload,
+  readAdapterBoardSnapshot,
+  subscribeAdapterBoard,
+} from "./adapterFeed";
 import { tasksForProject } from "./model";
 
 const at = "2026-10-21T18:00:00Z";
@@ -80,4 +87,43 @@ it.effect("reads adapter cards and keeps fixture tasks as the fallback", () =>
       "Live Saturday",
     );
   }),
+);
+
+it.effect("re-renders from a feed payload and falls back when the payload is empty", () =>
+  Effect.gen(function* () {
+    const live = yield* assigned("task-usba-page");
+    const payload = encodeAdapterBoard([
+      {
+        taskId: "task-usba-page",
+        title: "Live page",
+        state: live,
+        threadId: "t3-thread-1",
+        updatedAt: at,
+      },
+    ]);
+    const seen: number[] = [];
+    const stop = subscribeAdapterBoard(() => {
+      seen.push(readAdapterBoardSnapshot().length);
+    });
+    assert.strictEqual(applyAdapterBoardPayload(payload), true);
+    assert.strictEqual(seen.at(-1), 1);
+    const shown = tasksForBoard("usba", readAdapterBoardSnapshot());
+    assert.equal(
+      shown.some((task) => task.id === "task-usba-page" && task.title === "Live page"),
+      true,
+    );
+    assert.strictEqual(applyAdapterBoardPayload("not-json"), false);
+    assert.strictEqual(applyAdapterBoardPayload("[]"), true);
+    assert.deepStrictEqual(
+      tasksForBoard("usba", readAdapterBoardSnapshot()),
+      tasksForProject("usba"),
+    );
+    stop();
+  }).pipe(
+    Effect.ensuring(
+      Effect.sync(() => {
+        applyAdapterBoardPayload("[]");
+      }),
+    ),
+  ),
 );

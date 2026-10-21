@@ -1,12 +1,62 @@
+import * as NodeSocket from "@effect/platform-node/NodeSocket";
 import { ContextPackageSnapshotV1 } from "@t3tools/ai-os-contracts";
+import {
+  CommandId,
+  MessageId,
+  ORCHESTRATION_PROTOCOL_VERSION_TEXT,
+  ORCHESTRATION_V2_WS_METHODS,
+  OrchestrationV2Command,
+  OrchestrationV2DispatchCommandError,
+  OrchestrationV2GetThreadProjectionError,
+  OrchestrationV2GetThreadProjectionInput,
+  OrchestrationV2RpcSchemas,
+  OrchestrationV2ThreadLaunchError,
+  ProjectId,
+  ProviderInstanceId,
+  RunId,
+  ThreadId,
+  type OrchestrationV2ThreadProjection,
+} from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
-import * as Schema from "effect/Schema";
-import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/http";
+import * as Layer from "effect/Layer";
+import * as Schedule from "effect/Schedule";
+import { Rpc, RpcClient, RpcGroup, RpcSerialization } from "effect/rpc";
+import { RpcClientError } from "effect/rpc/RpcClientError";
 
 import { GrokT3Error } from "./errors.ts";
 
 /** Default origin of a local T3 server. Tests pass the fake server's origin instead. */
 export const T3_LOCAL_ORIGIN = "http://127.0.0.1:3773";
+
+/** Fields every launch sends besides the task title, prompt, and context. */
+export const T3_LAUNCH_DEFAULTS = {
+  instanceId: "codex",
+  runtimeMode: "full-access",
+  interactionMode: "default",
+  workspaceStrategy: { type: "root" },
+} as const;
+
+/**
+ * The three orchestration methods this adapter calls. Schemas are the real
+ * contract schemas, and the tags are the real websocket method names.
+ */
+export const T3OrchestrationRpc = RpcGroup.make(
+  Rpc.make(ORCHESTRATION_V2_WS_METHODS.launchThread, {
+    payload: OrchestrationV2RpcSchemas.launchThread.input,
+    success: OrchestrationV2RpcSchemas.launchThread.output,
+    error: OrchestrationV2ThreadLaunchError,
+  }),
+  Rpc.make(ORCHESTRATION_V2_WS_METHODS.dispatchCommand, {
+    payload: OrchestrationV2Command,
+    success: OrchestrationV2RpcSchemas.dispatchCommand.output,
+    error: OrchestrationV2DispatchCommandError,
+  }),
+  Rpc.make(ORCHESTRATION_V2_WS_METHODS.getThreadProjection, {
+    payload: OrchestrationV2GetThreadProjectionInput,
+    success: OrchestrationV2RpcSchemas.getThreadProjection.output,
+    error: OrchestrationV2GetThreadProjectionError,
+  }),
+);
 
 export interface T3LaunchRequest {
   readonly idempotencyKey: string;
@@ -14,140 +64,221 @@ export interface T3LaunchRequest {
   readonly title: string;
   readonly prompt: string;
   readonly contextPackage: ContextPackageSnapshotV1;
+  readonly model: string;
 }
 
 export interface T3LaunchResult {
   readonly threadId: string;
-  readonly created: boolean;
+  readonly runId: string | null;
+  readonly resumed: boolean;
 }
 
 export interface T3ThreadView {
   readonly threadId: string;
-  readonly status: "running" | "completed" | "interrupted";
+  readonly runId: string | null;
+  readonly status: "running" | "completed" | "interrupted" | "idle";
   readonly text: string | null;
   readonly revision: string | null;
   readonly inputTokens?: number;
   readonly outputTokens?: number;
 }
 
+export interface T3ContinueRequest {
+  readonly threadId: string;
+  readonly runId: string;
+  readonly commandId: string;
+  readonly messageId: string;
+  readonly text: string;
+}
+
 export interface T3LocalClient {
   readonly launch: (input: T3LaunchRequest) => Effect.Effect<T3LaunchResult, GrokT3Error>;
   readonly read: (threadId: string) => Effect.Effect<T3ThreadView, GrokT3Error>;
-  readonly stop: (threadId: string) => Effect.Effect<void, GrokT3Error>;
+  readonly interrupt: (threadId: string, runId: string) => Effect.Effect<void, GrokT3Error>;
+  readonly continueRun: (input: T3ContinueRequest) => Effect.Effect<void, GrokT3Error>;
 }
 
-const LaunchBody = Schema.Struct({
-  idempotencyKey: Schema.String,
-  projectId: Schema.String,
-  title: Schema.String,
-  prompt: Schema.String,
-  contextPackage: ContextPackageSnapshotV1,
-});
-
-const LaunchResult = Schema.Struct({
-  threadId: Schema.String,
-  created: Schema.Boolean,
-});
-
-const ThreadView = Schema.Struct({
-  threadId: Schema.String,
-  status: Schema.Literals(["running", "completed", "interrupted"]),
-  text: Schema.NullOr(Schema.String),
-  revision: Schema.NullOr(Schema.String),
-  inputTokens: Schema.optional(Schema.Number),
-  outputTokens: Schema.optional(Schema.Number),
-});
-
-const StopResult = Schema.Struct({
-  stopped: Schema.Boolean,
-});
-
-const unavailable = (method: string, url: string) =>
-  new GrokT3Error({
-    reason: "t3_unavailable",
-    detail: `T3 did not answer ${method} ${url}.`,
-  });
+const unavailable = (detail: string) => new GrokT3Error({ reason: "t3_unavailable", detail });
 
 const rejected = (detail: string) => new GrokT3Error({ reason: "t3_rejected", detail });
 
-const decodeJson = <A>(schema: Schema.Codec<A, string>, text: string) =>
-  Schema.decodeEffect(schema)(text).pipe(
-    Effect.mapError(() => rejected("T3 returned an unreadable payload.")),
+const detailOf = (error: { readonly message?: string }) =>
+  error.message !== undefined && error.message.length > 0
+    ? error.message
+    : "T3 rejected the request.";
+
+/** Stable command id for one launch payload. The same key reuses the same thread. */
+export const launchCommandId = (idempotencyKey: string): string => {
+  let hash = 5381;
+  for (let index = 0; index < idempotencyKey.length; index += 1) {
+    hash = (hash * 33 + idempotencyKey.charCodeAt(index)) | 0;
+  }
+  return `launch-${(hash >>> 0).toString(16)}`;
+};
+
+const socketUrl = (origin: string): string => {
+  const url = new URL(origin);
+  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+  url.pathname = "/ws";
+  url.search = "";
+  url.searchParams.set("orchestrationProtocol", ORCHESTRATION_PROTOCOL_VERSION_TEXT);
+  return url.toString();
+};
+
+const messageContext = (context: ContextPackageSnapshotV1) => ({
+  version: 1 as const,
+  records: [
+    {
+      version: 1 as const,
+      contextId: "context-package",
+      label: "Context package",
+      kind: "context-package",
+      payload: context,
+    },
+  ],
+});
+
+const viewFromProjection = (
+  threadId: string,
+  projection: OrchestrationV2ThreadProjection,
+): T3ThreadView => {
+  const run = projection.runs.at(-1);
+  const status =
+    run === undefined
+      ? "idle"
+      : run.status === "completed"
+        ? "completed"
+        : run.status === "interrupted" ||
+            run.status === "failed" ||
+            run.status === "cancelled" ||
+            run.status === "rolled_back"
+          ? "interrupted"
+          : "running";
+  const assistant = projection.messages.findLast(
+    (message) => message.role === "assistant" && message.text.length > 0,
+  );
+  const revision = projection.checkpoints.at(-1)?.ref ?? null;
+  const usage = projection.providerTurns.at(-1)?.tokenUsage;
+  return {
+    threadId,
+    runId: run?.id ?? null,
+    status,
+    text: assistant?.text ?? null,
+    revision,
+    ...(usage?.inputTokens === undefined ? {} : { inputTokens: usage.inputTokens }),
+    ...(usage?.outputTokens === undefined ? {} : { outputTokens: usage.outputTokens }),
+  };
+};
+
+type T3RpcClient = RpcClient.RpcClient.From<
+  RpcGroup.Rpcs<typeof T3OrchestrationRpc>,
+  RpcClientError
+>;
+
+const isGrokT3Error = (error: unknown): error is GrokT3Error =>
+  typeof error === "object" && error !== null && "_tag" in error && error._tag === "GrokT3Error";
+
+const withRpc = <A>(
+  origin: string,
+  use: (client: T3RpcClient) => Effect.Effect<A, GrokT3Error>,
+): Effect.Effect<A, GrokT3Error> =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const protocol = yield* RpcClient.makeProtocolSocket({
+        retryTransientErrors: false,
+        retryPolicy: Schedule.recurs(0),
+      });
+      const client = yield* RpcClient.make(T3OrchestrationRpc).pipe(
+        Effect.provideService(RpcClient.Protocol, protocol),
+      );
+      return yield* use(client);
+    }),
+  ).pipe(
+    Effect.provide(
+      Layer.mergeAll(
+        NodeSocket.layerWebSocket(socketUrl(origin), { openTimeout: "5 seconds" }),
+        RpcSerialization.layerJson,
+      ),
+    ),
+    Effect.mapError((error) =>
+      isGrokT3Error(error) ? error : unavailable(`T3 did not answer ${origin}.`),
+    ),
   );
 
-const exchange = (request: HttpClientRequest.HttpClientRequest, method: string, url: string) =>
-  Effect.gen(function* () {
-    const client = yield* HttpClient.HttpClient;
-    const response = yield* client
-      .execute(HttpClientRequest.acceptJson(request))
-      .pipe(Effect.mapError(() => unavailable(method, url)));
-    const text = yield* response.text.pipe(
-      Effect.mapError(() => rejected("T3 returned an unreadable payload.")),
-    );
-    return { status: response.status, text };
-  }).pipe(Effect.provide(FetchHttpClient.layer));
-
-const refuse = (action: string, status: number) =>
-  new GrokT3Error({
-    reason: "t3_rejected",
-    detail: `T3 refused the ${action} (${status}).`,
-  });
-
 /**
- * HTTP client for a local T3 server.
+ * Websocket client for a local T3 server.
  *
- * Launch posts the prompt and the ContextPackage. The real server creates threads
- * with the `orchestration.launchThread` websocket method and reads them at
- * `GET /api/orchestration/threads/:threadId`. This client uses the same origin and
- * path shape so a fake server can stand in. It does not spawn Codex and it does
- * not call an update endpoint. Codex stays the pinned extension binary.
+ * Launch is `orchestration.launchThread`. Cancel is `run.interrupt` with the
+ * run id. Continue is `message.dispatch` on the same thread with
+ * `manualContinuationOfRunId`. Reads use `orchestration.getThreadProjection`.
+ * Nothing here spawns Codex or calls an update endpoint.
  */
-export const httpT3LocalClient = (origin: string): T3LocalClient => {
-  const root = origin.replace(/\/$/, "");
+export const wsT3LocalClient = (origin: string): T3LocalClient => {
   const launch = (input: T3LaunchRequest) =>
-    Effect.gen(function* () {
-      const url = `${root}/api/orchestration/threads`;
-      const request = yield* HttpClientRequest.schemaBodyJson(LaunchBody)(
-        HttpClientRequest.post(url),
-        input,
-      ).pipe(Effect.mapError(() => rejected("Could not encode the T3 launch.")));
-      const response = yield* exchange(request, "POST", url);
-      if (response.status < 200 || response.status >= 300) {
-        return yield* refuse("launch", response.status);
-      }
-      return yield* decodeJson(Schema.fromJsonString(LaunchResult), response.text);
-    });
+    withRpc(origin, (client) =>
+      Effect.gen(function* () {
+        const result = yield* client[ORCHESTRATION_V2_WS_METHODS.launchThread]({
+          commandId: CommandId.make(launchCommandId(input.idempotencyKey)),
+          projectId: ProjectId.make(input.projectId),
+          title: input.title,
+          modelSelection: {
+            instanceId: ProviderInstanceId.make(T3_LAUNCH_DEFAULTS.instanceId),
+            model: input.model,
+          },
+          runtimeMode: T3_LAUNCH_DEFAULTS.runtimeMode,
+          interactionMode: T3_LAUNCH_DEFAULTS.interactionMode,
+          workspaceStrategy: T3_LAUNCH_DEFAULTS.workspaceStrategy,
+          initialMessage: {
+            text: input.prompt,
+            attachments: [],
+            context: messageContext(input.contextPackage),
+          },
+        }).pipe(Effect.mapError((error) => rejected(detailOf(error))));
+        return {
+          threadId: result.threadId,
+          runId: result.projection.runs.at(-1)?.id ?? null,
+          resumed: result.resumed,
+        };
+      }),
+    );
   const read = (threadId: string) =>
-    Effect.gen(function* () {
-      const url = `${root}/api/orchestration/threads/${encodeURIComponent(threadId)}`;
-      const response = yield* exchange(HttpClientRequest.get(url), "GET", url);
-      if (response.status < 200 || response.status >= 300) {
-        return yield* refuse("thread read", response.status);
-      }
-      const view = yield* decodeJson(Schema.fromJsonString(ThreadView), response.text);
-      return {
-        threadId: view.threadId,
-        status: view.status,
-        text: view.text,
-        revision: view.revision,
-        ...(view.inputTokens === undefined ? {} : { inputTokens: view.inputTokens }),
-        ...(view.outputTokens === undefined ? {} : { outputTokens: view.outputTokens }),
-      } satisfies T3ThreadView;
-    });
-  const stop = (threadId: string) =>
-    Effect.gen(function* () {
-      const url = `${root}/api/orchestration/threads/${encodeURIComponent(threadId)}/stop`;
-      const request = yield* HttpClientRequest.bodyJson(HttpClientRequest.post(url), {}).pipe(
-        Effect.mapError(() => rejected("Could not encode the T3 stop.")),
-      );
-      const response = yield* exchange(request, "POST", url);
-      if (response.status < 200 || response.status >= 300) {
-        return yield* refuse("stop", response.status);
-      }
-      const result = yield* decodeJson(Schema.fromJsonString(StopResult), response.text);
-      if (!result.stopped) {
-        return yield* rejected("T3 did not stop the thread.");
-      }
-    });
-  return { launch, read, stop };
+    withRpc(origin, (client) =>
+      Effect.gen(function* () {
+        const projection = yield* client[ORCHESTRATION_V2_WS_METHODS.getThreadProjection]({
+          threadId: ThreadId.make(threadId),
+        }).pipe(Effect.mapError((error) => rejected(detailOf(error))));
+        return viewFromProjection(threadId, projection);
+      }),
+    );
+  const interrupt = (threadId: string, runId: string) =>
+    withRpc(origin, (client) =>
+      client[ORCHESTRATION_V2_WS_METHODS.dispatchCommand]({
+        type: "run.interrupt",
+        commandId: CommandId.make(`interrupt-${threadId}-${runId}`),
+        threadId: ThreadId.make(threadId),
+        runId: RunId.make(runId),
+      }).pipe(
+        Effect.mapError((error) => rejected(detailOf(error))),
+        Effect.asVoid,
+      ),
+    );
+  const continueRun = (input: T3ContinueRequest) =>
+    withRpc(origin, (client) =>
+      client[ORCHESTRATION_V2_WS_METHODS.dispatchCommand]({
+        type: "message.dispatch",
+        commandId: CommandId.make(input.commandId),
+        createdBy: "user",
+        creationSource: "web",
+        threadId: ThreadId.make(input.threadId),
+        messageId: MessageId.make(input.messageId),
+        text: input.text,
+        attachments: [],
+        manualContinuationOfRunId: RunId.make(input.runId),
+        dispatchMode: { type: "start_immediately" },
+      }).pipe(
+        Effect.mapError((error) => rejected(detailOf(error))),
+        Effect.asVoid,
+      ),
+    );
+  return { launch, read, interrupt, continueRun };
 };

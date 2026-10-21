@@ -7,14 +7,26 @@ export {
   memorySessionStore,
   readAdapterBoard,
   renderPrompt,
+  subscribeAdapterFeed,
   type AdapterBoardCard,
   type AttemptSession,
   type GrokT3Adapter,
   type SessionStore,
 } from "./grokT3.ts";
 export {
+  ADAPTER_BOARD_EVENTS_PATH,
+  ADAPTER_BOARD_ORIGIN,
+  ADAPTER_BOARD_PATH,
+  adapterBoardLayer,
+  decodeAdapterBoard,
+  encodeAdapterBoard,
+} from "./boardFeed.ts";
+export {
+  T3_LAUNCH_DEFAULTS,
   T3_LOCAL_ORIGIN,
-  httpT3LocalClient,
+  launchCommandId,
+  wsT3LocalClient,
+  type T3ContinueRequest,
   type T3LaunchRequest,
   type T3LaunchResult,
   type T3LocalClient,

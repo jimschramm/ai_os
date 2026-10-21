@@ -1,4 +1,3 @@
-import { readAdapterBoard } from "@t3tools/ai-os-adapter";
 import { Badge } from "~/components/ui/badge";
 import { Button } from "~/components/ui/button";
 import { CircleAlertIcon, CircleHelpIcon } from "lucide-react";
@@ -20,6 +19,7 @@ import { CortexView } from "./CortexView";
 import { MemoryBrowser } from "./MemoryBrowser";
 import { UsageGauges } from "./UsageGauges";
 import { tasksForBoard } from "./adapterBoard";
+import { useAdapterBoard } from "./adapterFeed";
 import type { NeedsYouItem, OperationsProjectId, OperationsTask } from "./fixtures";
 import { INITIAL_MEMORY_REVIEW, type MemoryReviewState } from "./memoryModel";
 import {
@@ -55,7 +55,7 @@ export function OperationsDashboard() {
   const [review, setReview] = useState<MemoryReviewState>(INITIAL_MEMORY_REVIEW);
   const [memoryNotes, setMemoryNotes] = useState<Readonly<Record<string, string>>>({});
   const project = projectById(projectId);
-  const tasks = tasksForBoard(projectId, readAdapterBoard());
+  const tasks = tasksForBoard(projectId, useAdapterBoard());
   const selected = tasks.find((task) => task.id === selectedId) ?? null;
   const currentTask = tasks.find((task) => task.id === currentTaskId) ?? null;
   const openMemory = (factId: string | null) => {
