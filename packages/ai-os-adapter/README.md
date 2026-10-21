@@ -4,22 +4,20 @@
 
 The driver records one intake, launches it on a local T3 server, prints progress, and publishes the task to that server's `/api/ai-os/board`. `/operations` reads the same hub.
 
-The server prints a pairing URL at startup. Use the token from that URL.
+The server prints a pairing URL at startup. Export that token as `T3_PAIRING_TOKEN` before running the driver. The token is not accepted as an argument.
 
 List project ids:
 
 ```sh
-vp run --filter @t3tools/ai-os-adapter live-driver -- \
-  --list-projects \
-  --pairing-token "$T3_PAIRING_TOKEN"
+T3_PAIRING_TOKEN="<token>" vp run --filter @t3tools/ai-os-adapter live-driver -- \
+  --list-projects
 ```
 
-Launch one task. `--origin` defaults to `http://127.0.0.1:13773`. `--model` defaults to `gpt-5.4`. `T3_PAIRING_TOKEN` is used when `--pairing-token` is omitted. Omit `--project-id` to print the same list and stop.
+Launch one task. `--origin` defaults to `http://127.0.0.1:13773`. `--model` defaults to `gpt-5.4`. Omit `--project-id` to print the same list and stop.
 
 ```sh
-vp run --filter @t3tools/ai-os-adapter live-driver -- \
+T3_PAIRING_TOKEN="<token>" vp run --filter @t3tools/ai-os-adapter live-driver -- \
   --origin http://127.0.0.1:13773 \
-  --pairing-token "$T3_PAIRING_TOKEN" \
   --project-id <id> \
   --model gpt-5.4 \
   --title "Tournament page" \

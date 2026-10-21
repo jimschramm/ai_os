@@ -9,23 +9,23 @@ import { wsT3LocalClient, type T3LocalClient } from "./t3Client.ts";
 /** Dev-server port. Override with `--origin` when the server picked another one. */
 export const LIVE_DRIVER_DEFAULT_ORIGIN = "http://127.0.0.1:13773";
 
-/** Read by the CLI when `--pairing-token` is omitted. */
+/** Pairing token. Read from the environment so it is not echoed as a process argument. */
 export const LIVE_DRIVER_PAIRING_ENV = "T3_PAIRING_TOKEN";
 
 const DEFAULT_MODEL = "gpt-5.4";
 
 export const LIVE_DRIVER_HELP = `Record one intake on a local T3 server and publish it to /operations.
 
-vp run --filter @t3tools/ai-os-adapter live-driver -- --list-projects --pairing-token <token>
+Set ${LIVE_DRIVER_PAIRING_ENV} to the pairing token from the server startup URL.
+
+vp run --filter @t3tools/ai-os-adapter live-driver -- --list-projects
 vp run --filter @t3tools/ai-os-adapter live-driver -- \\
   --origin ${LIVE_DRIVER_DEFAULT_ORIGIN} \\
-  --pairing-token <token> \\
   --project-id <id> \\
   --model ${DEFAULT_MODEL} \\
   --title "Tournament page" \\
   --prompt "Update the tournament page schedule."
 
---pairing-token may be omitted when ${LIVE_DRIVER_PAIRING_ENV} is set.
 Omit --project-id to print the ids from GET /api/projects.`;
 
 export class LiveDriverUsageError extends Schema.TaggedError<LiveDriverUsageError>()(
@@ -82,6 +82,11 @@ export const parseLiveDriverArgs = (
   for (let index = 0; index < argv.length; index += 1) {
     const flag = argv[index];
     if (flag === "--") continue;
+    if (flag === "--pairing-token" || flag?.startsWith("--pairing-token=") === true) {
+      throw new LiveDriverUsageError({
+        detail: `Set ${LIVE_DRIVER_PAIRING_ENV}. A pairing token is not accepted as an argument.\n\n${LIVE_DRIVER_HELP}`,
+      });
+    }
     switch (flag) {
       case "--help":
       case "-h":
@@ -91,10 +96,6 @@ export const parseLiveDriverArgs = (
         break;
       case "--origin":
         origin = take(argv, index, flag);
-        index += 1;
-        break;
-      case "--pairing-token":
-        pairingToken = take(argv, index, flag);
         index += 1;
         break;
       case "--project-id":
@@ -122,7 +123,7 @@ export const parseLiveDriverArgs = (
 
   if (pairingToken === undefined || pairingToken.trim().length === 0) {
     throw new LiveDriverUsageError({
-      detail: `Pass --pairing-token or set ${LIVE_DRIVER_PAIRING_ENV}.\n\n${LIVE_DRIVER_HELP}`,
+      detail: `Set ${LIVE_DRIVER_PAIRING_ENV}.\n\n${LIVE_DRIVER_HELP}`,
     });
   }
 

@@ -27,6 +27,7 @@ import { ADAPTER_BOARD_PATH, decodeAdapterBoard } from "./board.ts";
 import { makeAdapterBoardHub } from "./boardHub.ts";
 import {
   LIVE_DRIVER_DEFAULT_ORIGIN,
+  LIVE_DRIVER_HELP,
   LiveDriverUsageError,
   parseLiveDriverArgs,
   runLiveDriver,
@@ -181,7 +182,7 @@ const readBoard = (origin: string) =>
     Effect.provide(FetchHttpClient.layer),
   );
 
-it.effect("parses the dev origin and refuses to start without a pairing token", () =>
+it.effect("reads the pairing token from the environment and rejects the flag", () =>
   Effect.sync(() => {
     const parsed = parseLiveDriverArgs(
       ["--", "--origin", "http://127.0.0.1:13773/", "--title", "Tournament page"],
@@ -193,12 +194,41 @@ it.effect("parses the dev origin and refuses to start without a pairing token", 
     assert.strictEqual(parsed.projectId, undefined);
 
     let missing = false;
+    let missingDetail = "";
     try {
       parseLiveDriverArgs(["--project-id", "usba"], {});
     } catch (error) {
       missing = isLiveDriverUsageError(error);
+      if (isLiveDriverUsageError(error)) missingDetail = error.detail;
     }
     assert.strictEqual(missing, true);
+    assert.equal(missingDetail.startsWith("Set T3_PAIRING_TOKEN."), true);
+
+    const secret = "pair-secret-value";
+    let rejected = false;
+    let rejectedDetail = "";
+    try {
+      parseLiveDriverArgs(["--pairing-token", secret, "--project-id", "usba"], {
+        T3_PAIRING_TOKEN: "env-token",
+      });
+    } catch (error) {
+      rejected = isLiveDriverUsageError(error);
+      if (isLiveDriverUsageError(error)) rejectedDetail = error.detail;
+    }
+    assert.strictEqual(rejected, true);
+    assert.equal(rejectedDetail.includes(secret), false);
+    assert.equal(LIVE_DRIVER_HELP.includes("--pairing-token"), false);
+
+    let inline = false;
+    let inlineDetail = "";
+    try {
+      parseLiveDriverArgs([`--pairing-token=${secret}`], { T3_PAIRING_TOKEN: "env-token" });
+    } catch (error) {
+      inline = isLiveDriverUsageError(error);
+      if (isLiveDriverUsageError(error)) inlineDetail = error.detail;
+    }
+    assert.strictEqual(inline, true);
+    assert.equal(inlineDetail.includes(secret), false);
   }),
 );
 
