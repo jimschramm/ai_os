@@ -45,12 +45,13 @@ export const TransferOwnershipCommandV1 = Schema.Struct({
 });
 export type TransferOwnershipCommandV1 = typeof TransferOwnershipCommandV1.Type;
 
-export const FailCommandV1 = Schema.Struct({
-  command: Schema.Literal("fail"),
+export const OperatorFailCommandV1 = Schema.Struct({
+  command: Schema.Literal("operator_fail"),
   ...controlFields,
+  actorId: ContractId,
   blocker: BlockerV1,
 });
-export type FailCommandV1 = typeof FailCommandV1.Type;
+export type OperatorFailCommandV1 = typeof OperatorFailCommandV1.Type;
 
 export const ResolveRecoveryCommandV1 = Schema.Union([
   Schema.Struct({
@@ -77,7 +78,7 @@ export const ControlCommandV1 = Schema.Union([
   ContinueCommandV1,
   RetryCommandV1,
   TransferOwnershipCommandV1,
-  FailCommandV1,
+  OperatorFailCommandV1,
   ResolveRecoveryCommandV1,
 ]);
 export type ControlCommandV1 = typeof ControlCommandV1.Type;

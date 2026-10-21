@@ -83,6 +83,16 @@ export const LeaseExpiredV1 = Schema.Struct({
 });
 export type LeaseExpiredV1 = typeof LeaseExpiredV1.Type;
 
+/** Worker-originated failure. Fenced by the open generation and lease. */
+export const WorkerFailV1 = Schema.Struct({
+  taskId: ContractId,
+  attemptId: ContractId,
+  generation: PositiveInt,
+  leaseId: ContractId,
+  blocker: BlockerV1,
+});
+export type WorkerFailV1 = typeof WorkerFailV1.Type;
+
 export const decodeProgressReportV1 = Schema.decodeUnknownEffect(ProgressReportV1, strictParse);
 export const decodeHeartbeatV1 = Schema.decodeUnknownEffect(HeartbeatV1, strictParse);
 export const decodeHeartbeatLapseV1 = Schema.decodeUnknownEffect(HeartbeatLapseV1, strictParse);

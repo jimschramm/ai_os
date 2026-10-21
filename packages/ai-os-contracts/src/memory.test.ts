@@ -285,7 +285,7 @@ it.effect("rejects vector candidates inside a context package and ineligible mem
   }),
 );
 
-it.effect("derives package membership from same-project SUPERSEDES edges", () =>
+it.effect("rejects a supersession graph whose status and edges disagree", () =>
   Effect.gen(function* () {
     const accepted = (factId: string, projectId = "usba") => ({
       acceptance: "accepted" as const,
@@ -297,6 +297,11 @@ it.effect("derives package membership from same-project SUPERSEDES edges", () =>
       validity: { from: at, until: null as string | null },
       acceptedBy: "jim",
       acceptedAt: at,
+    });
+    const superseded = (factId: string, supersededBy: string) => ({
+      ...accepted(factId),
+      acceptance: "superseded" as const,
+      supersededBy,
     });
     const supersedes = (fromId: string, toId: string, projectId = "usba") => ({
       acceptance: "accepted" as const,
@@ -310,42 +315,93 @@ it.effect("derives package membership from same-project SUPERSEDES edges", () =>
       acceptedBy: "jim",
       acceptedAt: at,
     });
-    const stillAccepted = yield* buildRetrieval(
+    const stillAccepted = yield* Effect.flip(
+      buildRetrieval(
+        {
+          facts: [accepted("decision-old"), accepted("decision-new")],
+          relationships: [supersedes("decision-new", "decision-old")],
+        },
+        request,
+        [],
+      ),
+    );
+    assert.strictEqual(stillAccepted.reason, "invalid_graph");
+    assert.strictEqual(stillAccepted.event, "retrieve");
+
+    const statusOnlyGraph = {
+      facts: [superseded("decision-old", "decision-new")],
+      relationships: [],
+    };
+    assert.deepStrictEqual(
+      packageFacts(statusOnlyGraph, "usba", at).map((item) => item.factId),
+      [],
+    );
+    const statusOnly = yield* Effect.flip(buildRetrieval(statusOnlyGraph, request, []));
+    assert.strictEqual(statusOnly.reason, "invalid_graph");
+
+    const cycle = yield* Effect.flip(
+      buildRetrieval(
+        {
+          facts: [superseded("decision-a", "decision-b"), superseded("decision-b", "decision-a")],
+          relationships: [
+            supersedes("decision-b", "decision-a"),
+            supersedes("decision-a", "decision-b"),
+          ],
+        },
+        request,
+        [],
+      ),
+    );
+    assert.strictEqual(cycle.reason, "invalid_graph");
+    assert.strictEqual(cycle.detail.includes("cycle"), true);
+
+    const selfEdge = yield* Effect.flip(
+      buildRetrieval(
+        {
+          facts: [accepted("decision-loop")],
+          relationships: [supersedes("decision-loop", "decision-loop")],
+        },
+        request,
+        [],
+      ),
+    );
+    assert.strictEqual(selfEdge.reason, "invalid_graph");
+
+    const crossProject = yield* Effect.flip(
+      buildRetrieval(
+        {
+          facts: [accepted("decision-new"), accepted("decision-old", "other")],
+          relationships: [supersedes("decision-new", "decision-old")],
+        },
+        { ...request, projectId: "other" },
+        [],
+      ),
+    );
+    assert.strictEqual(crossProject.reason, "invalid_graph");
+
+    const proposedOnly = yield* buildRetrieval(
       {
         facts: [accepted("decision-old"), accepted("decision-new")],
-        relationships: [supersedes("decision-new", "decision-old")],
-      },
-      request,
-      [],
-    );
-    assert.deepStrictEqual(stillAccepted.contextPackage.memoryVersions, ["decision-new"]);
-
-    const statusOnly = yield* buildRetrieval(
-      {
-        facts: [
+        relationships: [
           {
-            ...accepted("decision-old"),
-            acceptance: "superseded" as const,
-            supersededBy: "decision-new",
+            acceptance: "proposed" as const,
+            relationshipId: "rel-proposed",
+            projectId: "usba",
+            relationshipType: "SUPERSEDES" as const,
+            fromId: "decision-new",
+            toId: "decision-old",
+            provenance: { actorId: "jim", at },
+            validity: { from: at, until: null },
           },
         ],
-        relationships: [],
       },
       request,
       [],
     );
-    assert.deepStrictEqual(statusOnly.contextPackage.memoryVersions, ["decision-old"]);
-
-    const crossProject = {
-      facts: [accepted("decision-new"), accepted("decision-old", "other")],
-      relationships: [supersedes("decision-new", "decision-old")],
-    };
-    const otherPackage = yield* buildRetrieval(
-      crossProject,
-      { ...request, projectId: "other" },
-      [],
-    );
-    assert.deepStrictEqual(otherPackage.contextPackage.memoryVersions, ["decision-old"]);
+    assert.deepStrictEqual(proposedOnly.contextPackage.memoryVersions, [
+      "decision-old",
+      "decision-new",
+    ]);
 
     let graph = yield* applyMemoryEvent(initialMemoryGraph, {
       type: "propose_fact",
@@ -372,6 +428,13 @@ it.effect("derives package membership from same-project SUPERSEDES edges", () =>
       relationship: supersedes("decision-home", "decision-away"),
     });
     assert.strictEqual(crossed.reason, "memory_not_eligible");
+
+    const self = yield* failure(graph, {
+      type: "supersede",
+      relationship: supersedes("decision-home", "decision-home"),
+    });
+    assert.strictEqual(self.reason, "memory_not_eligible");
+    assert.strictEqual(self.detail.includes("itself"), true);
 
     const fractional = yield* buildRetrieval(
       {

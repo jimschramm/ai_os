@@ -46,6 +46,7 @@ export const ContractErrorReason = Schema.Literals([
   "delivery_revision_mismatch",
   "delivery_origin_mismatch",
   "memory_not_eligible",
+  "invalid_graph",
 ]);
 export type ContractErrorReason = typeof ContractErrorReason.Type;
 

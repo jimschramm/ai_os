@@ -1,6 +1,8 @@
 import * as Schema from "effect/Schema";
 import * as SchemaTransformation from "effect/SchemaTransformation";
 
+import { canonicalInstant } from "./canonical.ts";
+
 export const strictParse = { onExcessProperty: "error" as const };
 
 const boundedPattern = (max: number, pattern: RegExp) =>
@@ -219,7 +221,9 @@ export const ContractText = Schema.String.check(
 export type ContractText = typeof ContractText.Type;
 
 export const IsoDateTime = Schema.String.check(
-  Schema.isPattern(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/),
+  Schema.makeFilter((value: string) =>
+    canonicalInstant(value) !== null ? true : "Expected an RFC3339 UTC instant.",
+  ),
 );
 export type IsoDateTime = typeof IsoDateTime.Type;
 

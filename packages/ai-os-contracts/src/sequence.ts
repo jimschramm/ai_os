@@ -9,7 +9,7 @@ import {
   ContinueCommandV1,
   type ControlCommandV1,
   DEFAULT_RETRY_LIMIT,
-  FailCommandV1,
+  OperatorFailCommandV1,
   ResolveRecoveryCommandV1,
   RetryCommandV1,
   TransferOwnershipCommandV1,
@@ -44,6 +44,7 @@ import {
   HeartbeatV1,
   LeaseExpiredV1,
   ProgressReportV1,
+  WorkerFailV1,
 } from "./progress.ts";
 import { QaAcceptV1, QaReworkV1, QaUnavailableV1, QaVerdictV1 } from "./qa.ts";
 import { UsageMeasurementV1 } from "./usage.ts";
@@ -81,7 +82,8 @@ export const SequenceEvent = Schema.Union([
     type: Schema.Literal("transfer_ownership"),
     command: TransferOwnershipCommandV1,
   }),
-  Schema.Struct({ type: Schema.Literal("fail"), command: FailCommandV1 }),
+  Schema.Struct({ type: Schema.Literal("fail"), failure: WorkerFailV1 }),
+  Schema.Struct({ type: Schema.Literal("operator_fail"), command: OperatorFailCommandV1 }),
   Schema.Struct({ type: Schema.Literal("resolve_recovery"), command: ResolveRecoveryCommandV1 }),
   Schema.Struct({ type: Schema.Literal("deliver"), delivery: ResultDeliveryV1 }),
 ]);
@@ -392,6 +394,7 @@ export const LEGAL_EVENTS = {
     "report_usage",
     "cancel",
     "fail",
+    "operator_fail",
     "transfer_ownership",
   ],
   awaiting_qa: ["qa", "cancel"],
@@ -451,13 +454,14 @@ const contractFor = (event: SequenceEvent): ContractName => {
     case "continue":
     case "retry":
     case "transfer_ownership":
-    case "fail":
+    case "operator_fail":
     case "resolve_recovery":
       return "control";
     case "deliver":
       return "delivery";
     case "start_execution":
     case "lease_expired":
+    case "fail":
       return "sequence";
   }
 };
@@ -761,7 +765,7 @@ const controlCommandOf = (event: SequenceEvent): ControlCommandV1 | null => {
     case "continue":
     case "retry":
     case "transfer_ownership":
-    case "fail":
+    case "operator_fail":
     case "resolve_recovery":
       return event.command;
     default:
@@ -1081,6 +1085,33 @@ const applyFail = (
     if (state.phase !== "executing") {
       return yield* reject(state, event, "illegal_transition", `Cannot fail from ${state.phase}.`);
     }
+    yield* matchesWork(state, event, event.failure);
+    yield* requireLease(state, event, event.failure);
+    return {
+      phase: "failed" as const,
+      intake: state.intake,
+      acknowledgment: state.acknowledgment,
+      assignment: state.assignment,
+      reworkRevision: state.reworkRevision,
+      run: state.run,
+      commands: state.commands,
+      blocker: event.failure.blocker,
+    };
+  });
+
+const applyOperatorFail = (
+  state: SequenceState,
+  event: Extract<SequenceEvent, { type: "operator_fail" }>,
+): Effect.Effect<SequenceState, ContractTransitionError> =>
+  Effect.gen(function* () {
+    if (state.phase !== "executing") {
+      return yield* reject(
+        state,
+        event,
+        "illegal_transition",
+        `Cannot operator_fail from ${state.phase}.`,
+      );
+    }
     yield* matchesWork(state, event, event.command);
     const commands = yield* withCommand(state, event, event.command);
     return {
@@ -1269,6 +1300,8 @@ const transition = (
         return yield* applyTransfer(state, event);
       case "fail":
         return yield* applyFail(state, event);
+      case "operator_fail":
+        return yield* applyOperatorFail(state, event);
       case "resolve_recovery":
         return yield* applyResolveRecovery(state, event);
       case "deliver":
@@ -1333,9 +1366,11 @@ const contractNameOf = (value: unknown): ContractName => {
     case "continue":
     case "retry":
     case "transfer_ownership":
-    case "fail":
+    case "operator_fail":
     case "resolve_recovery":
       return "control";
+    case "fail":
+      return "sequence";
     case "deliver":
       return "delivery";
     default:

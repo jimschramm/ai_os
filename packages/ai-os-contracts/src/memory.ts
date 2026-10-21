@@ -195,10 +195,9 @@ export type MemoryEvent = typeof MemoryEvent.Type;
 const covers = (window: { readonly from: string; readonly until: string | null }, asOf: string) =>
   timeAtOrBefore(window.from, asOf) && (window.until === null || timeBefore(asOf, window.until));
 
-export type EligibleFactV1 = AcceptedFactV1 | SupersededFactV1;
+export type EligibleFactV1 = AcceptedFactV1;
 
 const supersededFactIds = (graph: MemoryGraphV1, projectId: string, asOf: string): Set<string> => {
-  const projectOf = new Map(graph.facts.map((fact) => [fact.factId, fact.projectId]));
   const superseded = new Set<string>();
   for (const relationship of graph.relationships) {
     if (
@@ -206,12 +205,6 @@ const supersededFactIds = (graph: MemoryGraphV1, projectId: string, asOf: string
       relationship.relationshipType !== "SUPERSEDES" ||
       relationship.projectId !== projectId ||
       !covers(relationship.validity, asOf)
-    ) {
-      continue;
-    }
-    if (
-      projectOf.get(relationship.fromId) !== projectId ||
-      projectOf.get(relationship.toId) !== projectId
     ) {
       continue;
     }
@@ -228,7 +221,7 @@ export const packageFacts = (
   const superseded = supersededFactIds(graph, projectId, asOf);
   return graph.facts.filter(
     (fact): fact is EligibleFactV1 =>
-      fact.acceptance !== "proposed" &&
+      fact.acceptance === "accepted" &&
       fact.projectId === projectId &&
       covers(fact.validity, asOf) &&
       !superseded.has(fact.factId),
@@ -274,6 +267,93 @@ const invalidMemory = (event: string, detail: string) =>
     event,
     detail,
   });
+
+const invalidGraph = (event: string, detail: string) =>
+  new ContractTransitionError({
+    contract: "memory",
+    reason: "invalid_graph",
+    from: "idle",
+    event,
+    detail,
+  });
+
+/**
+ * Status is an invariant of the accepted SUPERSEDES edges, not a second source
+ * of eligibility. A superseded fact without a matching edge, an accepted edge
+ * whose target is still accepted, a self-edge, a cross-project edge, or a cycle
+ * is not a graph we can package.
+ */
+const supersessionInvariant = (graph: MemoryGraphV1): string | null => {
+  const facts = new Map(graph.facts.map((fact) => [fact.factId, fact]));
+  const acceptedEdges: Array<AcceptedRelationshipV1> = [];
+  for (const relationship of graph.relationships) {
+    if (relationship.relationshipType !== "SUPERSEDES") {
+      continue;
+    }
+    if (relationship.fromId === relationship.toId) {
+      return "A fact cannot supersede itself.";
+    }
+    const newer = facts.get(relationship.fromId);
+    const older = facts.get(relationship.toId);
+    if (newer === undefined || older === undefined) {
+      return "A SUPERSEDES edge names a fact that is not in the graph.";
+    }
+    if (newer.projectId !== older.projectId || relationship.projectId !== newer.projectId) {
+      return "A SUPERSEDES edge stays inside one project.";
+    }
+    if (relationship.acceptance !== "accepted") {
+      continue;
+    }
+    if (older.acceptance !== "superseded" || older.supersededBy !== relationship.fromId) {
+      return "An accepted SUPERSEDES edge requires the older fact to be superseded by the newer fact.";
+    }
+    acceptedEdges.push(relationship);
+  }
+  for (const fact of graph.facts) {
+    if (fact.acceptance !== "superseded") {
+      continue;
+    }
+    const matched = acceptedEdges.some(
+      (edge) =>
+        edge.toId === fact.factId &&
+        edge.fromId === fact.supersededBy &&
+        edge.projectId === fact.projectId,
+    );
+    if (!matched) {
+      return "A superseded fact requires an accepted SUPERSEDES edge.";
+    }
+  }
+  const next = new Map<string, Array<string>>();
+  for (const edge of acceptedEdges) {
+    const targets = next.get(edge.fromId) ?? [];
+    targets.push(edge.toId);
+    next.set(edge.fromId, targets);
+  }
+  const color = new Map<string, 0 | 1 | 2>();
+  const visit = (factId: string): boolean => {
+    const seen = color.get(factId) ?? 0;
+    if (seen === 1) {
+      return true;
+    }
+    if (seen === 2) {
+      return false;
+    }
+    color.set(factId, 1);
+    for (const target of next.get(factId) ?? []) {
+      if (visit(target)) {
+        return true;
+      }
+    }
+    color.set(factId, 2);
+    return false;
+  };
+  for (const factId of next.keys()) {
+    if (visit(factId)) {
+      return "SUPERSEDES edges form a cycle.";
+    }
+  }
+  return null;
+};
 
 const applyMemory = (
   graph: MemoryGraphV1,
@@ -322,6 +402,9 @@ const applyMemory = (
   if (older === undefined || older.acceptance !== "accepted") {
     return Effect.fail(memoryError(event.type, "The older fact must already be accepted."));
   }
+  if (newer.factId === older.factId) {
+    return Effect.fail(memoryError(event.type, "A fact cannot supersede itself."));
+  }
   if (newer.projectId !== older.projectId || event.relationship.projectId !== newer.projectId) {
     return Effect.fail(memoryError(event.type, "A relationship stays inside one project."));
   }
@@ -347,7 +430,26 @@ const applyMemory = (
 
 const decodeCandidates = Schema.decodeUnknownEffect(Schema.Array(MemoryCandidateV1), strictParse);
 
-export const decodeMemoryGraphV1 = Schema.decodeUnknownEffect(MemoryGraphV1, strictParse);
+const decodeMemoryGraphStruct = Schema.decodeUnknownEffect(MemoryGraphV1, strictParse);
+
+const decodeGraph = (
+  graph: unknown,
+  event: string,
+): Effect.Effect<MemoryGraphV1, ContractTransitionError> =>
+  Effect.gen(function* () {
+    const decoded = yield* decodeMemoryGraphStruct(graph).pipe(
+      Effect.mapError(() => invalidMemory(event, "The memory graph does not match the schema.")),
+    );
+    const problem = supersessionInvariant(decoded);
+    if (problem !== null) {
+      return yield* invalidGraph(event, problem);
+    }
+    return decoded;
+  });
+
+export const decodeMemoryGraphV1 = (
+  graph: unknown,
+): Effect.Effect<MemoryGraphV1, ContractTransitionError> => decodeGraph(graph, "memory");
 export const decodeMemoryEvent = Schema.decodeUnknownEffect(MemoryEvent, strictParse);
 export const decodeRetrievalRequestV1 = Schema.decodeUnknownEffect(RetrievalRequestV1, strictParse);
 export const decodeRetrievalResponseV1 = Schema.decodeUnknownEffect(
@@ -362,22 +464,14 @@ export const applyMemoryEvent = (
   event: unknown,
 ): Effect.Effect<MemoryGraphV1, ContractTransitionError> =>
   Effect.gen(function* () {
-    const decodedGraph = yield* decodeMemoryGraphV1(graph).pipe(
-      Effect.mapError(() =>
-        invalidMemory(eventTypeOf(event), "The memory graph does not match the schema."),
-      ),
-    );
+    const decodedGraph = yield* decodeGraph(graph, eventTypeOf(event));
     const decodedEvent = yield* decodeMemoryEvent(event).pipe(
       Effect.mapError(() =>
         invalidMemory(eventTypeOf(event), "The memory event does not match the schema."),
       ),
     );
     const next = yield* applyMemory(decodedGraph, decodedEvent);
-    return yield* decodeMemoryGraphV1(next).pipe(
-      Effect.mapError(() =>
-        invalidMemory(decodedEvent.type, "The resulting graph does not match the schema."),
-      ),
-    );
+    return yield* decodeGraph(next, decodedEvent.type);
   });
 
 export const buildRetrieval = (
@@ -386,11 +480,7 @@ export const buildRetrieval = (
   candidates: unknown,
 ): Effect.Effect<RetrievalResponseV1, ContractTransitionError> =>
   Effect.gen(function* () {
-    const decodedGraph = yield* decodeMemoryGraphV1(graph).pipe(
-      Effect.mapError(() =>
-        invalidMemory("retrieve", "The memory graph does not match the schema."),
-      ),
-    );
+    const decodedGraph = yield* decodeGraph(graph, "retrieve");
     const decodedRequest = yield* decodeRetrievalRequestV1(request).pipe(
       Effect.mapError(() =>
         invalidMemory("retrieve", "The retrieval request does not match the schema."),

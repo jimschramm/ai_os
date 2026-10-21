@@ -493,7 +493,41 @@ it.effect("rejects schema-invalid input on every transition", () =>
             idempotencyKey: "fail-1",
             taskId: "task-usba-page",
             attemptId: "attempt-1",
+            blocker: {
+              summary: "The build failed.",
+              ownerId: "t3-codex",
+              nextAction: "Read the log.",
+            },
+          },
+        },
+      ],
+      [
+        executing,
+        {
+          type: "fail",
+          failure: {
+            taskId: "task-usba-page",
+            attemptId: "attempt-1",
+            generation: 1,
+            leaseId: "lease-1",
             blocker: { summary: "The build failed.", ownerId: "t3-codex", nextAction: " " },
+          },
+        },
+      ],
+      [
+        executing,
+        {
+          type: "operator_fail",
+          command: {
+            command: "operator_fail",
+            idempotencyKey: "fail-1",
+            taskId: "task-usba-page",
+            attemptId: "attempt-1",
+            blocker: {
+              summary: "The build failed.",
+              ownerId: "t3-codex",
+              nextAction: "Read the log.",
+            },
           },
         },
       ],

@@ -10,29 +10,29 @@ The package is `@t3tools/ai-os-contracts` (`packages/ai-os-contracts`). Schemas 
 
 Request, assignment, execution, independent QA, rework, accepted result. Progress, usage, control, and delivery extend that sequence. Shared memory is a separate graph.
 
-| Phase            | Kanban  | Legal events                                                                                                                   |
-| ---------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------ |
-| idle             |         | intake                                                                                                                         |
-| requested        |         | acknowledge                                                                                                                    |
-| acknowledged     | Ready   | assign                                                                                                                         |
-| assigned         | Ready   | start_execution, cancel, transfer_ownership                                                                                    |
-| executing        | Running | submit_completion, lease_expired, report_progress, heartbeat, heartbeat_lapsed, report_usage, cancel, fail, transfer_ownership |
-| awaiting_qa      | Review  | qa, cancel                                                                                                                     |
-| rework           | Ready   | start_execution, cancel                                                                                                        |
-| accepted         | Done    | start_execution, deliver                                                                                                       |
-| recovery_pending | Blocked | resolve_recovery                                                                                                               |
-| failed           |         | retry                                                                                                                          |
-| cancelled        |         | continue                                                                                                                       |
+| Phase            | Kanban  | Legal events                                                                                                                                  |
+| ---------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| idle             |         | intake                                                                                                                                        |
+| requested        |         | acknowledge                                                                                                                                   |
+| acknowledged     | Ready   | assign                                                                                                                                        |
+| assigned         | Ready   | start_execution, cancel, transfer_ownership                                                                                                   |
+| executing        | Running | submit_completion, lease_expired, report_progress, heartbeat, heartbeat_lapsed, report_usage, cancel, fail, operator_fail, transfer_ownership |
+| awaiting_qa      | Review  | qa, cancel                                                                                                                                    |
+| rework           | Ready   | start_execution, cancel                                                                                                                       |
+| accepted         | Done    | start_execution, deliver                                                                                                                      |
+| recovery_pending | Blocked | resolve_recovery                                                                                                                              |
+| failed           |         | retry                                                                                                                                         |
+| cancelled        |         | continue                                                                                                                                      |
 
 `requested` is the durable receipt of the intake. It is not confirmed, and it is not on the board yet. Acknowledge is the confirmation, and it carries the task link. A later `start_execution` from `accepted` drops the previous acceptance, so a new revision has to be submitted and reviewed again. `failed` and `cancelled` are off the board.
 
 `SequenceState` is a discriminated union on `phase`. A phase only decodes with the records that phase requires. `accepted` requires the assignment, the completion, an available accept verdict, and the delivery acks. `awaiting_qa` can carry only an unavailable verdict. `recovery_pending` requires the label `Execution status unknown`. A payload that is only `{ phase: "accepted" }` does not decode.
 
-An open attempt has a generation and a lease id minted for that generation (`lease-1` for generation 1). A new start, a retry, and an ownership transfer while executing each move to the next generation and lease, and clear the lease expiry and partial progress. Worker events — progress, heartbeat, heartbeat lapse, usage, completion, and lease expiry — carry that generation and lease id. A write that names any other pair is `stale_generation` and leaves the run where it is.
+An open attempt has a generation and a lease id minted for that generation (`lease-1` for generation 1). A new start, a retry, and an ownership transfer while executing each move to the next generation and lease, and clear the lease expiry and partial progress. Worker events — progress, heartbeat, heartbeat lapse, usage, completion, lease expiry, and `fail` — carry that generation and lease id. A write that names any other pair is `stale_generation` and leaves the run where it is. `operator_fail` is not a worker event. It is a control command with an actor and an idempotency key.
 
 ## Intake
 
-`IntakeV1` carries the workspace, project, request, constraints, acceptance criteria, authorization (`standing` or `explicit`), and the originating conversation id. That id is stored in canonical lowercase form.
+`IntakeV1` carries the workspace, project, request, constraints, acceptance criteria, authorization (`standing` or `explicit`), and the originating conversation id. That id is opaque and case-sensitive. Leading and trailing whitespace is trimmed. Any remaining whitespace, control character, or zero-width character is rejected. `Thread-A` and `thread-a` are different conversations. Model names and git object ids stay case-insensitive.
 
 `IntakeAcknowledgmentV1` is a separate payload. `durable` is the literal `true`. `taskLink` must be exactly `ai-os://tasks/{taskId}`: that scheme, that path, and no extra segment, query, or fragment. A string that only contains the task id is not a link. A `false` durable flag, a missing link, or an acknowledgment before the intake fails. The failure before any intake is `confirmation_before_durable_receipt`.
 
@@ -60,11 +60,11 @@ QA's model name must differ from the assignment's implementer model name. A mode
 
 `ProgressReportV1` is a snapshot for the open generation and lease: `working` or `blocked`, blockers, and partial artifacts. A blocked report needs at least one blocker. A blocker names the summary, the owner, and a concrete next action. A working report cannot carry blockers. Partial artifacts use the same revision types as completion, so an abbreviated git id is rejected. The stored report is frozen.
 
-`HeartbeatV1` names the generation, the lease id, and when that lease expires. The expiry is compared as an instant, so `2026-10-21T15:00:00.001Z` is after `2026-10-21T15:00:00Z`. A heartbeat refreshes `leaseExpiresAt` only when both the generation and the stored lease id match. It does not replace the lease id. `heartbeat_lapsed` and `lease_expired` for that same pair move `executing` to `recovery_pending`. A stale pair is rejected and leaves the run executing. Neither event returns the attempt to Ready.
+`HeartbeatV1` names the generation, the lease id, and when that lease expires. Instants are RFC3339 UTC with a `Z` suffix. The month, day (including leap years), hour, minute, and second are range-checked, and the parsed value must format back to the same string. A leap second (`60`) and `24:00` are rejected. Decode keeps the submitted text, so `.1Z` is not rewritten to `.100Z`. Ordering still compares the instants: `.1Z` and `.100Z` are the same millisecond, and `.001Z` is after a whole second. A heartbeat refreshes `leaseExpiresAt` only when both the generation and the stored lease id match. It does not replace the lease id. `heartbeat_lapsed` and `lease_expired` for that same pair move `executing` to `recovery_pending`. A stale pair is rejected and leaves the run executing. Neither event returns the attempt to Ready.
 
 ## Shared memory
 
-Node kinds and relationship types are the ones in [the memory schema](../memory-schema.md). `MemoryGraphV1` stores facts and relationships. A fact is `proposed`, `accepted`, or `superseded`. A relationship is `proposed` or `accepted`. Both carry provenance (who, when) and a validity window. Proposed is not knowledge. `accept_fact` is the explicit acceptance. `supersede` records an accepted `SUPERSEDES` relationship from the newer accepted fact to the older accepted fact. The older fact stays in the graph. `historyFacts` returns both. `packageFacts` returns facts in that project whose window covers `asOf`, excluding anything still only proposed. An accepted `SUPERSEDES` edge that is valid at `asOf` and stays inside that project removes the older fact, whatever status the fact record stores. A proposed edge does not. A relationship whose endpoints are in different projects is rejected. There is no shared-scope exception in v1. Windows are compared as instants.
+Node kinds and relationship types are the ones in [the memory schema](../memory-schema.md). `MemoryGraphV1` stores facts and relationships. A fact is `proposed`, `accepted`, or `superseded`. A relationship is `proposed` or `accepted`. Both carry provenance (who, when) and a validity window. Proposed is not knowledge. `accept_fact` is the explicit acceptance. `supersede` records an accepted `SUPERSEDES` relationship from the newer accepted fact to the older accepted fact and marks the older fact `superseded`. A fact cannot supersede itself. The older fact stays in the graph. `historyFacts` returns accepted and superseded facts. `packageFacts` returns accepted facts in that project whose window covers `asOf` and that are not the target of an accepted `SUPERSEDES` edge valid at `asOf`. A superseded fact is never current. Graph decode checks that status against the edges. A superseded fact without a matching accepted edge, an accepted edge whose target is not superseded by that newer fact, a self-edge, a cross-project `SUPERSEDES` edge, or a cycle of accepted `SUPERSEDES` edges is `invalid_graph`. That graph is rejected. It is not packaged as an empty current set. A proposed edge does not supersede. There is no shared-scope exception in v1. Windows are compared as instants.
 
 `buildRetrieval` builds that package from the graph first, then attaches `candidates` beside it. Candidates cannot add, remove, or reorder package entries. The package schema itself has no candidates field. This contract does not write total-agent-memory.
 
@@ -80,7 +80,7 @@ Control commands carry an idempotency key. That key is not a completion claim. T
 | -------------------- | ---------------------------------------- | ----------------------------------------------------------------------------------- |
 | `cancel`             | assigned, executing, awaiting_qa, rework | `cancelled`. Off the board.                                                         |
 | `continue`           | cancelled                                | `assigned` (Ready). This is the only way back from cancelled.                       |
-| `fail`               | executing                                | `failed`, with a blocker. Off the board.                                            |
+| `operator_fail`      | executing                                | `failed`, with an actor and a blocker. Off the board. Not fenced by the lease.      |
 | `retry`              | failed                                   | `executing` at the next generation, until `retryCount` reaches `retryLimit` (3).    |
 | `transfer_ownership` | assigned, executing                      | The worker changes. An executing transfer also advances the generation.             |
 | `resolve_recovery`   | recovery_pending                         | `continue` returns to Ready, `cancel` leaves the board, `fail` records the blocker. |
@@ -95,24 +95,25 @@ Control commands carry an idempotency key. That key is not a completion claim. T
 
 Invalid payloads fail schema decode. These transition errors are `ContractTransitionError`:
 
-| Reason                                | When                                                                                                          |
-| ------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
-| `confirmation_before_durable_receipt` | Acknowledge before the intake is recorded.                                                                    |
-| `illegal_transition`                  | The event is not legal for the phase.                                                                         |
-| `task_mismatch`                       | The payload task or usage project is not the acknowledged work.                                               |
-| `attempt_mismatch`                    | The payload attempt is not the open assignment.                                                               |
-| `implementer_mismatch`                | QA names a different implementer than the assignment.                                                         |
-| `qa_same_model`                       | QA uses the implementer's model.                                                                              |
-| `revision_mismatch`                   | Rework submits the same artifact revision again.                                                              |
-| `acceptance_revision_mismatch`        | QA or acceptance names a revision other than the submitted one, or the revision already sent back for rework. |
-| `recovery_pending_not_ready`          | Any event other than `resolve_recovery` while recovery is pending.                                            |
-| `invalid_payload`                     | The state, event, or result does not match its schema.                                                        |
-| `stale_generation`                    | A worker event names a generation or lease other than the open run.                                           |
-| `retry_limit_reached`                 | Retry was asked at the retry limit.                                                                           |
-| `idempotency_conflict`                | The idempotency key was already used for a different payload.                                                 |
-| `delivery_revision_mismatch`          | Delivery names a revision other than the accepted one.                                                        |
-| `delivery_origin_mismatch`            | A conversation delivery does not name the intake's originating conversation.                                  |
-| `memory_not_eligible`                 | The event is not acceptance of a proposed fact, or not a same-project supersession of two accepted facts.     |
+| Reason                                | When                                                                                                               |
+| ------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| `confirmation_before_durable_receipt` | Acknowledge before the intake is recorded.                                                                         |
+| `illegal_transition`                  | The event is not legal for the phase.                                                                              |
+| `task_mismatch`                       | The payload task or usage project is not the acknowledged work.                                                    |
+| `attempt_mismatch`                    | The payload attempt is not the open assignment.                                                                    |
+| `implementer_mismatch`                | QA names a different implementer than the assignment.                                                              |
+| `qa_same_model`                       | QA uses the implementer's model.                                                                                   |
+| `revision_mismatch`                   | Rework submits the same artifact revision again.                                                                   |
+| `acceptance_revision_mismatch`        | QA or acceptance names a revision other than the submitted one, or the revision already sent back for rework.      |
+| `recovery_pending_not_ready`          | Any event other than `resolve_recovery` while recovery is pending.                                                 |
+| `invalid_payload`                     | The state, event, or result does not match its schema.                                                             |
+| `stale_generation`                    | A worker event names a generation or lease other than the open run.                                                |
+| `retry_limit_reached`                 | Retry was asked at the retry limit.                                                                                |
+| `idempotency_conflict`                | The idempotency key was already used for a different payload.                                                      |
+| `delivery_revision_mismatch`          | Delivery names a revision other than the accepted one.                                                             |
+| `delivery_origin_mismatch`            | A conversation delivery does not name the intake's originating conversation.                                       |
+| `memory_not_eligible`                 | The event is not acceptance of a proposed fact, or not a same-project supersession of two distinct accepted facts. |
+| `invalid_graph`                       | SUPERSEDES edges disagree with fact status, leave their project, point at themselves, or form a cycle.             |
 
 ## Tests
 
@@ -123,4 +124,4 @@ vp run --filter @t3tools/ai-os-contracts test
 vp run --filter @t3tools/ai-os-contracts typecheck
 ```
 
-The tests cover valid and invalid payloads, the happy path, illegal transitions, canonical model and revision checks, the exact task URI, frozen snapshots, phase invariants, generation fences, usage kinds, memory acceptance and supersession, candidate exclusion, bounded retry, explicit recovery, idempotency, and delivery acks.
+The tests cover valid and invalid payloads, the happy path, illegal transitions, canonical model and revision checks, the exact task URI, frozen snapshots, phase invariants, generation fences on every worker event, usage kinds, memory acceptance and supersession, candidate exclusion, bounded retry, explicit recovery, idempotency, and delivery acks.

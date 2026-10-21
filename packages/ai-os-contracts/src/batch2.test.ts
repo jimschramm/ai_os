@@ -289,16 +289,16 @@ it.effect("cancels, continues, retries within a limit, and transfers ownership",
     assert.strictEqual(transferred.assignment.workerId, "t3-other");
     assert.strictEqual(transferred.assignment.attemptId, attemptId);
     const conflict = yield* failure(transferred, {
-      type: "fail",
-      command: command("fail", "own-1", { blocker }),
+      type: "operator_fail",
+      command: command("operator_fail", "own-1", { actorId: "jim", blocker }),
     });
     assert.strictEqual(conflict.reason, "idempotency_conflict");
     assert.strictEqual(transferred.phase, "executing");
 
     let failed = yield* requirePhase(
       yield* applySequenceEvent(transferred, {
-        type: "fail",
-        command: command("fail", "fail-0", { blocker }),
+        type: "operator_fail",
+        command: command("operator_fail", "fail-0", { actorId: "jim", blocker }),
       }),
       "failed",
     );
@@ -315,8 +315,8 @@ it.effect("cancels, continues, retries within a limit, and transfers ownership",
       assert.strictEqual(retried.run.retryCount, count + 1);
       failed = yield* requirePhase(
         yield* applySequenceEvent(retried, {
-          type: "fail",
-          command: command("fail", `fail-${count + 1}`, { blocker }),
+          type: "operator_fail",
+          command: command("operator_fail", `fail-${count + 1}`, { actorId: "jim", blocker }),
         }),
         "failed",
       );
@@ -412,7 +412,7 @@ const dashboard = (revision: typeof revisionTwo, idempotencyKey = "deliver-dashb
 const conversation = (idempotencyKey: string) => ({
   ...dashboard(revisionTwo, idempotencyKey),
   destination: "conversation" as const,
-  conversationId: "grok-thread-1",
+  conversationId: "Grok-Thread-1",
 });
 
 it.effect(
@@ -477,16 +477,21 @@ it.effect(
         delivery: { ...conversation("deliver-other"), conversationId: "other-thread" },
       });
       assert.strictEqual(otherOrigin.reason, "delivery_origin_mismatch");
+      const otherCase = yield* failure(otherKey, {
+        type: "deliver",
+        delivery: { ...conversation("deliver-case"), conversationId: "grok-thread-1" },
+      });
+      assert.strictEqual(otherCase.reason, "delivery_origin_mismatch");
       const both = yield* requirePhase(
         yield* applySequenceEvent(otherKey, {
           type: "deliver",
-          delivery: { ...conversation("deliver-conversation"), conversationId: "Grok-Thread-1" },
+          delivery: { ...conversation("deliver-conversation"), conversationId: " Grok-Thread-1 " },
         }),
         "accepted",
       );
       assert.strictEqual(both.deliveries.length, 2);
-      assert.strictEqual(both.deliveries[1]?.conversationId, "grok-thread-1");
-      assert.strictEqual(both.intake.originatingConversationId, "grok-thread-1");
+      assert.strictEqual(both.deliveries[1]?.conversationId, "Grok-Thread-1");
+      assert.strictEqual(both.intake.originatingConversationId, "Grok-Thread-1");
       assert.strictEqual(both.phase, "accepted");
     }),
 );
@@ -517,6 +522,16 @@ it.effect("rejects a worker event whose generation or lease is not current", () 
           attribution,
         },
       },
+      {
+        type: "fail" as const,
+        failure: {
+          taskId,
+          attemptId,
+          generation: 1,
+          leaseId: "lease-9",
+          blocker,
+        },
+      },
       expired(2),
     ];
     for (const event of probes) {
@@ -530,5 +545,70 @@ it.effect("rejects a worker event whose generation or lease is not current", () 
     );
     assert.strictEqual(beating.run.leaseId, leaseIdFor(1));
     assert.strictEqual(beating.run.leaseExpiresAt, leaseExpiresAt);
+  }),
+);
+
+it.effect("rejects every worker event that names a stale generation", () =>
+  Effect.gen(function* () {
+    const executing = yield* requirePhase(
+      yield* applySequence(happyPathEvents.slice(0, 4)),
+      "executing",
+    );
+    const stale = 2;
+    const workerEvents = [
+      { type: "report_progress" as const, report: progress(stale) },
+      { type: "heartbeat" as const, heartbeat: heartbeat(stale) },
+      { type: "heartbeat_lapsed" as const, lapse: lapse(stale) },
+      {
+        type: "report_usage" as const,
+        generation: stale,
+        leaseId: leaseIdFor(stale),
+        measurement: {
+          kind: "unknown" as const,
+          reason: "The provider returned no usage.",
+          attribution,
+        },
+      },
+      {
+        type: "submit_completion" as const,
+        completion: { ...completionExample, generation: stale, leaseId: leaseIdFor(stale) },
+      },
+      expired(stale),
+      {
+        type: "fail" as const,
+        failure: { taskId, attemptId, generation: stale, leaseId: leaseIdFor(stale), blocker },
+      },
+    ];
+    for (const event of workerEvents) {
+      const error = yield* failure(executing, event);
+      assert.strictEqual(error.reason, "stale_generation");
+      assert.strictEqual(error.from, "executing");
+      assert.strictEqual(error.event, event.type);
+    }
+    const failed = yield* requirePhase(
+      yield* applySequenceEvent(executing, {
+        type: "fail",
+        failure: {
+          taskId,
+          attemptId,
+          generation: executing.run.generation,
+          leaseId: executing.run.leaseId,
+          blocker,
+        },
+      }),
+      "failed",
+    );
+    assert.strictEqual(failed.blocker.nextAction, blocker.nextAction);
+    const operatorFailed = yield* requirePhase(
+      yield* applySequenceEvent(executing, {
+        type: "operator_fail",
+        command: command("operator_fail", "operator-fail-1", { actorId: "jim", blocker }),
+      }),
+      "failed",
+    );
+    assert.strictEqual(
+      operatorFailed.commands.some((entry) => entry.idempotencyKey === "operator-fail-1"),
+      true,
+    );
   }),
 );
