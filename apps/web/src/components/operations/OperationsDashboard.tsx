@@ -1,39 +1,37 @@
 import { Badge } from "~/components/ui/badge";
 import { Button } from "~/components/ui/button";
+import { CircleAlertIcon, CircleHelpIcon } from "lucide-react";
 import { useEffect, useRef, useState, type RefObject } from "react";
 
+import {
+  PROGRESS_STEPS,
+  agentColor,
+  agentMark,
+  findingsCount,
+  progressIndex,
+  progressPercent,
+  qaBreakdown,
+  touchSeries,
+} from "./boardVisuals";
 import { ContextPackageView } from "./ContextPackageView";
 import { CortexView } from "./CortexView";
 import { MemoryBrowser } from "./MemoryBrowser";
-import type { OperationsProjectId } from "./fixtures";
+import { UsageGauges } from "./UsageGauges";
+import type { NeedsYouItem, OperationsProjectId, OperationsTask } from "./fixtures";
 import { INITIAL_MEMORY_REVIEW, type MemoryReviewState } from "./memoryModel";
 import {
   BOARD_COLUMNS,
   activeAgentCount,
-  formatInstant,
-  formatShare,
-  formatUsdMinor,
   needsYou,
   projectById,
   projects,
   qaBadgeTone,
   qaStatusLabel,
-  recentResults,
   shortRevision,
   tasksForProject,
   tasksInColumn,
   usageFor,
-  type QaBadgeTone,
 } from "./model";
-import type { NeedsYouItem, OperationsTask } from "./fixtures";
-
-const TONE_DOT: Record<QaBadgeTone | "muted", string> = {
-  secondary: "bg-muted-foreground",
-  info: "bg-info",
-  warning: "bg-warning",
-  success: "bg-success",
-  muted: "bg-muted-foreground",
-};
 
 const COLUMN_ACCENT: Record<(typeof BOARD_COLUMNS)[number]["id"], string> = {
   Ready: "border-l-info",
@@ -48,7 +46,6 @@ export function OperationsDashboard() {
   const [surface, setSurface] = useState<"board" | "memory">("board");
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [currentTaskId, setCurrentTaskId] = useState<string | null>(null);
-  const [agentsOpen, setAgentsOpen] = useState(true);
   const [noted, setNoted] = useState<Readonly<Record<string, true>>>({});
   const [memoryOpen, setMemoryOpen] = useState(false);
   const [memoryId, setMemoryId] = useState<string | null>(null);
@@ -70,7 +67,6 @@ export function OperationsDashboard() {
     setMemoryOpen(false);
   };
   const attention = needsYou(tasks);
-  const results = recentResults(tasks);
   const usage = usageFor(tasks);
   const active = activeAgentCount(project.agents);
 
@@ -125,13 +121,17 @@ export function OperationsDashboard() {
             />
           </div>
         ) : (
-          <div className="flex flex-col gap-4 p-4 sm:p-6">
-            <AgentStrip
-              active={active}
-              agents={project.agents}
-              open={agentsOpen}
-              onToggle={() => setAgentsOpen((open) => !open)}
-            />
+          <div className="ops-visual flex flex-col gap-4 p-4 sm:p-6">
+            <AgentRail agents={project.agents} active={active} />
+            <div className="grid grid-cols-1 gap-3 lg:grid-cols-3">
+              <ThroughputCard tasks={tasks} />
+              <QaCard tasks={tasks} />
+              <BlockerCard
+                items={attention}
+                noted={noted}
+                onAct={(id) => setNoted((current) => ({ ...current, [id]: true }))}
+              />
+            </div>
             <section aria-labelledby="board-heading">
               <div className="mb-3 flex items-baseline justify-between gap-3">
                 <h2 id="board-heading" className="text-sm font-semibold tracking-tight">
@@ -140,59 +140,45 @@ export function OperationsDashboard() {
                 <p className="text-xs text-muted-foreground">{project.label}</p>
               </div>
               <div className="grid grid-cols-1 gap-3 md:grid-cols-2 lg:grid-cols-5">
-                {BOARD_COLUMNS.map((column) => (
-                  <section
-                    key={column.id}
-                    aria-labelledby={`column-${column.id}`}
-                    className="flex min-w-0 flex-col gap-2 rounded-xl border border-border bg-card/40 p-2"
-                  >
-                    <div className="px-1.5 pt-1">
-                      <h3 id={`column-${column.id}`} className="text-sm font-medium">
-                        {column.label}
-                      </h3>
-                      <p className="text-2xs leading-4 text-muted-foreground">{column.hint}</p>
-                    </div>
-                    <div className="flex flex-col gap-2">
-                      {tasksInColumn(tasks, column.id).map((task) => (
-                        <TaskCard
-                          key={task.id}
-                          task={task}
-                          accent={COLUMN_ACCENT[column.id]}
-                          pressed={task.id === selected?.id}
-                          onOpen={() => {
-                            setCurrentTaskId(task.id);
-                            setSelectedId(task.id);
-                          }}
-                        />
-                      ))}
-                      {tasksInColumn(tasks, column.id).length === 0 ? (
-                        <p className="px-1.5 py-3 text-xs text-muted-foreground">Nothing here</p>
-                      ) : null}
-                    </div>
-                  </section>
-                ))}
+                {BOARD_COLUMNS.map((column) => {
+                  const columnTasks = tasksInColumn(tasks, column.id);
+                  return (
+                    <section
+                      key={column.id}
+                      aria-labelledby={`column-${column.id}`}
+                      className="flex min-w-0 flex-col gap-2 rounded-xl border border-border bg-card/40 p-2"
+                    >
+                      <div className="flex items-center justify-between px-1.5 pt-1">
+                        <h3 id={`column-${column.id}`} className="text-sm font-medium">
+                          {column.label}
+                        </h3>
+                        <Badge size="sm" variant="outline">
+                          {columnTasks.length}
+                        </Badge>
+                      </div>
+                      <div className="flex flex-col gap-2">
+                        {columnTasks.map((task) => (
+                          <TaskCard
+                            key={task.id}
+                            task={task}
+                            accent={COLUMN_ACCENT[column.id]}
+                            pressed={task.id === selected?.id}
+                            onOpen={() => {
+                              setCurrentTaskId(task.id);
+                              setSelectedId(task.id);
+                            }}
+                          />
+                        ))}
+                        {columnTasks.length === 0 ? (
+                          <p className="px-1.5 py-3 text-xs text-muted-foreground">Nothing here</p>
+                        ) : null}
+                      </div>
+                    </section>
+                  );
+                })}
               </div>
             </section>
-            <div className="grid grid-cols-1 gap-3 lg:grid-cols-3">
-              <NeedsYouPanel
-                items={attention}
-                noted={noted}
-                onAct={(id) => setNoted((current) => ({ ...current, [id]: true }))}
-              />
-              <RecentResultsPanel
-                results={results}
-                onOpen={(id) => {
-                  setCurrentTaskId(id);
-                  setSelectedId(id);
-                }}
-              />
-              <UsagePanel
-                tokens={usage.totals.reportedTokens}
-                costMinor={usage.totals.estimatedCostMinorUsd}
-                shareBps={usage.totals.subscriptionAllocationBps}
-                unknown={usage.totals.unknownCount}
-              />
-            </div>
+            <UsageGauges entries={usage.entries} />
           </div>
         )}
       </main>
@@ -275,61 +261,192 @@ function ProjectPicker({
   );
 }
 
-function AgentStrip({
+function AgentRail({
   active,
   agents,
-  open,
-  onToggle,
 }: {
   active: number;
   agents: ReturnType<typeof projectById>["agents"];
-  open: boolean;
-  onToggle: () => void;
 }) {
   return (
     <section
       aria-labelledby="agents-heading"
       className="rounded-xl border border-border bg-card px-4 py-3"
     >
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <div>
-          <h2 id="agents-heading" className="text-sm font-semibold tracking-tight">
-            Agent activity
-          </h2>
-          <p className="text-xs text-muted-foreground">
-            {active} active {active === 1 ? "assignment" : "assignments"}
-          </p>
-        </div>
-        <Button
-          aria-expanded={open}
-          aria-controls="agent-assignments"
-          size="sm"
-          variant="outline"
-          onClick={onToggle}
-        >
-          {open ? "Hide assignments" : "Show assignments"}
-        </Button>
+      <div className="flex items-center justify-between gap-3">
+        <h2 id="agents-heading" className="text-sm font-semibold tracking-tight">
+          Agents
+        </h2>
+        <Badge size="sm" variant="info">
+          {active} live
+        </Badge>
       </div>
-      {open ? (
-        <ul id="agent-assignments" className="mt-3 grid gap-2 sm:grid-cols-2 xl:grid-cols-3">
-          {agents.map((agent) => (
-            <li
-              key={agent.id}
-              className="flex items-start justify-between gap-3 rounded-lg border border-border/80 bg-background/50 px-3 py-2"
+      <ul className="mt-3 flex gap-3 overflow-x-auto">
+        {agents.map((agent) => (
+          <li key={agent.id} className="flex w-16 shrink-0 flex-col items-center gap-1">
+            <span
+              className={`ops-avatar-mark grid size-10 place-items-center rounded-full text-xs font-semibold ${agent.mode === "active" ? "ops-live" : "ring-1 ring-inset ring-border"}`}
+              style={{ background: agentColor(agent.name) }}
             >
-              <div className="min-w-0">
-                <p className="truncate text-sm font-medium">{agent.name}</p>
-                <p className="truncate text-xs text-muted-foreground">
-                  {agent.surface} · {agent.assignment}
-                </p>
-              </div>
-              <Badge variant={agent.mode === "active" ? "info" : "outline"} size="sm">
-                {agent.mode === "active" ? "Active" : "Update only"}
-              </Badge>
+              {agentMark(agent.name)}
+            </span>
+            <span className="w-full truncate text-center text-2xs">{agent.name}</span>
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
+}
+
+function ThroughputCard({ tasks }: { tasks: readonly OperationsTask[] }) {
+  const series = touchSeries(tasks);
+  const done = tasksInColumn(tasks, "Done").length;
+  const max = Math.max(1, ...series);
+  const width = 240;
+  const height = 64;
+  const line = series
+    .map((value, index) => {
+      const x = (index / Math.max(series.length - 1, 1)) * width;
+      const y = height - (value / max) * (height - 8) - 4;
+      return `${index === 0 ? "M" : "L"}${x.toFixed(1)} ${y.toFixed(1)}`;
+    })
+    .join(" ");
+  return (
+    <section
+      aria-labelledby="throughput-heading"
+      className="rounded-xl border border-border bg-card p-4"
+    >
+      <div className="flex items-end justify-between gap-3">
+        <h2 id="throughput-heading" className="text-sm font-semibold">
+          Throughput
+        </h2>
+        <p className="text-2xl font-semibold tracking-tight">{done}</p>
+      </div>
+      <p className="text-2xs text-muted-foreground">Done today</p>
+      <svg viewBox={`0 0 ${width} ${height}`} className="mt-2 h-16 w-full" role="img">
+        <title>Tasks updated today, by hour</title>
+        <path d={`${line} L${width} ${height} L0 ${height} Z`} fill="var(--info)" opacity="0.18" />
+        <path d={line} fill="none" stroke="var(--info)" strokeWidth="2" />
+      </svg>
+    </section>
+  );
+}
+
+function QaCard({ tasks }: { tasks: readonly OperationsTask[] }) {
+  const counts = qaBreakdown(tasks);
+  const parts = [
+    { id: "accept", value: counts.accept, color: "var(--success)", label: "Accept" },
+    { id: "rework", value: counts.rework, color: "var(--warning)", label: "Rework" },
+    {
+      id: "unavailable",
+      value: counts.unavailable,
+      color: "var(--destructive)",
+      label: "Unavailable",
+    },
+    { id: "open", value: counts.open, color: "var(--muted-foreground)", label: "Open" },
+  ];
+  const total = parts.reduce((sum, part) => sum + part.value, 0) || 1;
+  const radius = 32;
+  const circumference = 2 * Math.PI * radius;
+  let traveled = 0;
+  const arcs = parts.flatMap((part) => {
+    if (part.value === 0) return [];
+    const length = (part.value / total) * circumference;
+    const arc = { ...part, length, traveled };
+    traveled += length;
+    return [arc];
+  });
+  return (
+    <section
+      aria-labelledby="qa-chart-heading"
+      className="rounded-xl border border-border bg-card p-4"
+    >
+      <h2 id="qa-chart-heading" className="text-sm font-semibold">
+        QA
+      </h2>
+      <div className="mt-3 flex items-center gap-4">
+        <svg viewBox="0 0 88 88" className="size-20 shrink-0" role="img">
+          <title>QA verdicts</title>
+          <circle cx="44" cy="44" r={radius} fill="none" stroke="var(--muted)" strokeWidth="9" />
+          {arcs.map((arc) => (
+            <circle
+              key={arc.id}
+              cx="44"
+              cy="44"
+              r={radius}
+              fill="none"
+              stroke={arc.color}
+              strokeWidth="9"
+              strokeDasharray={`${arc.length} ${circumference - arc.length}`}
+              strokeDashoffset={-arc.traveled}
+              transform="rotate(-90 44 44)"
+            />
+          ))}
+          <text x="44" y="48" textAnchor="middle" className="fill-foreground text-sm font-semibold">
+            {counts.accept}
+          </text>
+        </svg>
+        <ul className="flex flex-col gap-1 text-2xs text-muted-foreground">
+          {parts.map((part) => (
+            <li key={part.id} className="flex items-center gap-2">
+              <span
+                aria-hidden="true"
+                className="size-2 rounded-full"
+                style={{ background: part.color }}
+              />
+              <span>
+                {part.label} {part.value}
+              </span>
             </li>
           ))}
         </ul>
-      ) : null}
+      </div>
+    </section>
+  );
+}
+
+function BlockerCard({
+  items,
+  noted,
+  onAct,
+}: {
+  items: readonly NeedsYouItem[];
+  noted: Readonly<Record<string, true>>;
+  onAct: (id: string) => void;
+}) {
+  return (
+    <section
+      aria-labelledby="needs-you-heading"
+      className="rounded-xl border border-border bg-card p-4"
+    >
+      <h2 id="needs-you-heading" className="text-sm font-semibold">
+        Needs you
+      </h2>
+      {items.length === 0 ? (
+        <p className="mt-3 text-sm text-muted-foreground">Clear</p>
+      ) : (
+        <ul className="mt-3 flex flex-col gap-2">
+          {items.map((item) => (
+            <li key={item.id} className="flex items-center gap-2" aria-live="polite">
+              {item.kind === "blocker" ? (
+                <CircleAlertIcon aria-hidden="true" className="size-4 shrink-0 text-warning" />
+              ) : (
+                <CircleHelpIcon aria-hidden="true" className="size-4 shrink-0 text-info" />
+              )}
+              <span className="min-w-0 flex-1 truncate text-sm">{item.nextAction}</span>
+              {noted[item.id] ? (
+                <Badge size="sm" variant="outline">
+                  Noted
+                </Badge>
+              ) : (
+                <Button size="sm" variant="outline" onClick={() => onAct(item.id)}>
+                  {item.actionLabel}
+                </Button>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
     </section>
   );
 }
@@ -345,198 +462,44 @@ function TaskCard({
   pressed: boolean;
   onOpen: () => void;
 }) {
+  const percent = progressPercent(task.phase);
   return (
     <button
       type="button"
       aria-pressed={pressed}
       onClick={onOpen}
-      className={`rounded-lg border border-border border-l-2 bg-card px-3 py-2.5 text-left shadow-xs transition-colors duration-150 hover:bg-accent/40 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring focus-visible:outline-none ${accent} ${pressed ? "bg-accent/50" : ""}`}
+      className={`rounded-lg border border-border border-l-2 bg-card px-2.5 py-2 text-left shadow-xs transition-colors duration-150 hover:bg-accent/40 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring focus-visible:outline-none ${accent} ${pressed ? "bg-accent/50" : ""}`}
     >
-      <span className="line-clamp-2 text-sm font-medium">{task.title}</span>
-      <span className="mt-1 block text-xs text-muted-foreground">
-        {projectLabel(task.projectId)} · {task.agent}
+      <span className="flex items-center gap-2">
+        <span
+          aria-hidden="true"
+          className="ops-avatar-mark grid size-5 shrink-0 place-items-center rounded-full text-3xs font-semibold"
+          style={{ background: agentColor(task.agent) }}
+        >
+          {agentMark(task.agent)}
+        </span>
+        <span className="line-clamp-2 text-sm font-medium">{task.title}</span>
       </span>
-      <span className="mt-2 flex flex-wrap items-center gap-1.5">
+      <span className="mt-2 block h-1 overflow-hidden rounded-full bg-muted">
+        <span
+          className={`block h-1 rounded-full ${barClass(task.phase)}`}
+          style={{ width: `${percent}%` }}
+        />
+      </span>
+      <span className="mt-2 flex">
         <Badge variant={qaBadgeTone(task)} size="sm">
           {qaStatusLabel(task)}
         </Badge>
-      </span>
-      <span className="mt-2 flex items-center justify-between gap-2 text-2xs text-muted-foreground">
-        <span className="font-mono">{shortRevision(task)}</span>
-        <span>{formatInstant(task.updatedAt)}</span>
       </span>
     </button>
   );
 }
 
-function NeedsYouPanel({
-  items,
-  noted,
-  onAct,
-}: {
-  items: readonly NeedsYouItem[];
-  noted: Readonly<Record<string, true>>;
-  onAct: (id: string) => void;
-}) {
-  return (
-    <section
-      aria-labelledby="needs-you-heading"
-      className="flex flex-col gap-3 rounded-xl border border-border bg-card p-4"
-    >
-      <div>
-        <h2 id="needs-you-heading" className="text-sm font-semibold tracking-tight">
-          Needs you
-        </h2>
-        <p className="text-xs text-muted-foreground">Blockers and decisions</p>
-      </div>
-      {items.length === 0 ? (
-        <p className="text-sm text-muted-foreground">Nothing is waiting on you.</p>
-      ) : (
-        <ul className="flex flex-col gap-3">
-          {items.map((item) => (
-            <li key={item.id} className="rounded-lg border border-border/80 bg-background/40 p-3">
-              <div className="flex items-center gap-2">
-                <Badge variant={item.kind === "blocker" ? "warning" : "info"} size="sm">
-                  {item.kind === "blocker" ? "Blocker" : "Decision"}
-                </Badge>
-              </div>
-              <h3 className="mt-2 text-sm font-medium">{item.summary}</h3>
-              <p className="mt-1 text-xs text-muted-foreground">{item.nextAction}</p>
-              <div className="mt-3" aria-live="polite">
-                {noted[item.id] ? (
-                  <p className="text-xs text-muted-foreground">
-                    Noted. This mockup does not send the action.
-                  </p>
-                ) : (
-                  <Button size="sm" variant="outline" onClick={() => onAct(item.id)}>
-                    {item.actionLabel}
-                  </Button>
-                )}
-              </div>
-            </li>
-          ))}
-        </ul>
-      )}
-    </section>
-  );
-}
-
-function RecentResultsPanel({
-  results,
-  onOpen,
-}: {
-  results: readonly { readonly task: OperationsTask; readonly summary: string }[];
-  onOpen: (id: string) => void;
-}) {
-  return (
-    <section
-      aria-labelledby="results-heading"
-      className="flex flex-col gap-3 rounded-xl border border-border bg-card p-4"
-    >
-      <div>
-        <h2 id="results-heading" className="text-sm font-semibold tracking-tight">
-          Recent results
-        </h2>
-        <p className="text-xs text-muted-foreground">Accepted work in this workspace</p>
-      </div>
-      {results.length === 0 ? (
-        <p className="text-sm text-muted-foreground">No accepted results yet.</p>
-      ) : (
-        <ul className="flex flex-col gap-2">
-          {results.map(({ task, summary }) => (
-            <li key={task.id}>
-              <button
-                type="button"
-                onClick={() => onOpen(task.id)}
-                className="w-full rounded-lg border border-border/80 bg-background/40 px-3 py-2 text-left transition-colors duration-150 hover:bg-accent/40 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring focus-visible:outline-none"
-              >
-                <h3 className="text-sm font-medium">{task.title}</h3>
-                <p className="mt-1 text-xs text-muted-foreground">{summary}</p>
-                <p className="mt-1 font-mono text-2xs text-muted-foreground">
-                  {shortRevision(task)} · {formatInstant(task.updatedAt)}
-                </p>
-              </button>
-            </li>
-          ))}
-        </ul>
-      )}
-    </section>
-  );
-}
-
-function UsagePanel({
-  tokens,
-  costMinor,
-  shareBps,
-  unknown,
-}: {
-  tokens: { readonly input: number; readonly output: number };
-  costMinor: number;
-  shareBps: number;
-  unknown: number;
-}) {
-  return (
-    <section
-      aria-labelledby="usage-heading"
-      className="flex flex-col gap-3 rounded-xl border border-border bg-card p-4"
-    >
-      <div>
-        <h2 id="usage-heading" className="text-sm font-semibold tracking-tight">
-          Usage
-        </h2>
-        <p className="text-xs text-muted-foreground">Each kind stays in its own total</p>
-      </div>
-      <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
-        <UsageKind
-          tone="info"
-          label="Reported tokens"
-          value={`${tokens.input.toLocaleString("en-US")} in`}
-          note={`${tokens.output.toLocaleString("en-US")} out · reported by the client`}
-        />
-        <UsageKind
-          tone="warning"
-          label="Estimated cost"
-          value={formatUsdMinor(costMinor)}
-          note="Estimate only. Not a charge."
-        />
-        <UsageKind
-          tone="success"
-          label="Subscription"
-          value={formatShare(shareBps)}
-          note="Share of a subscription. Not dollars."
-        />
-        <UsageKind
-          tone="muted"
-          label="Unknown"
-          value={String(unknown)}
-          note={unknown === 1 ? "Session with no report" : "Sessions with no report"}
-        />
-      </div>
-    </section>
-  );
-}
-
-function UsageKind({
-  tone,
-  label,
-  value,
-  note,
-}: {
-  tone: "info" | "warning" | "success" | "muted";
-  label: string;
-  value: string;
-  note: string;
-}) {
-  return (
-    <div className="rounded-lg border border-border/80 bg-background/40 p-3">
-      <div className="flex items-center gap-2">
-        <span aria-hidden="true" className={`size-1.5 rounded-full ${TONE_DOT[tone]}`} />
-        <h3 className="text-xs font-medium text-muted-foreground">{label}</h3>
-      </div>
-      <p className="mt-2 text-lg font-semibold tracking-tight">{value}</p>
-      <p className="mt-1 text-xs text-muted-foreground">{note}</p>
-    </div>
-  );
+function barClass(phase: OperationsTask["phase"]): string {
+  if (phase === "accepted") return "bg-success";
+  if (phase === "recovery_pending" || phase === "rework" || phase === "awaiting_qa")
+    return "bg-warning";
+  return "bg-info";
 }
 
 function TaskDrawer({
@@ -641,6 +604,11 @@ function TaskDrawerBody({
           >
             {task.title}
           </h2>
+          <div className="mt-2">
+            <Badge variant={qaBadgeTone(task)}>
+              {qaStatusLabel(task)} · {findingsCount(task)}
+            </Badge>
+          </div>
         </div>
         <Button size="sm" variant="ghost" onClick={onClose}>
           Close
@@ -648,6 +616,18 @@ function TaskDrawerBody({
       </div>
       <div className="min-h-0 flex-1 overflow-auto px-4 py-4">
         <div className="flex flex-col gap-5">
+          <section aria-labelledby="progress-heading">
+            <h3 id="progress-heading" className="text-sm font-semibold">
+              Progress
+            </h3>
+            <ProgressStepper phase={task.phase} />
+          </section>
+          <section aria-labelledby="context-heading">
+            <h3 id="context-heading" className="text-sm font-semibold">
+              Context
+            </h3>
+            <ContextPackageView task={task} onOpenRecord={onOpenRecord} />
+          </section>
           <section aria-labelledby="request-heading">
             <h3 id="request-heading" className="text-sm font-semibold">
               Request
@@ -664,66 +644,22 @@ function TaskDrawerBody({
               ))}
             </ul>
           </section>
-          <section aria-labelledby="context-heading">
-            <h3 id="context-heading" className="text-sm font-semibold">
-              Context
-            </h3>
-            <ContextPackageView task={task} onOpenRecord={onOpenRecord} />
-          </section>
           <section aria-labelledby="suggestions-heading">
             <h3 id="suggestions-heading" className="text-sm font-semibold">
               Suggestions, not context
             </h3>
-            <p className="mt-1 text-xs text-muted-foreground">
-              Vector candidates. They are not in the context package.
-            </p>
             {task.candidates.length === 0 ? (
-              <p className="mt-2 text-sm text-muted-foreground">No suggestions.</p>
+              <p className="mt-2 text-sm text-muted-foreground">None</p>
             ) : (
-              <ul className="mt-2 flex flex-col gap-2">
+              <ul className="mt-2 flex flex-wrap gap-1.5">
                 {task.candidates.map((candidate) => (
-                  <li
-                    key={candidate.nodeId}
-                    className="rounded-lg border border-dashed border-border px-3 py-2"
-                  >
-                    <p className="font-mono text-2xs text-muted-foreground">
-                      {candidate.nodeId} · {candidate.source} · {candidate.score.toFixed(2)}
-                    </p>
+                  <li key={candidate.nodeId}>
+                    <span className="inline-flex rounded-full border border-dashed border-border px-2.5 py-1 font-mono text-2xs text-muted-foreground">
+                      {candidate.score.toFixed(2)}
+                    </span>
                   </li>
                 ))}
               </ul>
-            )}
-          </section>
-          <section aria-labelledby="progress-heading">
-            <h3 id="progress-heading" className="text-sm font-semibold">
-              Progress
-            </h3>
-            {task.progress.length === 0 ? (
-              <p className="mt-2 text-sm text-muted-foreground">No progress reports.</p>
-            ) : (
-              <ol className="mt-2 flex flex-col gap-2">
-                {task.progress.map((report) => (
-                  <li
-                    key={`${report.attemptId}-${report.generation}`}
-                    className="rounded-lg border border-border/80 bg-background/40 px-3 py-2 text-sm"
-                  >
-                    <p className="font-medium">
-                      {report.status === "working" ? "Working" : "Blocked"} · generation{" "}
-                      {report.generation}
-                    </p>
-                    {report.blockers.map((blocker) => (
-                      <p key={blocker.summary} className="mt-1 text-xs text-muted-foreground">
-                        {blocker.summary} Next: {blocker.nextAction}
-                      </p>
-                    ))}
-                    {report.partialArtifacts.map((artifact) => (
-                      <p key={artifact.artifactId} className="mt-1 text-xs text-muted-foreground">
-                        {artifact.note}
-                      </p>
-                    ))}
-                  </li>
-                ))}
-              </ol>
             )}
           </section>
           <section aria-labelledby="evidence-heading">
@@ -746,27 +682,22 @@ function TaskDrawerBody({
             <h3 id="qa-heading" className="text-sm font-semibold">
               QA
             </h3>
-            <div className="mt-2">
-              <Badge variant={qaBadgeTone(task)}>{qaStatusLabel(task)}</Badge>
+            <div className="mt-2 flex flex-wrap items-center gap-2">
+              <Badge variant={qaBadgeTone(task)}>
+                {qaStatusLabel(task)} · {findingsCount(task)} findings
+              </Badge>
             </div>
             {task.qa !== null &&
             task.qa.availability === "available" &&
             task.qa.findings.length > 0 ? (
-              <ul className="mt-2 flex flex-col gap-2">
+              <ul className="mt-2 flex flex-col gap-1">
                 {task.qa.findings.map((finding) => (
-                  <li
-                    key={finding.defect}
-                    className="rounded-lg border border-border/80 bg-background/40 px-3 py-2 text-sm"
-                  >
-                    <p className="font-medium">{finding.defect}</p>
-                    <p className="mt-1 text-xs text-muted-foreground">{finding.evidence}</p>
-                    <p className="mt-1 text-xs">Expected: {finding.expectedBehavior}</p>
+                  <li key={finding.defect} className="text-sm">
+                    {finding.defect}
                   </li>
                 ))}
               </ul>
-            ) : (
-              <p className="mt-2 text-sm text-muted-foreground">No findings.</p>
-            )}
+            ) : null}
           </section>
           <section aria-labelledby="artifacts-heading">
             <h3 id="artifacts-heading" className="text-sm font-semibold">
@@ -780,6 +711,58 @@ function TaskDrawerBody({
         </div>
       </div>
     </>
+  );
+}
+
+const STEP_DOT = {
+  pending: "size-2.5 rounded-full bg-muted",
+  current: "size-2.5 rounded-full bg-info",
+  stalled: "size-2.5 rounded-full bg-warning",
+  done: "size-2.5 rounded-full bg-info",
+  accepted: "size-2.5 rounded-full bg-success",
+} as const;
+
+function ProgressStepper({ phase }: { phase: OperationsTask["phase"] }) {
+  const state = progressIndex(phase);
+  return (
+    <ol className="mt-3 grid grid-cols-6 gap-1">
+      {PROGRESS_STEPS.map((step, index) => {
+        const reached = index <= state.index;
+        const current = index === state.index;
+        const tone = !reached
+          ? "pending"
+          : current && state.stalled
+            ? "stalled"
+            : index === PROGRESS_STEPS.length - 1
+              ? "accepted"
+              : current
+                ? "current"
+                : "done";
+        return (
+          <li
+            key={step.id}
+            className="flex min-w-0 flex-col items-center gap-1"
+            aria-current={current ? "step" : undefined}
+          >
+            <span aria-hidden="true" className={STEP_DOT[tone]} />
+            <span
+              className={
+                reached
+                  ? "text-center text-2xs leading-4"
+                  : "text-center text-2xs leading-4 text-muted-foreground"
+              }
+            >
+              {step.label}
+            </span>
+            {current && state.stalled ? (
+              <Badge size="sm" variant="warning">
+                Unknown
+              </Badge>
+            ) : null}
+          </li>
+        );
+      })}
+    </ol>
   );
 }
 

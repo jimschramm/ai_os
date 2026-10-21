@@ -1,5 +1,6 @@
 import { Badge } from "~/components/ui/badge";
 import { Button } from "~/components/ui/button";
+import { useState } from "react";
 
 import type { MemoryFactV1 } from "@t3tools/ai-os-contracts";
 
@@ -20,105 +21,117 @@ export function ContextPackageView({
   }
   const instructions = snapshot.records.filter((fact) => fact.kind === "Instruction");
   const decisions = snapshot.records.filter((fact) => fact.kind === "Decision");
-  const requirements = snapshot.records.filter((fact) => memoryType(fact.kind) === "facts");
+  const facts = snapshot.records.filter((fact) => memoryType(fact.kind) === "facts");
+  const used = new Set([...instructions, ...decisions, ...facts].map((fact) => fact.factId));
+  const others = snapshot.records.filter((fact) => !used.has(fact.factId));
 
   return (
-    <div className="mt-2 flex flex-col gap-4">
-      <p className="text-xs text-muted-foreground">
-        Immutable package from {formatInstant(snapshot.createdAt)}. Later memory edits are not in
-        it.
+    <div className="mt-2 flex flex-col gap-3">
+      <p className="text-2xs text-muted-foreground">
+        {formatInstant(snapshot.createdAt)} · {snapshot.repoCommit.slice(0, 7)} ·{" "}
+        {snapshot.authorizationScope}
       </p>
-      <dl className="grid grid-cols-1 gap-2 text-xs sm:grid-cols-2">
-        <div className="rounded-lg border border-border/80 bg-background/40 px-3 py-2">
-          <dt className="text-muted-foreground">Repository</dt>
-          <dd className="mt-1 font-mono">{snapshot.repoCommit.slice(0, 7)}</dd>
-        </div>
-        <div className="rounded-lg border border-border/80 bg-background/40 px-3 py-2">
-          <dt className="text-muted-foreground">Authorization</dt>
-          <dd className="mt-1">{snapshot.authorizationScope}</dd>
-        </div>
-      </dl>
-      <div>
-        <h4 className="text-xs font-medium text-muted-foreground">Requirements</h4>
-        <p className="mt-1 text-sm leading-6">{snapshot.requirements}</p>
-        <RecordList records={requirements} onOpenRecord={onOpenRecord} />
-      </div>
-      <div>
-        <h4 className="text-xs font-medium text-muted-foreground">Governing instructions</h4>
-        <RecordList records={instructions} onOpenRecord={onOpenRecord} />
-      </div>
-      <div>
-        <h4 className="text-xs font-medium text-muted-foreground">Current decisions</h4>
-        <RecordList records={decisions} onOpenRecord={onOpenRecord} />
-      </div>
-      <div>
-        <h4 className="text-xs font-medium text-muted-foreground">Memory versions</h4>
-        <ul className="mt-2 flex flex-col gap-2">
-          {snapshot.records.map((fact) => (
-            <li
-              key={fact.factId}
-              className="rounded-lg border border-border/80 bg-background/40 px-3 py-2"
-            >
-              <div className="flex flex-wrap items-center gap-2">
-                <Badge size="sm" variant="secondary">
-                  {fact.kind}
-                </Badge>
-                <span className="font-mono text-2xs text-muted-foreground">{fact.factId}</span>
-              </div>
-              <p className="mt-2 text-sm">{fact.body}</p>
-              <p className="mt-1 text-xs text-muted-foreground">{formatProvenance(fact)}</p>
-              <EvidenceList factId={fact.factId} />
-              <div className="mt-2">
-                <Button size="sm" variant="ghost" onClick={() => onOpenRecord(fact.factId)}>
-                  Open record
-                </Button>
-              </div>
-            </li>
-          ))}
-        </ul>
-      </div>
-      <p className="text-xs text-muted-foreground">
-        Attempt revision {shortRevision(task)} is separate from these memory versions.
-      </p>
+      <ChipGroup
+        title="Requirements"
+        chips={[
+          { id: "requirements", label: "Requirements", body: snapshot.requirements, fact: null },
+          ...facts.map(chipFromFact),
+        ]}
+        onOpenRecord={onOpenRecord}
+      />
+      <ChipGroup
+        title="Instructions"
+        chips={instructions.map(chipFromFact)}
+        onOpenRecord={onOpenRecord}
+      />
+      <ChipGroup
+        title="Decisions"
+        chips={decisions.map(chipFromFact)}
+        onOpenRecord={onOpenRecord}
+      />
+      {others.length === 0 ? null : (
+        <ChipGroup
+          title="Other versions"
+          chips={others.map(chipFromFact)}
+          onOpenRecord={onOpenRecord}
+        />
+      )}
+      <p className="text-2xs text-muted-foreground">Attempt {shortRevision(task)}</p>
     </div>
   );
 }
 
-function RecordList({
-  records,
+interface Chip {
+  readonly id: string;
+  readonly label: string;
+  readonly body: string;
+  readonly fact: MemoryFactV1 | null;
+}
+
+function chipFromFact(fact: MemoryFactV1): Chip {
+  return { id: fact.factId, label: shortLabel(fact.body), body: fact.body, fact };
+}
+
+function ChipGroup({
+  title,
+  chips,
   onOpenRecord,
 }: {
-  records: readonly MemoryFactV1[];
+  title: string;
+  chips: readonly Chip[];
   onOpenRecord: (factId: string) => void;
 }) {
-  if (records.length === 0) {
-    return <p className="mt-1 text-sm text-muted-foreground">None in this package.</p>;
-  }
+  const [openId, setOpenId] = useState<string | null>(null);
+  const open = chips.find((chip) => chip.id === openId) ?? null;
+  if (chips.length === 0) return null;
   return (
-    <ul className="mt-2 flex flex-col gap-2">
-      {records.map((fact) => (
-        <li key={fact.factId}>
-          <button
-            type="button"
-            onClick={() => onOpenRecord(fact.factId)}
-            className="w-full rounded-lg border border-border/80 bg-background/40 px-3 py-2 text-left transition-colors duration-150 hover:bg-accent/40 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring focus-visible:outline-none"
-          >
-            <span className="block text-sm">{fact.body}</span>
-            <span className="mt-1 block text-xs text-muted-foreground">
-              {formatProvenance(fact)}
-            </span>
-          </button>
-        </li>
-      ))}
-    </ul>
+    <div>
+      <h4 className="text-2xs font-medium text-muted-foreground">{title}</h4>
+      <ul className="mt-1 flex flex-wrap gap-1.5">
+        {chips.map((chip) => {
+          const expanded = chip.id === openId;
+          return (
+            <li key={chip.id}>
+              <button
+                type="button"
+                aria-expanded={expanded}
+                onClick={() => setOpenId(expanded ? null : chip.id)}
+                className="rounded-full border border-border bg-background/60 px-2.5 py-1 text-2xs hover:bg-accent/40 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring focus-visible:outline-none"
+              >
+                {chip.label}
+              </button>
+            </li>
+          );
+        })}
+      </ul>
+      {open === null ? null : (
+        <div className="mt-2 rounded-lg border border-border/80 bg-background/40 px-3 py-2">
+          <p className="text-sm">{open.body}</p>
+          {open.fact === null ? null : (
+            <>
+              <p className="mt-1 text-2xs text-muted-foreground">{formatProvenance(open.fact)}</p>
+              <EvidenceLines factId={open.fact.factId} />
+              <div className="mt-2 flex items-center gap-2">
+                <Badge size="sm" variant="secondary">
+                  {open.fact.kind}
+                </Badge>
+                <Button size="sm" variant="ghost" onClick={() => onOpenRecord(open.fact!.factId)}>
+                  Open record
+                </Button>
+              </div>
+            </>
+          )}
+        </div>
+      )}
+    </div>
   );
 }
 
-function EvidenceList({ factId }: { factId: string }) {
+function EvidenceLines({ factId }: { factId: string }) {
   const evidence = linkedEvidence(factId);
   if (evidence.length === 0) return null;
   return (
-    <ul className="mt-2 flex flex-col gap-1 text-xs text-muted-foreground">
+    <ul className="mt-1 flex flex-col gap-0.5 text-2xs text-muted-foreground">
       {evidence.map((item) => (
         <li key={`${item.label}:${item.detail}`}>
           {item.label}: {item.detail}
@@ -126,4 +139,9 @@ function EvidenceList({ factId }: { factId: string }) {
       ))}
     </ul>
   );
+}
+
+function shortLabel(body: string): string {
+  const clean = body.replace(/\.$/, "");
+  return clean.length > 32 ? `${clean.slice(0, 32)}…` : clean;
 }
