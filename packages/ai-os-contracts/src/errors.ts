@@ -6,6 +6,11 @@ export const ContractName = Schema.Literals([
   "completion",
   "qa",
   "sequence",
+  "progress",
+  "memory",
+  "usage",
+  "control",
+  "delivery",
 ]);
 export type ContractName = typeof ContractName.Type;
 
@@ -19,6 +24,8 @@ export const SequencePhase = Schema.Literals([
   "rework",
   "accepted",
   "recovery_pending",
+  "failed",
+  "cancelled",
 ]);
 export type SequencePhase = typeof SequencePhase.Type;
 
@@ -33,6 +40,11 @@ export const ContractErrorReason = Schema.Literals([
   "revision_mismatch",
   "recovery_pending_not_ready",
   "invalid_payload",
+  "stale_generation",
+  "retry_limit_reached",
+  "idempotency_conflict",
+  "delivery_revision_mismatch",
+  "memory_not_eligible",
 ]);
 export type ContractErrorReason = typeof ContractErrorReason.Type;
 

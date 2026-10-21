@@ -235,5 +235,17 @@ export const TaskLink = Schema.String.check(
 );
 export type TaskLink = typeof TaskLink.Type;
 
+export const NonNegativeInt = Schema.Int.check(
+  Schema.isGreaterThanOrEqualTo(0),
+  Schema.isLessThanOrEqualTo(1_000_000),
+);
+export type NonNegativeInt = typeof NonNegativeInt.Type;
+
+export const PositiveInt = Schema.Int.check(
+  Schema.isGreaterThanOrEqualTo(1),
+  Schema.isLessThanOrEqualTo(1_000_000),
+);
+export type PositiveInt = typeof PositiveInt.Type;
+
 export const ContractVersion = Schema.Literal("v1");
 export type ContractVersion = typeof ContractVersion.Type;

@@ -194,7 +194,7 @@ it.effect("blocks an expired lease as recovery_pending and does not return it to
       const error = yield* failure(blocked, event);
       assert.strictEqual(error.reason, "recovery_pending_not_ready");
     }
-    assert.deepStrictEqual(LEGAL_EVENTS.recovery_pending, []);
+    assert.deepStrictEqual(LEGAL_EVENTS.recovery_pending, ["resolve_recovery"]);
   }),
 );
 
@@ -343,6 +343,167 @@ it.effect("rejects schema-invalid input on every transition", () =>
           qa: { ...qaReworkExample, qaModel: "gpt-\u200b5.4" },
         },
       ],
+      [
+        executing,
+        {
+          type: "report_progress",
+          report: {
+            version: "v1",
+            taskId: "task-usba-page",
+            attemptId: "attempt-1",
+            generation: 1,
+            status: "working",
+            blockers: [
+              {
+                summary: "The preview is down.",
+                ownerId: "t3-codex",
+                nextAction: "Restore the preview.",
+              },
+            ],
+            partialArtifacts: [],
+          },
+        },
+      ],
+      [
+        executing,
+        {
+          type: "heartbeat",
+          heartbeat: {
+            version: "v1",
+            taskId: "task-usba-page",
+            attemptId: "attempt-1",
+            generation: 1,
+            leaseId: "lease-1",
+            observedAt: "2026-10-21T15:00:00Z",
+            leaseExpiresAt: "2026-10-21T15:00:00Z",
+          },
+        },
+      ],
+      [
+        executing,
+        {
+          type: "heartbeat_lapsed",
+          lapse: {
+            version: "v1",
+            taskId: "task-usba-page",
+            attemptId: "attempt-1",
+            generation: 0,
+          },
+        },
+      ],
+      [
+        executing,
+        {
+          type: "report_usage",
+          measurement: {
+            kind: "reported_tokens",
+            inputTokens: 1,
+            outputTokens: 1,
+            amountMinor: 5,
+            attribution: {
+              projectId: "usba",
+              taskId: "task-usba-page",
+              attemptId: "attempt-1",
+              agentId: "codex",
+              platform: "t3",
+              provider: "openai",
+              model: "gpt-5.4",
+            },
+          },
+        },
+      ],
+      [
+        executing,
+        {
+          type: "cancel",
+          command: {
+            command: "cancel",
+            idempotencyKey: "cancel-1",
+            taskId: "task-usba-page",
+            attemptId: "attempt-1",
+            claimedOutcome: "done",
+          },
+        },
+      ],
+      [
+        executing,
+        {
+          type: "continue",
+          command: { command: "continue", idempotencyKey: "continue-1", taskId: "task-usba-page" },
+        },
+      ],
+      [
+        executing,
+        {
+          type: "retry",
+          command: {
+            command: "cancel",
+            idempotencyKey: "retry-1",
+            taskId: "task-usba-page",
+            attemptId: "attempt-1",
+          },
+        },
+      ],
+      [
+        executing,
+        {
+          type: "transfer_ownership",
+          command: {
+            command: "transfer_ownership",
+            idempotencyKey: "transfer-1",
+            taskId: "task-usba-page",
+            attemptId: "attempt-1",
+          },
+        },
+      ],
+      [
+        executing,
+        {
+          type: "fail",
+          command: {
+            command: "fail",
+            idempotencyKey: "fail-1",
+            taskId: "task-usba-page",
+            attemptId: "attempt-1",
+            blocker: { summary: "The build failed.", ownerId: "t3-codex", nextAction: " " },
+          },
+        },
+      ],
+      [
+        executing,
+        {
+          type: "resolve_recovery",
+          command: {
+            command: "resolve_recovery",
+            outcome: "fail",
+            idempotencyKey: "resolve-1",
+            taskId: "task-usba-page",
+            attemptId: "attempt-1",
+          },
+        },
+      ],
+      [
+        executing,
+        {
+          type: "deliver",
+          delivery: {
+            version: "v1",
+            taskId: "task-usba-page",
+            attemptId: "attempt-1",
+            acceptedRevision: revisionTwo,
+            destination: "conversation",
+            idempotencyKey: "deliver-1",
+            deliveredAt: "2026-10-21T16:00:00Z",
+          },
+        },
+      ],
+      [
+        executing,
+        {
+          type: "submit_completion",
+          completion: { ...completionExample, idempotencyKey: "claim-1" },
+        },
+      ],
     ] as const;
     for (const [state, event] of cases) {
       const error = yield* failure(state, event);
@@ -402,8 +563,12 @@ it.effect("rejects an accepted phase that has no completion or independent QA ve
     const acceptedTooEarly = yield* Effect.exit(
       decodeSequenceState({ ...awaiting, qa: qaAcceptExample }),
     );
+    const bareFailed = yield* Effect.exit(decodeSequenceState({ phase: "failed" }));
+    const bareCancelled = yield* Effect.exit(decodeSequenceState({ phase: "cancelled" }));
     assert.strictEqual(Exit.isFailure(sameModel), true);
     assert.strictEqual(Exit.isFailure(acceptedTooEarly), true);
+    assert.strictEqual(Exit.isFailure(bareFailed), true);
+    assert.strictEqual(Exit.isFailure(bareCancelled), true);
   }),
 );
 
