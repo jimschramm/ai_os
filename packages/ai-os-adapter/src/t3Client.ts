@@ -72,6 +72,20 @@ export const T3OrchestrationRpc = RpcGroup.make(
 ).middleware(RpcScopeAuthorization);
 
 const decodeAccessToken = Schema.decodeUnknownEffect(Schema.fromJsonString(AuthAccessTokenResult));
+const decodeProjectList = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(
+    Schema.Struct({
+      projects: Schema.Array(
+        Schema.Struct({
+          id: Schema.String,
+          title: Schema.String,
+          workspaceRoot: Schema.String,
+          deletedAt: Schema.NullOr(Schema.String),
+        }),
+      ),
+    }),
+  ),
+);
 const WebSocketTicketJson = Schema.toCodecJson(AuthWebSocketTicketResult);
 const decodeWebSocketTicket = Schema.decodeUnknownEffect(
   Schema.fromJsonString(WebSocketTicketJson),
@@ -110,12 +124,19 @@ export interface T3ContinueRequest {
   readonly text: string;
 }
 
+export interface T3ProjectSummary {
+  readonly id: string;
+  readonly title: string;
+  readonly workspaceRoot: string;
+}
+
 export interface T3LocalClient {
   readonly launch: (input: T3LaunchRequest) => Effect.Effect<T3LaunchResult, GrokT3Error>;
   readonly read: (threadId: string) => Effect.Effect<T3ThreadView, GrokT3Error>;
   readonly interrupt: (threadId: string, runId: string) => Effect.Effect<void, GrokT3Error>;
   readonly continueRun: (input: T3ContinueRequest) => Effect.Effect<void, GrokT3Error>;
   readonly publishBoard: (cards: readonly AdapterBoardCard[]) => Effect.Effect<void, GrokT3Error>;
+  readonly listProjectIds: () => Effect.Effect<readonly T3ProjectSummary[], GrokT3Error>;
 }
 
 const unavailable = (detail: string) => new GrokT3Error({ reason: "t3_unavailable", detail });
@@ -398,5 +419,27 @@ export const wsT3LocalClient = (options: T3ClientOptions): T3LocalClient => {
         }
       }),
     );
-  return { launch, read, interrupt, continueRun, publishBoard };
+  const listProjectIds = () =>
+    http(
+      Effect.gen(function* () {
+        const bearer = yield* accessToken;
+        const response = yield* HttpClient.execute(
+          HttpClientRequest.get(`${origin}/api/projects`).pipe(
+            HttpClientRequest.setHeader("authorization", `Bearer ${bearer}`),
+          ),
+        );
+        if (response.status !== 200) {
+          return yield* statusError(response.status, "list projects");
+        }
+        const body = yield* decodeProjectList(yield* response.text).pipe(
+          Effect.mapError(() => unavailable("T3 returned an unreadable project list.")),
+        );
+        return body.projects.flatMap((project) =>
+          project.deletedAt === null
+            ? [{ id: project.id, title: project.title, workspaceRoot: project.workspaceRoot }]
+            : [],
+        );
+      }),
+    );
+  return { launch, read, interrupt, continueRun, publishBoard, listProjectIds };
 };
