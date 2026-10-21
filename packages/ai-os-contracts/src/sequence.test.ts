@@ -15,6 +15,7 @@ import {
   revisionOne,
   revisionTwo,
 } from "./examples.ts";
+import { leaseIdFor } from "./canonical.ts";
 import {
   LEGAL_EVENTS,
   acceptedRevision,
@@ -147,9 +148,16 @@ it.effect("binds acceptance to the exact final revision", () =>
     const awaitingRework = yield* applySequence(happyPathEvents.slice(0, 6));
     const rework = yield* applySequenceEvent(awaitingRework, { type: "qa", qa: qaReworkExample });
     const executing = yield* applySequenceEvent(rework, { type: "start_execution" });
+    if (executing.phase !== "executing") {
+      return yield* Effect.die("Rework must be executing before the repeated submission.");
+    }
     const repeated = yield* failure(executing, {
       type: "submit_completion",
-      completion: completionExample,
+      completion: {
+        ...completionExample,
+        generation: executing.run.generation,
+        leaseId: executing.run.leaseId,
+      },
     });
     assert.strictEqual(repeated.reason, "revision_mismatch");
 
@@ -174,7 +182,15 @@ it.effect("binds acceptance to the exact final revision", () =>
 it.effect("blocks an expired lease as recovery_pending and does not return it to Ready", () =>
   Effect.gen(function* () {
     const executing = yield* applySequence(happyPathEvents.slice(0, 4));
-    const blocked = yield* applySequenceEvent(executing, { type: "lease_expired" });
+    const blocked = yield* applySequenceEvent(executing, {
+      type: "lease_expired",
+      lease: {
+        taskId: "task-usba-page",
+        attemptId: "attempt-1",
+        generation: 1,
+        leaseId: leaseIdFor(1),
+      },
+    });
     if (blocked.phase !== "recovery_pending") {
       return yield* Effect.die("An expired lease must be recovery_pending.");
     }
@@ -186,7 +202,15 @@ it.effect("blocks an expired lease as recovery_pending and does not return it to
       { type: "acknowledge", acknowledgment: acknowledgmentExample },
       { type: "assign", assignment: assignmentExample },
       { type: "start_execution" },
-      { type: "lease_expired" },
+      {
+        type: "lease_expired",
+        lease: {
+          taskId: "task-usba-page",
+          attemptId: "attempt-1",
+          generation: 1,
+          leaseId: leaseIdFor(1),
+        },
+      },
       { type: "submit_completion", completion: completionExample },
       { type: "qa", qa: qaAcceptExample },
     ];
@@ -194,7 +218,7 @@ it.effect("blocks an expired lease as recovery_pending and does not return it to
       const error = yield* failure(blocked, event);
       assert.strictEqual(error.reason, "recovery_pending_not_ready");
     }
-    assert.deepStrictEqual(LEGAL_EVENTS.recovery_pending, []);
+    assert.deepStrictEqual(LEGAL_EVENTS.recovery_pending, ["resolve_recovery"]);
   }),
 );
 
@@ -343,6 +367,205 @@ it.effect("rejects schema-invalid input on every transition", () =>
           qa: { ...qaReworkExample, qaModel: "gpt-\u200b5.4" },
         },
       ],
+      [
+        executing,
+        {
+          type: "report_progress",
+          report: {
+            version: "v1",
+            taskId: "task-usba-page",
+            attemptId: "attempt-1",
+            generation: 1,
+            leaseId: leaseIdFor(1),
+            status: "working",
+            blockers: [
+              {
+                summary: "The preview is down.",
+                ownerId: "t3-codex",
+                nextAction: "Restore the preview.",
+              },
+            ],
+            partialArtifacts: [],
+          },
+        },
+      ],
+      [
+        executing,
+        {
+          type: "heartbeat",
+          heartbeat: {
+            version: "v1",
+            taskId: "task-usba-page",
+            attemptId: "attempt-1",
+            generation: 1,
+            leaseId: "lease-1",
+            observedAt: "2026-10-21T15:00:00Z",
+            leaseExpiresAt: "2026-10-21T15:00:00Z",
+          },
+        },
+      ],
+      [
+        executing,
+        {
+          type: "heartbeat_lapsed",
+          lapse: {
+            version: "v1",
+            taskId: "task-usba-page",
+            attemptId: "attempt-1",
+            generation: 0,
+            leaseId: leaseIdFor(1),
+          },
+        },
+      ],
+      [
+        executing,
+        {
+          type: "report_usage",
+          generation: 1,
+          leaseId: leaseIdFor(1),
+          measurement: {
+            kind: "reported_tokens",
+            inputTokens: 1,
+            outputTokens: 1,
+            amountMinor: 5,
+            attribution: {
+              projectId: "usba",
+              taskId: "task-usba-page",
+              attemptId: "attempt-1",
+              agentId: "codex",
+              platform: "t3",
+              provider: "openai",
+              model: "gpt-5.4",
+            },
+          },
+        },
+      ],
+      [
+        executing,
+        {
+          type: "cancel",
+          command: {
+            command: "cancel",
+            idempotencyKey: "cancel-1",
+            taskId: "task-usba-page",
+            attemptId: "attempt-1",
+            claimedOutcome: "done",
+          },
+        },
+      ],
+      [
+        executing,
+        {
+          type: "continue",
+          command: { command: "continue", idempotencyKey: "continue-1", taskId: "task-usba-page" },
+        },
+      ],
+      [
+        executing,
+        {
+          type: "retry",
+          command: {
+            command: "cancel",
+            idempotencyKey: "retry-1",
+            taskId: "task-usba-page",
+            attemptId: "attempt-1",
+          },
+        },
+      ],
+      [
+        executing,
+        {
+          type: "transfer_ownership",
+          command: {
+            command: "transfer_ownership",
+            idempotencyKey: "transfer-1",
+            taskId: "task-usba-page",
+            attemptId: "attempt-1",
+          },
+        },
+      ],
+      [
+        executing,
+        {
+          type: "fail",
+          command: {
+            command: "fail",
+            idempotencyKey: "fail-1",
+            taskId: "task-usba-page",
+            attemptId: "attempt-1",
+            blocker: {
+              summary: "The build failed.",
+              ownerId: "t3-codex",
+              nextAction: "Read the log.",
+            },
+          },
+        },
+      ],
+      [
+        executing,
+        {
+          type: "fail",
+          failure: {
+            taskId: "task-usba-page",
+            attemptId: "attempt-1",
+            generation: 1,
+            leaseId: "lease-1",
+            blocker: { summary: "The build failed.", ownerId: "t3-codex", nextAction: " " },
+          },
+        },
+      ],
+      [
+        executing,
+        {
+          type: "operator_fail",
+          command: {
+            command: "operator_fail",
+            idempotencyKey: "fail-1",
+            taskId: "task-usba-page",
+            attemptId: "attempt-1",
+            blocker: {
+              summary: "The build failed.",
+              ownerId: "t3-codex",
+              nextAction: "Read the log.",
+            },
+          },
+        },
+      ],
+      [
+        executing,
+        {
+          type: "resolve_recovery",
+          command: {
+            command: "resolve_recovery",
+            outcome: "fail",
+            idempotencyKey: "resolve-1",
+            taskId: "task-usba-page",
+            attemptId: "attempt-1",
+          },
+        },
+      ],
+      [
+        executing,
+        {
+          type: "deliver",
+          delivery: {
+            version: "v1",
+            taskId: "task-usba-page",
+            attemptId: "attempt-1",
+            acceptedRevision: revisionTwo,
+            destination: "conversation",
+            idempotencyKey: "deliver-1",
+            deliveredAt: "2026-10-21T16:00:00Z",
+          },
+        },
+      ],
+      [
+        executing,
+        {
+          type: "submit_completion",
+          completion: { ...completionExample, idempotencyKey: "claim-1" },
+        },
+      ],
     ] as const;
     for (const [state, event] of cases) {
       const error = yield* failure(state, event);
@@ -402,8 +625,12 @@ it.effect("rejects an accepted phase that has no completion or independent QA ve
     const acceptedTooEarly = yield* Effect.exit(
       decodeSequenceState({ ...awaiting, qa: qaAcceptExample }),
     );
+    const bareFailed = yield* Effect.exit(decodeSequenceState({ phase: "failed" }));
+    const bareCancelled = yield* Effect.exit(decodeSequenceState({ phase: "cancelled" }));
     assert.strictEqual(Exit.isFailure(sameModel), true);
     assert.strictEqual(Exit.isFailure(acceptedTooEarly), true);
+    assert.strictEqual(Exit.isFailure(bareFailed), true);
+    assert.strictEqual(Exit.isFailure(bareCancelled), true);
   }),
 );
 
@@ -458,13 +685,78 @@ it.effect("treats a rework revision as stale when only the git SHA case differs"
       return yield* Effect.die("Rework must record the reviewed git revision.");
     }
     const executing = yield* applySequenceEvent(rework, { type: "start_execution" });
+    if (executing.phase !== "executing") {
+      return yield* Effect.die("Rework must be executing before the repeated submission.");
+    }
     const repeated = yield* failure(executing, {
       type: "submit_completion",
       completion: {
         ...completionExample,
+        generation: executing.run.generation,
+        leaseId: executing.run.leaseId,
         artifactRevision: { type: "git", sha: rework.reworkRevision.sha.toUpperCase() },
       },
     });
     assert.strictEqual(repeated.reason, "revision_mismatch");
+  }),
+);
+
+it.effect("rejects stored progress or completion that names a different run", () =>
+  Effect.gen(function* () {
+    const executing = yield* applySequence(happyPathEvents.slice(0, 4));
+    if (executing.phase !== "executing") {
+      return yield* Effect.die("The run must be executing.");
+    }
+    const forgedProgress = {
+      ...executing,
+      run: {
+        ...executing.run,
+        progress: {
+          version: "v1" as const,
+          taskId: "task-usba-page",
+          attemptId: "attempt-1",
+          generation: 2,
+          leaseId: leaseIdFor(2),
+          status: "working" as const,
+          blockers: [],
+          partialArtifacts: [],
+        },
+      },
+    };
+    const progressState = yield* Effect.exit(decodeSequenceState(forgedProgress));
+    const progressWrite = yield* failure(forgedProgress, { type: "start_execution" });
+    assert.strictEqual(Exit.isFailure(progressState), true);
+    assert.strictEqual(progressWrite.reason, "invalid_payload");
+    assert.strictEqual(progressWrite.from, "executing");
+
+    const awaiting = yield* applySequence(happyPathEvents.slice(0, 5));
+    if (awaiting.phase !== "awaiting_qa") {
+      return yield* Effect.die("The completion must be awaiting QA.");
+    }
+    const forgedCompletion = {
+      ...awaiting,
+      completion: {
+        ...awaiting.completion,
+        generation: awaiting.run.generation,
+        leaseId: "lease-9",
+      },
+    };
+    const completionState = yield* Effect.exit(decodeSequenceState(forgedCompletion));
+    const qaOverStale = yield* failure(forgedCompletion, { type: "qa", qa: qaWaitingExample });
+    assert.strictEqual(Exit.isFailure(completionState), true);
+    assert.strictEqual(qaOverStale.reason, "invalid_payload");
+    assert.strictEqual(qaOverStale.from, "awaiting_qa");
+    assert.strictEqual(qaOverStale.event, "qa");
+
+    const accepted = yield* applySequence(happyPathEvents);
+    if (accepted.phase !== "accepted") {
+      return yield* Effect.die("The happy path must be accepted.");
+    }
+    const forgedAccepted = {
+      ...accepted,
+      completion: { ...accepted.completion, generation: accepted.run.generation + 1 },
+    };
+    const acceptedState = yield* Effect.exit(decodeSequenceState(forgedAccepted));
+    assert.strictEqual(Exit.isFailure(acceptedState), true);
   }),
 );

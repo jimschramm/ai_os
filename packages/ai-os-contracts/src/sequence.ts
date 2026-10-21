@@ -4,13 +4,32 @@ import * as Schema from "effect/Schema";
 import { AssignmentV1, freezeSnapshot } from "./assignment.ts";
 import { CompletionSubmissionV1 } from "./completion.ts";
 import {
+  AppliedCommandV1,
+  CancelCommandV1,
+  ContinueCommandV1,
+  type ControlCommandV1,
+  DEFAULT_RETRY_LIMIT,
+  OperatorFailCommandV1,
+  ResolveRecoveryCommandV1,
+  RetryCommandV1,
+  TransferOwnershipCommandV1,
+  commandFingerprint,
+  rememberCommand,
+} from "./control.ts";
+import { leaseIdFor } from "./canonical.ts";
+import {
   ArtifactRevisionV1,
+  ContractId,
+  IsoDateTime,
+  NonNegativeInt,
+  PositiveInt,
   type ModelRef,
   sameModelName,
   sameRevision,
   strictParse,
   taskLinkMatches,
 } from "./common.ts";
+import { DeliveryAckV1, ResultDeliveryV1, ackFor, deliveryFingerprint } from "./delivery.ts";
 import {
   ContractName,
   ContractTransitionError,
@@ -18,26 +37,55 @@ import {
   SequencePhase,
   type ContractErrorReason,
 } from "./errors.ts";
-import { IntakeAcknowledgmentV1, IntakeV1 } from "./intake.ts";
+import { Intake, IntakeAcknowledgmentV1 } from "./intake.ts";
+import {
+  BlockerV1,
+  HeartbeatLapseV1,
+  HeartbeatV1,
+  LeaseExpiredV1,
+  ProgressReportV1,
+  WorkerFailV1,
+} from "./progress.ts";
 import { QaAcceptV1, QaReworkV1, QaUnavailableV1, QaVerdictV1 } from "./qa.ts";
+import { UsageMeasurementV1 } from "./usage.ts";
 
 export const KanbanColumn = Schema.Literals(["Ready", "Running", "Blocked", "Review", "Done"]);
 export type KanbanColumn = typeof KanbanColumn.Type;
 
 export const SequenceEvent = Schema.Union([
-  Schema.Struct({ type: Schema.Literal("intake"), intake: IntakeV1 }),
+  Schema.Struct({ type: Schema.Literal("intake"), intake: Intake }),
   Schema.Struct({
     type: Schema.Literal("acknowledge"),
     acknowledgment: IntakeAcknowledgmentV1,
   }),
   Schema.Struct({ type: Schema.Literal("assign"), assignment: AssignmentV1 }),
   Schema.Struct({ type: Schema.Literal("start_execution") }),
-  Schema.Struct({ type: Schema.Literal("lease_expired") }),
+  Schema.Struct({ type: Schema.Literal("lease_expired"), lease: LeaseExpiredV1 }),
   Schema.Struct({
     type: Schema.Literal("submit_completion"),
     completion: CompletionSubmissionV1,
   }),
   Schema.Struct({ type: Schema.Literal("qa"), qa: QaVerdictV1 }),
+  Schema.Struct({ type: Schema.Literal("report_progress"), report: ProgressReportV1 }),
+  Schema.Struct({ type: Schema.Literal("heartbeat"), heartbeat: HeartbeatV1 }),
+  Schema.Struct({ type: Schema.Literal("heartbeat_lapsed"), lapse: HeartbeatLapseV1 }),
+  Schema.Struct({
+    type: Schema.Literal("report_usage"),
+    generation: PositiveInt,
+    leaseId: ContractId,
+    measurement: UsageMeasurementV1,
+  }),
+  Schema.Struct({ type: Schema.Literal("cancel"), command: CancelCommandV1 }),
+  Schema.Struct({ type: Schema.Literal("continue"), command: ContinueCommandV1 }),
+  Schema.Struct({ type: Schema.Literal("retry"), command: RetryCommandV1 }),
+  Schema.Struct({
+    type: Schema.Literal("transfer_ownership"),
+    command: TransferOwnershipCommandV1,
+  }),
+  Schema.Struct({ type: Schema.Literal("fail"), failure: WorkerFailV1 }),
+  Schema.Struct({ type: Schema.Literal("operator_fail"), command: OperatorFailCommandV1 }),
+  Schema.Struct({ type: Schema.Literal("resolve_recovery"), command: ResolveRecoveryCommandV1 }),
+  Schema.Struct({ type: Schema.Literal("deliver"), delivery: ResultDeliveryV1 }),
 ]);
 export type SequenceEvent = typeof SequenceEvent.Type;
 
@@ -88,6 +136,14 @@ const independentQa = (
     : "The QA payload names a different implementer than the assignment.";
 };
 
+const workerRecordMatchesRun = (
+  run: { readonly generation: number; readonly leaseId: string },
+  record: { readonly generation: number; readonly leaseId: string },
+): true | string =>
+  record.generation === run.generation && record.leaseId === run.leaseId
+    ? true
+    : "Stored worker data must name the current generation and lease.";
+
 const reviewedRevision = (
   completion: CompletionSubmissionV1,
   qa: { readonly artifactRevision: ArtifactRevisionV1 },
@@ -109,42 +165,92 @@ export type IdleState = typeof IdleState.Type;
 
 export const RequestedState = Schema.Struct({
   phase: Schema.Literal("requested"),
-  intake: IntakeV1,
+  intake: Intake,
 });
 export type RequestedState = typeof RequestedState.Type;
 
 export const AcknowledgedState = Schema.Struct({
   phase: Schema.Literal("acknowledged"),
-  intake: IntakeV1,
+  intake: Intake,
   acknowledgment: IntakeAcknowledgmentV1,
 }).check(Schema.makeFilter((state) => linked(state.acknowledgment)));
 export type AcknowledgedState = typeof AcknowledgedState.Type;
 
+export const RunV1 = Schema.Struct({
+  generation: PositiveInt,
+  leaseId: ContractId,
+  leaseExpiresAt: Schema.NullOr(IsoDateTime),
+  progress: Schema.NullOr(ProgressReportV1),
+  retryCount: NonNegativeInt,
+  retryLimit: PositiveInt,
+  usage: Schema.Array(UsageMeasurementV1),
+}).check(
+  Schema.makeFilter((run) => {
+    if (run.retryCount > run.retryLimit) {
+      return "The retry count is above the limit.";
+    }
+    if (run.leaseId !== leaseIdFor(run.generation)) {
+      return "The lease is bound to the generation.";
+    }
+    return run.progress === null ? true : workerRecordMatchesRun(run, run.progress);
+  }),
+);
+export type RunV1 = typeof RunV1.Type;
+
+const freshRun = (generation: number, previous?: RunV1): RunV1 => ({
+  generation,
+  leaseId: leaseIdFor(generation),
+  leaseExpiresAt: null,
+  progress: null,
+  retryCount: previous?.retryCount ?? 0,
+  retryLimit: previous?.retryLimit ?? DEFAULT_RETRY_LIMIT,
+  usage: previous?.usage ?? [],
+});
+
 export const AssignedState = Schema.Struct({
   phase: Schema.Literal("assigned"),
-  intake: IntakeV1,
+  intake: Intake,
   acknowledgment: IntakeAcknowledgmentV1,
   assignment: AssignmentV1,
-}).check(Schema.makeFilter((state) => assignedTo(state.acknowledgment, state.assignment)));
+  reworkRevision: Schema.NullOr(ArtifactRevisionV1),
+  heldRun: Schema.NullOr(RunV1),
+  commands: Schema.Array(AppliedCommandV1),
+  nextGeneration: PositiveInt,
+}).check(
+  Schema.makeFilter((state) => {
+    const link = assignedTo(state.acknowledgment, state.assignment);
+    if (link !== true) {
+      return link;
+    }
+    if (state.heldRun !== null && state.nextGeneration !== state.heldRun.generation + 1) {
+      return "The next generation must follow the held run.";
+    }
+    return true;
+  }),
+);
 export type AssignedState = typeof AssignedState.Type;
 
 export const ExecutingState = Schema.Struct({
   phase: Schema.Literal("executing"),
-  intake: IntakeV1,
+  intake: Intake,
   acknowledgment: IntakeAcknowledgmentV1,
   assignment: AssignmentV1,
   reworkRevision: Schema.NullOr(ArtifactRevisionV1),
+  run: RunV1,
+  commands: Schema.Array(AppliedCommandV1),
 }).check(Schema.makeFilter((state) => assignedTo(state.acknowledgment, state.assignment)));
 export type ExecutingState = typeof ExecutingState.Type;
 
 export const AwaitingQaState = Schema.Struct({
   phase: Schema.Literal("awaiting_qa"),
-  intake: IntakeV1,
+  intake: Intake,
   acknowledgment: IntakeAcknowledgmentV1,
   assignment: AssignmentV1,
   completion: CompletionSubmissionV1,
   qa: Schema.NullOr(QaUnavailableV1),
   reworkRevision: Schema.NullOr(ArtifactRevisionV1),
+  run: RunV1,
+  commands: Schema.Array(AppliedCommandV1),
 }).check(
   Schema.makeFilter((state) => {
     const match = payloadMatches(state.acknowledgment, state.assignment, state.completion);
@@ -163,19 +269,21 @@ export const AwaitingQaState = Schema.Struct({
     ) {
       return "The submitted revision was already sent back for rework.";
     }
-    return true;
+    return workerRecordMatchesRun(state.run, state.completion);
   }),
 );
 export type AwaitingQaState = typeof AwaitingQaState.Type;
 
 export const ReworkState = Schema.Struct({
   phase: Schema.Literal("rework"),
-  intake: IntakeV1,
+  intake: Intake,
   acknowledgment: IntakeAcknowledgmentV1,
   assignment: AssignmentV1,
   completion: CompletionSubmissionV1,
   qa: QaReworkV1,
   reworkRevision: ArtifactRevisionV1,
+  run: RunV1,
+  commands: Schema.Array(AppliedCommandV1),
 }).check(
   Schema.makeFilter((state) => {
     const match = payloadMatches(state.acknowledgment, state.assignment, state.completion);
@@ -193,18 +301,22 @@ export const ReworkState = Schema.Struct({
     if (!sameRevision(state.qa.artifactRevision, state.reworkRevision)) {
       return "Rework records the revision that was reviewed.";
     }
-    return reviewedRevision(state.completion, state.qa, null);
+    const current = workerRecordMatchesRun(state.run, state.completion);
+    return current === true ? reviewedRevision(state.completion, state.qa, null) : current;
   }),
 );
 export type ReworkState = typeof ReworkState.Type;
 
 export const AcceptedState = Schema.Struct({
   phase: Schema.Literal("accepted"),
-  intake: IntakeV1,
+  intake: Intake,
   acknowledgment: IntakeAcknowledgmentV1,
   assignment: AssignmentV1,
   completion: CompletionSubmissionV1,
   qa: QaAcceptV1,
+  run: RunV1,
+  commands: Schema.Array(AppliedCommandV1),
+  deliveries: Schema.Array(DeliveryAckV1),
 }).check(
   Schema.makeFilter((state) => {
     const match = payloadMatches(state.acknowledgment, state.assignment, state.completion);
@@ -222,20 +334,47 @@ export const AcceptedState = Schema.Struct({
     if (!sameRevision(state.qa.acceptedRevision, state.qa.artifactRevision)) {
       return "Acceptance is bound to the exact artifact revision.";
     }
-    return reviewedRevision(state.completion, state.qa, null);
+    const current = workerRecordMatchesRun(state.run, state.completion);
+    return current === true ? reviewedRevision(state.completion, state.qa, null) : current;
   }),
 );
 export type AcceptedState = typeof AcceptedState.Type;
 
 export const RecoveryPendingState = Schema.Struct({
   phase: Schema.Literal("recovery_pending"),
-  intake: IntakeV1,
+  intake: Intake,
   acknowledgment: IntakeAcknowledgmentV1,
   assignment: AssignmentV1,
   reworkRevision: Schema.NullOr(ArtifactRevisionV1),
   recoveryLabel: Schema.Literal(RECOVERY_PENDING_LABEL),
+  run: RunV1,
+  commands: Schema.Array(AppliedCommandV1),
 }).check(Schema.makeFilter((state) => assignedTo(state.acknowledgment, state.assignment)));
 export type RecoveryPendingState = typeof RecoveryPendingState.Type;
+
+export const FailedState = Schema.Struct({
+  phase: Schema.Literal("failed"),
+  intake: Intake,
+  acknowledgment: IntakeAcknowledgmentV1,
+  assignment: AssignmentV1,
+  reworkRevision: Schema.NullOr(ArtifactRevisionV1),
+  run: RunV1,
+  commands: Schema.Array(AppliedCommandV1),
+  blocker: BlockerV1,
+}).check(Schema.makeFilter((state) => assignedTo(state.acknowledgment, state.assignment)));
+export type FailedState = typeof FailedState.Type;
+
+export const CancelledState = Schema.Struct({
+  phase: Schema.Literal("cancelled"),
+  intake: Intake,
+  acknowledgment: IntakeAcknowledgmentV1,
+  assignment: AssignmentV1,
+  reworkRevision: Schema.NullOr(ArtifactRevisionV1),
+  run: Schema.NullOr(RunV1),
+  commands: Schema.Array(AppliedCommandV1),
+  nextGeneration: PositiveInt,
+}).check(Schema.makeFilter((state) => assignedTo(state.acknowledgment, state.assignment)));
+export type CancelledState = typeof CancelledState.Type;
 
 export const SequenceState = Schema.Union([
   IdleState,
@@ -247,6 +386,8 @@ export const SequenceState = Schema.Union([
   ReworkState,
   AcceptedState,
   RecoveryPendingState,
+  FailedState,
+  CancelledState,
 ]);
 export type SequenceState = typeof SequenceState.Type;
 
@@ -254,12 +395,25 @@ export const LEGAL_EVENTS = {
   idle: ["intake"],
   requested: ["acknowledge"],
   acknowledged: ["assign"],
-  assigned: ["start_execution"],
-  executing: ["submit_completion", "lease_expired"],
-  awaiting_qa: ["qa"],
-  rework: ["start_execution"],
-  accepted: ["start_execution"],
-  recovery_pending: [],
+  assigned: ["start_execution", "cancel", "transfer_ownership"],
+  executing: [
+    "submit_completion",
+    "lease_expired",
+    "report_progress",
+    "heartbeat",
+    "heartbeat_lapsed",
+    "report_usage",
+    "cancel",
+    "fail",
+    "operator_fail",
+    "transfer_ownership",
+  ],
+  awaiting_qa: ["qa", "cancel"],
+  rework: ["start_execution", "cancel"],
+  accepted: ["start_execution", "deliver"],
+  recovery_pending: ["resolve_recovery"],
+  failed: ["retry"],
+  cancelled: ["continue"],
 } as const satisfies Record<SequencePhase, ReadonlyArray<SequenceEvent["type"]>>;
 
 export const initialSequenceState: SequenceState = { phase: "idle" };
@@ -281,6 +435,9 @@ export const kanbanColumn = (phase: SequencePhase): KanbanColumn | null => {
       return "Review";
     case "accepted":
       return "Done";
+    case "failed":
+    case "cancelled":
+      return null;
   }
 };
 
@@ -298,8 +455,24 @@ const contractFor = (event: SequenceEvent): ContractName => {
       return "completion";
     case "qa":
       return "qa";
+    case "report_progress":
+    case "heartbeat":
+    case "heartbeat_lapsed":
+      return "progress";
+    case "report_usage":
+      return "usage";
+    case "cancel":
+    case "continue":
+    case "retry":
+    case "transfer_ownership":
+    case "operator_fail":
+    case "resolve_recovery":
+      return "control";
+    case "deliver":
+      return "delivery";
     case "start_execution":
     case "lease_expired":
+    case "fail":
       return "sequence";
   }
 };
@@ -373,6 +546,10 @@ const applyAssign = (
       intake: state.intake,
       acknowledgment: state.acknowledgment,
       assignment: freezeSnapshot(event.assignment),
+      reworkRevision: null,
+      heldRun: null,
+      commands: [],
+      nextGeneration: 1,
     };
   });
 
@@ -380,13 +557,26 @@ const applyStart = (
   state: SequenceState,
   event: Extract<SequenceEvent, { type: "start_execution" }>,
 ): Effect.Effect<SequenceState, ContractTransitionError> => {
-  if (state.phase === "assigned" || state.phase === "accepted") {
+  if (state.phase === "assigned") {
+    return Effect.succeed({
+      phase: "executing",
+      intake: state.intake,
+      acknowledgment: state.acknowledgment,
+      assignment: state.assignment,
+      reworkRevision: state.reworkRevision,
+      run: freshRun(state.nextGeneration, state.heldRun ?? undefined),
+      commands: state.commands,
+    });
+  }
+  if (state.phase === "accepted") {
     return Effect.succeed({
       phase: "executing",
       intake: state.intake,
       acknowledgment: state.acknowledgment,
       assignment: state.assignment,
       reworkRevision: null,
+      run: freshRun(state.run.generation + 1, state.run),
+      commands: state.commands,
     });
   }
   if (state.phase === "rework") {
@@ -396,6 +586,8 @@ const applyStart = (
       acknowledgment: state.acknowledgment,
       assignment: state.assignment,
       reworkRevision: state.reworkRevision,
+      run: freshRun(state.run.generation + 1, state.run),
+      commands: state.commands,
     });
   }
   return reject(state, event, "illegal_transition", `Cannot start_execution from ${state.phase}.`);
@@ -404,19 +596,29 @@ const applyStart = (
 const applyLeaseExpired = (
   state: SequenceState,
   event: Extract<SequenceEvent, { type: "lease_expired" }>,
-): Effect.Effect<SequenceState, ContractTransitionError> => {
-  if (state.phase !== "executing") {
-    return reject(state, event, "illegal_transition", `Cannot lease_expired from ${state.phase}.`);
-  }
-  return Effect.succeed({
-    phase: "recovery_pending",
-    intake: state.intake,
-    acknowledgment: state.acknowledgment,
-    assignment: state.assignment,
-    reworkRevision: state.reworkRevision,
-    recoveryLabel: RECOVERY_PENDING_LABEL,
+): Effect.Effect<SequenceState, ContractTransitionError> =>
+  Effect.gen(function* () {
+    if (state.phase !== "executing") {
+      return yield* reject(
+        state,
+        event,
+        "illegal_transition",
+        `Cannot lease_expired from ${state.phase}.`,
+      );
+    }
+    yield* matchesWork(state, event, event.lease);
+    yield* requireLease(state, event, event.lease);
+    return {
+      phase: "recovery_pending" as const,
+      intake: state.intake,
+      acknowledgment: state.acknowledgment,
+      assignment: state.assignment,
+      reworkRevision: state.reworkRevision,
+      recoveryLabel: RECOVERY_PENDING_LABEL,
+      run: state.run,
+      commands: state.commands,
+    };
   });
-};
 
 const applyCompletion = (
   state: SequenceState,
@@ -447,6 +649,7 @@ const applyCompletion = (
         "The payload attempt does not match the open assignment.",
       );
     }
+    yield* requireLease(state, event, event.completion);
     if (
       state.reworkRevision !== null &&
       sameRevision(event.completion.artifactRevision, state.reworkRevision)
@@ -466,6 +669,8 @@ const applyCompletion = (
       completion: event.completion,
       qa: null,
       reworkRevision: state.reworkRevision,
+      run: state.run,
+      commands: state.commands,
     };
   });
 
@@ -476,6 +681,14 @@ const applyQa = (
   Effect.gen(function* () {
     if (state.phase !== "awaiting_qa") {
       return yield* reject(state, event, "illegal_transition", `Cannot qa from ${state.phase}.`);
+    }
+    if (workerRecordMatchesRun(state.run, state.completion) !== true) {
+      return yield* reject(
+        state,
+        event,
+        "stale_generation",
+        "QA is bound to the completion from the current run.",
+      );
     }
     const qa = event.qa;
     if (state.acknowledgment.taskId !== qa.taskId) {
@@ -503,6 +716,8 @@ const applyQa = (
         completion: state.completion,
         qa,
         reworkRevision: state.reworkRevision,
+        run: state.run,
+        commands: state.commands,
       };
     }
     if (sameModelName(qa.qaModel, state.assignment.implementerModel)) {
@@ -546,6 +761,8 @@ const applyQa = (
         completion: state.completion,
         qa,
         reworkRevision: qa.artifactRevision,
+        run: state.run,
+        commands: state.commands,
       };
     }
     return {
@@ -555,7 +772,492 @@ const applyQa = (
       assignment: state.assignment,
       completion: state.completion,
       qa,
+      run: state.run,
+      commands: state.commands,
+      deliveries: [],
     };
+  });
+
+const controlCommandOf = (event: SequenceEvent): ControlCommandV1 | null => {
+  switch (event.type) {
+    case "cancel":
+    case "continue":
+    case "retry":
+    case "transfer_ownership":
+    case "operator_fail":
+    case "resolve_recovery":
+      return event.command;
+    default:
+      return null;
+  }
+};
+
+const replayControl = (
+  state: SequenceState,
+  event: SequenceEvent,
+): Effect.Effect<SequenceState | null, ContractTransitionError> => {
+  const command = controlCommandOf(event);
+  if (command === null || !("commands" in state)) {
+    return Effect.succeed(null);
+  }
+  const fingerprint = commandFingerprint(command);
+  const existing = state.commands.find((entry) => entry.idempotencyKey === command.idempotencyKey);
+  if (existing === undefined) {
+    return Effect.succeed(null);
+  }
+  if (existing.fingerprint !== fingerprint) {
+    return reject(
+      state,
+      event,
+      "idempotency_conflict",
+      "This idempotency key was already used for a different command.",
+    );
+  }
+  return Effect.succeed(state);
+};
+
+const withCommand = (
+  state: SequenceState & { readonly commands: ReadonlyArray<AppliedCommandV1> },
+  event: SequenceEvent,
+  command: ControlCommandV1,
+): Effect.Effect<ReadonlyArray<AppliedCommandV1>, ContractTransitionError> =>
+  Effect.map(
+    rememberCommand(
+      state.commands,
+      command.idempotencyKey,
+      commandFingerprint(command),
+      state.phase,
+      event.type,
+    ),
+    (recorded) => recorded.commands,
+  );
+
+const matchesWork = (
+  state: SequenceState & {
+    readonly acknowledgment: IntakeAcknowledgmentV1;
+    readonly assignment: AssignmentV1;
+  },
+  event: SequenceEvent,
+  payload: { readonly taskId: string; readonly attemptId: string },
+): Effect.Effect<void, ContractTransitionError> =>
+  Effect.gen(function* () {
+    if (payload.taskId !== state.acknowledgment.taskId) {
+      return yield* reject(
+        state,
+        event,
+        "task_mismatch",
+        "The payload task does not match the acknowledged task.",
+      );
+    }
+    if (payload.attemptId !== state.assignment.attemptId) {
+      return yield* reject(
+        state,
+        event,
+        "attempt_mismatch",
+        "The payload attempt does not match the open assignment.",
+      );
+    }
+  });
+
+const requireLease = (
+  state: ExecutingState,
+  event: SequenceEvent,
+  fence: { readonly generation: number; readonly leaseId: string },
+): Effect.Effect<void, ContractTransitionError> =>
+  fence.generation === state.run.generation && fence.leaseId === state.run.leaseId
+    ? Effect.void
+    : reject(state, event, "stale_generation", "The write names a stale generation or lease.");
+
+const applyProgress = (
+  state: SequenceState,
+  event: Extract<SequenceEvent, { type: "report_progress" }>,
+): Effect.Effect<SequenceState, ContractTransitionError> =>
+  Effect.gen(function* () {
+    if (state.phase !== "executing") {
+      return yield* reject(
+        state,
+        event,
+        "illegal_transition",
+        `Cannot report_progress from ${state.phase}.`,
+      );
+    }
+    yield* matchesWork(state, event, event.report);
+    yield* requireLease(state, event, event.report);
+    return {
+      ...state,
+      run: { ...state.run, progress: event.report },
+    };
+  });
+
+const applyHeartbeat = (
+  state: SequenceState,
+  event: Extract<SequenceEvent, { type: "heartbeat" }>,
+): Effect.Effect<SequenceState, ContractTransitionError> =>
+  Effect.gen(function* () {
+    if (state.phase !== "executing") {
+      return yield* reject(
+        state,
+        event,
+        "illegal_transition",
+        `Cannot heartbeat from ${state.phase}.`,
+      );
+    }
+    yield* matchesWork(state, event, event.heartbeat);
+    yield* requireLease(state, event, event.heartbeat);
+    return {
+      ...state,
+      run: { ...state.run, leaseExpiresAt: event.heartbeat.leaseExpiresAt },
+    };
+  });
+
+const applyHeartbeatLapse = (
+  state: SequenceState,
+  event: Extract<SequenceEvent, { type: "heartbeat_lapsed" }>,
+): Effect.Effect<SequenceState, ContractTransitionError> =>
+  Effect.gen(function* () {
+    if (state.phase !== "executing") {
+      return yield* reject(
+        state,
+        event,
+        "illegal_transition",
+        `Cannot heartbeat_lapsed from ${state.phase}.`,
+      );
+    }
+    yield* matchesWork(state, event, event.lapse);
+    yield* requireLease(state, event, event.lapse);
+    return {
+      phase: "recovery_pending" as const,
+      intake: state.intake,
+      acknowledgment: state.acknowledgment,
+      assignment: state.assignment,
+      reworkRevision: state.reworkRevision,
+      recoveryLabel: RECOVERY_PENDING_LABEL,
+      run: state.run,
+      commands: state.commands,
+    };
+  });
+
+const applyUsage = (
+  state: SequenceState,
+  event: Extract<SequenceEvent, { type: "report_usage" }>,
+): Effect.Effect<SequenceState, ContractTransitionError> =>
+  Effect.gen(function* () {
+    if (state.phase !== "executing") {
+      return yield* reject(
+        state,
+        event,
+        "illegal_transition",
+        `Cannot report_usage from ${state.phase}.`,
+      );
+    }
+    if (event.measurement.attribution.projectId !== state.intake.projectId) {
+      return yield* reject(
+        state,
+        event,
+        "task_mismatch",
+        "The usage project must match the intake project.",
+      );
+    }
+    yield* matchesWork(state, event, event.measurement.attribution);
+    yield* requireLease(state, event, event);
+    return {
+      ...state,
+      run: { ...state.run, usage: [...state.run.usage, event.measurement] },
+    };
+  });
+
+const applyCancel = (
+  state: SequenceState,
+  event: Extract<SequenceEvent, { type: "cancel" }>,
+): Effect.Effect<SequenceState, ContractTransitionError> =>
+  Effect.gen(function* () {
+    if (
+      state.phase !== "assigned" &&
+      state.phase !== "executing" &&
+      state.phase !== "awaiting_qa" &&
+      state.phase !== "rework"
+    ) {
+      return yield* reject(
+        state,
+        event,
+        "illegal_transition",
+        `Cannot cancel from ${state.phase}.`,
+      );
+    }
+    yield* matchesWork(state, event, event.command);
+    const commands = yield* withCommand(state, event, event.command);
+    if (state.phase === "assigned") {
+      return {
+        phase: "cancelled" as const,
+        intake: state.intake,
+        acknowledgment: state.acknowledgment,
+        assignment: state.assignment,
+        reworkRevision: state.reworkRevision,
+        run: state.heldRun,
+        commands,
+        nextGeneration: state.nextGeneration,
+      };
+    }
+    return {
+      phase: "cancelled" as const,
+      intake: state.intake,
+      acknowledgment: state.acknowledgment,
+      assignment: state.assignment,
+      reworkRevision: state.reworkRevision,
+      run: state.run,
+      commands,
+      nextGeneration: state.run.generation + 1,
+    };
+  });
+
+const applyContinue = (
+  state: SequenceState,
+  event: Extract<SequenceEvent, { type: "continue" }>,
+): Effect.Effect<SequenceState, ContractTransitionError> =>
+  Effect.gen(function* () {
+    if (state.phase !== "cancelled") {
+      return yield* reject(
+        state,
+        event,
+        "illegal_transition",
+        `Cannot continue from ${state.phase}.`,
+      );
+    }
+    yield* matchesWork(state, event, event.command);
+    const commands = yield* withCommand(state, event, event.command);
+    return {
+      phase: "assigned" as const,
+      intake: state.intake,
+      acknowledgment: state.acknowledgment,
+      assignment: state.assignment,
+      reworkRevision: state.reworkRevision,
+      heldRun: state.run,
+      commands,
+      nextGeneration: state.nextGeneration,
+    };
+  });
+
+const applyRetry = (
+  state: SequenceState,
+  event: Extract<SequenceEvent, { type: "retry" }>,
+): Effect.Effect<SequenceState, ContractTransitionError> =>
+  Effect.gen(function* () {
+    if (state.phase !== "failed") {
+      return yield* reject(state, event, "illegal_transition", `Cannot retry from ${state.phase}.`);
+    }
+    yield* matchesWork(state, event, event.command);
+    if (state.run.retryCount >= state.run.retryLimit) {
+      return yield* reject(
+        state,
+        event,
+        "retry_limit_reached",
+        "The retry count has reached the limit.",
+      );
+    }
+    const commands = yield* withCommand(state, event, event.command);
+    return {
+      phase: "executing" as const,
+      intake: state.intake,
+      acknowledgment: state.acknowledgment,
+      assignment: state.assignment,
+      reworkRevision: state.reworkRevision,
+      run: freshRun(state.run.generation + 1, {
+        ...state.run,
+        retryCount: state.run.retryCount + 1,
+      }),
+      commands,
+    };
+  });
+
+const applyTransfer = (
+  state: SequenceState,
+  event: Extract<SequenceEvent, { type: "transfer_ownership" }>,
+): Effect.Effect<SequenceState, ContractTransitionError> =>
+  Effect.gen(function* () {
+    if (state.phase !== "assigned" && state.phase !== "executing") {
+      return yield* reject(
+        state,
+        event,
+        "illegal_transition",
+        `Cannot transfer_ownership from ${state.phase}.`,
+      );
+    }
+    yield* matchesWork(state, event, event.command);
+    const commands = yield* withCommand(state, event, event.command);
+    const assignment = freezeSnapshot({ ...state.assignment, workerId: event.command.ownerId });
+    if (state.phase === "assigned") {
+      return { ...state, assignment, commands };
+    }
+    return {
+      ...state,
+      assignment,
+      commands,
+      run: freshRun(state.run.generation + 1, state.run),
+    };
+  });
+
+const applyFail = (
+  state: SequenceState,
+  event: Extract<SequenceEvent, { type: "fail" }>,
+): Effect.Effect<SequenceState, ContractTransitionError> =>
+  Effect.gen(function* () {
+    if (state.phase !== "executing") {
+      return yield* reject(state, event, "illegal_transition", `Cannot fail from ${state.phase}.`);
+    }
+    yield* matchesWork(state, event, event.failure);
+    yield* requireLease(state, event, event.failure);
+    return {
+      phase: "failed" as const,
+      intake: state.intake,
+      acknowledgment: state.acknowledgment,
+      assignment: state.assignment,
+      reworkRevision: state.reworkRevision,
+      run: state.run,
+      commands: state.commands,
+      blocker: event.failure.blocker,
+    };
+  });
+
+const applyOperatorFail = (
+  state: SequenceState,
+  event: Extract<SequenceEvent, { type: "operator_fail" }>,
+): Effect.Effect<SequenceState, ContractTransitionError> =>
+  Effect.gen(function* () {
+    if (state.phase !== "executing") {
+      return yield* reject(
+        state,
+        event,
+        "illegal_transition",
+        `Cannot operator_fail from ${state.phase}.`,
+      );
+    }
+    yield* matchesWork(state, event, event.command);
+    const commands = yield* withCommand(state, event, event.command);
+    return {
+      phase: "failed" as const,
+      intake: state.intake,
+      acknowledgment: state.acknowledgment,
+      assignment: state.assignment,
+      reworkRevision: state.reworkRevision,
+      run: state.run,
+      commands,
+      blocker: event.command.blocker,
+    };
+  });
+
+const applyResolveRecovery = (
+  state: SequenceState,
+  event: Extract<SequenceEvent, { type: "resolve_recovery" }>,
+): Effect.Effect<SequenceState, ContractTransitionError> =>
+  Effect.gen(function* () {
+    if (state.phase !== "recovery_pending") {
+      return yield* reject(
+        state,
+        event,
+        "illegal_transition",
+        `Cannot resolve_recovery from ${state.phase}.`,
+      );
+    }
+    yield* matchesWork(state, event, event.command);
+    const commands = yield* withCommand(state, event, event.command);
+    if (event.command.outcome === "continue") {
+      return {
+        phase: "assigned" as const,
+        intake: state.intake,
+        acknowledgment: state.acknowledgment,
+        assignment: state.assignment,
+        reworkRevision: state.reworkRevision,
+        heldRun: state.run,
+        commands,
+        nextGeneration: state.run.generation + 1,
+      };
+    }
+    if (event.command.outcome === "cancel") {
+      return {
+        phase: "cancelled" as const,
+        intake: state.intake,
+        acknowledgment: state.acknowledgment,
+        assignment: state.assignment,
+        reworkRevision: state.reworkRevision,
+        run: state.run,
+        commands,
+        nextGeneration: state.run.generation + 1,
+      };
+    }
+    return {
+      phase: "failed" as const,
+      intake: state.intake,
+      acknowledgment: state.acknowledgment,
+      assignment: state.assignment,
+      reworkRevision: state.reworkRevision,
+      run: state.run,
+      commands,
+      blocker: event.command.blocker,
+    };
+  });
+
+const applyDeliver = (
+  state: SequenceState,
+  event: Extract<SequenceEvent, { type: "deliver" }>,
+): Effect.Effect<SequenceState, ContractTransitionError> =>
+  Effect.gen(function* () {
+    if (state.phase !== "accepted") {
+      return yield* reject(
+        state,
+        event,
+        "illegal_transition",
+        `Cannot deliver from ${state.phase}.`,
+      );
+    }
+    yield* matchesWork(state, event, event.delivery);
+    if (
+      !sameRevision(event.delivery.acceptedRevision, state.qa.acceptedRevision) ||
+      !sameRevision(event.delivery.acceptedRevision, state.completion.artifactRevision)
+    ) {
+      return yield* reject(
+        state,
+        event,
+        "delivery_revision_mismatch",
+        "Delivery is bound to the exact accepted revision.",
+      );
+    }
+    if (event.delivery.destination === "conversation") {
+      if (!("originatingConversationId" in state.intake)) {
+        return yield* reject(
+          state,
+          event,
+          "delivery_origin_mismatch",
+          "A v1 intake has no originating conversation. Deliver to the dashboard.",
+        );
+      }
+      if (event.delivery.conversationId !== state.intake.originatingConversationId) {
+        return yield* reject(
+          state,
+          event,
+          "delivery_origin_mismatch",
+          "Delivery to a conversation must name the originating conversation.",
+        );
+      }
+    }
+    const fingerprint = deliveryFingerprint(event.delivery);
+    const sameKey = state.deliveries.find(
+      (delivery) => delivery.idempotencyKey === event.delivery.idempotencyKey,
+    );
+    if (sameKey !== undefined) {
+      if (sameKey.fingerprint === fingerprint) {
+        return state;
+      }
+      return yield* reject(
+        state,
+        event,
+        "idempotency_conflict",
+        "This idempotency key was already used for a different delivery.",
+      );
+    }
+    if (state.deliveries.some((delivery) => delivery.destination === event.delivery.destination)) {
+      return state;
+    }
+    return { ...state, deliveries: [...state.deliveries, ackFor(event.delivery)] };
   });
 
 const transition = (
@@ -563,7 +1265,11 @@ const transition = (
   event: SequenceEvent,
 ): Effect.Effect<SequenceState, ContractTransitionError> =>
   Effect.gen(function* () {
-    if (state.phase === "recovery_pending") {
+    const replay = yield* replayControl(state, event);
+    if (replay !== null) {
+      return replay;
+    }
+    if (state.phase === "recovery_pending" && event.type !== "resolve_recovery") {
       return yield* reject(
         state,
         event,
@@ -602,6 +1308,30 @@ const transition = (
         return yield* applyCompletion(state, event);
       case "qa":
         return yield* applyQa(state, event);
+      case "report_progress":
+        return yield* applyProgress(state, event);
+      case "heartbeat":
+        return yield* applyHeartbeat(state, event);
+      case "heartbeat_lapsed":
+        return yield* applyHeartbeatLapse(state, event);
+      case "report_usage":
+        return yield* applyUsage(state, event);
+      case "cancel":
+        return yield* applyCancel(state, event);
+      case "continue":
+        return yield* applyContinue(state, event);
+      case "retry":
+        return yield* applyRetry(state, event);
+      case "transfer_ownership":
+        return yield* applyTransfer(state, event);
+      case "fail":
+        return yield* applyFail(state, event);
+      case "operator_fail":
+        return yield* applyOperatorFail(state, event);
+      case "resolve_recovery":
+        return yield* applyResolveRecovery(state, event);
+      case "deliver":
+        return yield* applyDeliver(state, event);
     }
   });
 
@@ -615,6 +1345,8 @@ const PHASES = [
   "rework",
   "accepted",
   "recovery_pending",
+  "failed",
+  "cancelled",
 ] as const satisfies ReadonlyArray<SequencePhase>;
 
 const phaseOf = (value: unknown): SequencePhase => {
@@ -650,6 +1382,23 @@ const contractNameOf = (value: unknown): ContractName => {
       return "completion";
     case "qa":
       return "qa";
+    case "report_progress":
+    case "heartbeat":
+    case "heartbeat_lapsed":
+      return "progress";
+    case "report_usage":
+      return "usage";
+    case "cancel":
+    case "continue":
+    case "retry":
+    case "transfer_ownership":
+    case "operator_fail":
+    case "resolve_recovery":
+      return "control";
+    case "fail":
+      return "sequence";
+    case "deliver":
+      return "delivery";
     default:
       return "sequence";
   }

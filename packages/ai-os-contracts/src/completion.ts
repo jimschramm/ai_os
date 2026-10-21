@@ -6,6 +6,7 @@ import {
   ContractText,
   ContractVersion,
   EvidenceRef,
+  PositiveInt,
   strictParse,
 } from "./common.ts";
 
@@ -30,6 +31,8 @@ export const CompletionSubmissionV1 = Schema.Struct({
   version: ContractVersion,
   taskId: ContractId,
   attemptId: ContractId,
+  generation: PositiveInt,
+  leaseId: ContractId,
   claimedOutcome: ContractText,
   artifactRevision: ArtifactRevisionV1,
   evidence: Schema.NonEmptyArray(EvidenceV1),

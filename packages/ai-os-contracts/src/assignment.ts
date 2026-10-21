@@ -45,6 +45,8 @@ const deepFreeze = <T>(value: T): T => {
 
 export const freezeSnapshot = <T>(value: T): T => deepFreeze(deepCopy(value));
 
+export const freezeInPlace = <T>(value: T): T => deepFreeze(value);
+
 // Struct decode already copies. Freezing in the check keeps that copy immutable.
 // A decodeTo transform is rebuilt by the target struct, so the freeze would not survive it.
 const freezeDecoded = Schema.makeFilter(<A>(value: A) => {

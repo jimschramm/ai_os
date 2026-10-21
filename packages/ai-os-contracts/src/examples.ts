@@ -1,13 +1,15 @@
 import * as Schema from "effect/Schema";
 
 import { AssignmentV1 } from "./assignment.ts";
+import { leaseIdFor } from "./canonical.ts";
 import { strictParse } from "./common.ts";
 import { CompletionSubmissionV1 } from "./completion.ts";
-import { IntakeAcknowledgmentV1, IntakeV1 } from "./intake.ts";
+import { IntakeAcknowledgmentV1, IntakeV1, IntakeV2 } from "./intake.ts";
 import { QaVerdictV1 } from "./qa.ts";
 import type { SequenceEvent } from "./sequence.ts";
 
 const decodeIntake = Schema.decodeUnknownSync(IntakeV1, strictParse);
+const decodeIntakeV2 = Schema.decodeUnknownSync(IntakeV2, strictParse);
 const decodeAcknowledgment = Schema.decodeUnknownSync(IntakeAcknowledgmentV1, strictParse);
 const decodeAssignment = Schema.decodeUnknownSync(AssignmentV1, strictParse);
 const decodeCompletion = Schema.decodeUnknownSync(CompletionSubmissionV1, strictParse);
@@ -26,6 +28,18 @@ export const intakeExample = decodeIntake({
   constraints: ["Keep the public page available during the update."],
   acceptanceCriteria: ["The tournament page shows the new schedule."],
   authorization: { kind: "standing", scope: "usba-web" },
+});
+
+export const intakeV2Example = decodeIntakeV2({
+  version: "v1",
+  workspaceId: "personal",
+  projectId: "usba",
+  request:
+    "Update the USBA tournament page, verify it, and have Marketing prepare the announcement.",
+  constraints: ["Keep the public page available during the update."],
+  acceptanceCriteria: ["The tournament page shows the new schedule."],
+  authorization: { kind: "standing", scope: "usba-web" },
+  originatingConversationId: "Grok-Thread-1",
 });
 
 export const acknowledgmentExample = decodeAcknowledgment({
@@ -57,6 +71,8 @@ export const completionExample = decodeCompletion({
   version: "v1",
   taskId: "task-usba-page",
   attemptId: "attempt-1",
+  generation: 1,
+  leaseId: leaseIdFor(1),
   claimedOutcome: "Updated the tournament page.",
   artifactRevision: revisionOne,
   evidence: [{ kind: "diff", ref: "diff-rev-1" }],
@@ -91,6 +107,8 @@ export const completionAfterReworkExample = decodeCompletion({
   version: "v1",
   taskId: "task-usba-page",
   attemptId: "attempt-1",
+  generation: 2,
+  leaseId: leaseIdFor(2),
   claimedOutcome: "Added the final round to the tournament page.",
   artifactRevision: revisionTwo,
   evidence: [

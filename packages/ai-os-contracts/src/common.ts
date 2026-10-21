@@ -1,6 +1,8 @@
 import * as Schema from "effect/Schema";
 import * as SchemaTransformation from "effect/SchemaTransformation";
 
+import { canonicalInstant } from "./canonical.ts";
+
 export const strictParse = { onExcessProperty: "error" as const };
 
 const boundedPattern = (max: number, pattern: RegExp) =>
@@ -219,7 +221,9 @@ export const ContractText = Schema.String.check(
 export type ContractText = typeof ContractText.Type;
 
 export const IsoDateTime = Schema.String.check(
-  Schema.isPattern(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/),
+  Schema.makeFilter((value: string) =>
+    canonicalInstant(value) !== null ? true : "Expected an RFC3339 UTC instant.",
+  ),
 );
 export type IsoDateTime = typeof IsoDateTime.Type;
 
@@ -234,6 +238,18 @@ export const TaskLink = Schema.String.check(
   Schema.isPattern(/^ai-os:\/\/tasks\/[A-Za-z0-9][A-Za-z0-9._:-]*$/),
 );
 export type TaskLink = typeof TaskLink.Type;
+
+export const NonNegativeInt = Schema.Int.check(
+  Schema.isGreaterThanOrEqualTo(0),
+  Schema.isLessThanOrEqualTo(1_000_000),
+);
+export type NonNegativeInt = typeof NonNegativeInt.Type;
+
+export const PositiveInt = Schema.Int.check(
+  Schema.isGreaterThanOrEqualTo(1),
+  Schema.isLessThanOrEqualTo(1_000_000),
+);
+export type PositiveInt = typeof PositiveInt.Type;
 
 export const ContractVersion = Schema.Literal("v1");
 export type ContractVersion = typeof ContractVersion.Type;
