@@ -24,7 +24,9 @@ Request, assignment, execution, independent QA, rework, accepted result.
 
 `requested` is the durable receipt of the intake. It is not confirmed, and it is not on the board yet. Acknowledge is the confirmation, and it carries the task link. A later `start_execution` from `accepted` drops the previous acceptance, so a new revision has to be submitted and reviewed again.
 
-`SequenceState` is a discriminated union on `phase`. A phase only decodes with the records that phase requires. `accepted` requires the assignment, the completion, and an available accept verdict whose revision matches that completion exactly and whose model is independent of the implementer. `awaiting_qa` can carry only an unavailable verdict. `recovery_pending` requires the label `Execution status unknown`. `kanbanColumn` still maps `accepted` to Done, and a payload that is only `{ phase: "accepted" }` does not decode.
+`SequenceState` is a discriminated union on `phase`. A phase only decodes with the records that phase requires. `accepted` requires the assignment, the completion, and an available accept verdict whose revision matches that completion exactly and whose model name is independent of the implementer. `awaiting_qa` can carry only an unavailable verdict. `recovery_pending` requires the label `Execution status unknown`. `kanbanColumn` still maps `accepted` to Done, and a payload that is only `{ phase: "accepted" }` does not decode.
+
+`applySequenceEvent` decodes the current state and the event with those schemas, applies the transition, then decodes the result as `SequenceState`. A payload that fails the schema is `invalid_payload`. It is not stored.
 
 ## Intake
 
@@ -34,11 +36,11 @@ Request, assignment, execution, independent QA, rework, accepted result.
 
 ## Assignment
 
-`AssignmentV1` names the worker, the attempt, the implementer model, and a `ContextPackageSnapshotV1`: requirements, memory versions, repo commit, authorization scope, and created time. The snapshot has no vector field. Decode and assignment both deep-copy that snapshot and freeze the copy, so later mutation of the caller's object does not change the recorded context, and mutation of the stored snapshot throws. The repo commit is a git SHA, stored as lowercase hex.
+`AssignmentV1` names the worker, the attempt, the implementer model, and a `ContextPackageSnapshotV1`: requirements, memory versions, repo commit, authorization scope, and created time. The snapshot has no vector field. Decode and assignment both deep-copy that snapshot and freeze the copy, so later mutation of the caller's object does not change the recorded context, and mutation of the stored snapshot throws. The repo commit is a full git object id, 40 or 64 lowercase hex characters.
 
 ## Completion submission
 
-`CompletionSubmissionV1` carries the claimed outcome, the exact `artifactRevision`, and at least one evidence item (`diff`, `commit`, `test`, `browser`, `preview`, `deployment`, or `readback`). An artifact revision is a git SHA, a Drive file id plus version, or a named page, preview, deployment, or document id. Git SHAs compare as lowercase hex. Drive file ids stay case-sensitive. Submitting a completion moves `executing` to `awaiting_qa`. It does not accept the work. Repeating the revision that QA sent back for rework, including the same git SHA in a different case, is `revision_mismatch`.
+`CompletionSubmissionV1` carries the claimed outcome, the exact `artifactRevision`, and at least one evidence item (`diff`, `commit`, `test`, `browser`, `preview`, `deployment`, or `readback`). An artifact revision is a git object id, a Drive file id plus version, or a named page, preview, deployment, or document id. A git object id is exactly 40 hex characters (SHA-1) or 64 (SHA-256), stored lowercase. Abbreviated ids are rejected. Drive file ids stay case-sensitive. Submitting a completion moves `executing` to `awaiting_qa`. It does not accept the work. Repeating the revision that QA sent back for rework, including the same full git id in a different case, is `revision_mismatch`.
 
 ## QA verdict and rework
 
@@ -50,7 +52,7 @@ Request, assignment, execution, independent QA, rework, accepted result.
 | `verdict: rework`           | Moves to `rework`. Findings are required. The reviewed revision is recorded.                                                           |
 | `verdict: accept`           | Moves to `accepted`. `acceptedRevision` must equal `artifactRevision`, and that revision must be the one in the completion submission. |
 
-QA's model must differ from the assignment's implementer model. Model identity is trimmed, lowercased, and a provider prefix is normalized (`OpenAI:GPT-5.4` and `openai/gpt-5.4` are the same model; a bare `gpt-5.4` is not). The schema check and the transition both compare those canonical ids. The transition rejects a QA model equal to the assigned implementer (`qa_same_model`) and a payload that names some other implementer (`implementer_mismatch`). Acceptance compares canonical revisions, so a git SHA matches regardless of case. An unavailable verdict cannot also carry an acceptance. There is no event that skips QA.
+QA's model name must differ from the assignment's implementer model name. A model is `{ provider?, model }`. Provider is attribution (`openai/gpt-5.4` and `azure/gpt-5.4` are the same model, and so is a bare `gpt-5.4`). The schema check and the transition both compare those canonical model names. The transition rejects a QA model name equal to the assigned implementer (`qa_same_model`) and a payload that names some other implementer model (`implementer_mismatch`). Acceptance compares canonical revisions, so a full git id matches regardless of case. An unavailable verdict cannot also carry an acceptance. There is no event that skips QA.
 
 ## Errors
 
@@ -67,6 +69,7 @@ Invalid payloads fail schema decode. These transition errors are `ContractTransi
 | `revision_mismatch`                   | Rework submits the same artifact revision again.                                                              |
 | `acceptance_revision_mismatch`        | QA or acceptance names a revision other than the submitted one, or the revision already sent back for rework. |
 | `recovery_pending_not_ready`          | Any event while the lease is expired.                                                                         |
+| `invalid_payload`                     | The state or event does not decode, or the resulting state does not match its phase.                          |
 
 `lease_expired` is legal only from `executing`. The phase becomes `recovery_pending`, the label is `Execution status unknown`, and the kanban column is Blocked. No event leaves that phase. Returning to Ready is a later contract.
 

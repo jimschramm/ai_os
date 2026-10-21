@@ -13,9 +13,9 @@ const decodeAssignment = Schema.decodeUnknownSync(AssignmentV1, strictParse);
 const decodeCompletion = Schema.decodeUnknownSync(CompletionSubmissionV1, strictParse);
 const decodeQa = Schema.decodeUnknownSync(QaVerdictV1, strictParse);
 
-export const exampleRepoCommit = "a1b2c3d";
-export const revisionOne = { type: "git" as const, sha: "abc1234" };
-export const revisionTwo = { type: "git" as const, sha: "def5678" };
+export const exampleRepoCommit = "c".repeat(40);
+export const revisionOne = { type: "git" as const, sha: "a".repeat(40) };
+export const revisionTwo = { type: "git" as const, sha: "b".repeat(40) };
 
 export const intakeExample = decodeIntake({
   version: "v1",
@@ -59,7 +59,7 @@ export const completionExample = decodeCompletion({
   attemptId: "attempt-1",
   claimedOutcome: "Updated the tournament page.",
   artifactRevision: revisionOne,
-  evidence: [{ kind: "diff", ref: "abc1234" }],
+  evidence: [{ kind: "diff", ref: "diff-rev-1" }],
 });
 
 export const qaWaitingExample = decodeQa({
@@ -94,7 +94,7 @@ export const completionAfterReworkExample = decodeCompletion({
   claimedOutcome: "Added the final round to the tournament page.",
   artifactRevision: revisionTwo,
   evidence: [
-    { kind: "diff", ref: "def5678" },
+    { kind: "diff", ref: "diff-rev-2" },
     { kind: "browser", ref: "preview-rev-2" },
   ],
 });

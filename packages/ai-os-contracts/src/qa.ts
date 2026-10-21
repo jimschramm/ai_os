@@ -5,8 +5,8 @@ import {
   ContractId,
   ContractText,
   ContractVersion,
-  ModelId,
-  sameModel,
+  ModelRef,
+  sameModelName,
   sameRevision,
   strictParse,
 } from "./common.ts";
@@ -19,8 +19,11 @@ export const QaFindingV1 = Schema.Struct({
 export type QaFindingV1 = typeof QaFindingV1.Type;
 
 const differentModel = Schema.makeFilter(
-  (verdict: { readonly qaModel: string; readonly implementerModel: string }) =>
-    sameModel(verdict.qaModel, verdict.implementerModel)
+  (verdict: {
+    readonly qaModel: ModelRef | string;
+    readonly implementerModel: ModelRef | string;
+  }) =>
+    sameModelName(verdict.qaModel, verdict.implementerModel)
       ? "QA must use a different model than the implementer."
       : true,
 );
@@ -48,8 +51,8 @@ export const QaReworkV1 = Schema.Struct({
   taskId: ContractId,
   attemptId: ContractId,
   availability: Schema.Literal("available"),
-  qaModel: ModelId,
-  implementerModel: ModelId,
+  qaModel: ModelRef,
+  implementerModel: ModelRef,
   verdict: Schema.Literal("rework"),
   artifactRevision: ArtifactRevisionV1,
   findings: Schema.NonEmptyArray(QaFindingV1),
@@ -61,8 +64,8 @@ export const QaAcceptV1 = Schema.Struct({
   taskId: ContractId,
   attemptId: ContractId,
   availability: Schema.Literal("available"),
-  qaModel: ModelId,
-  implementerModel: ModelId,
+  qaModel: ModelRef,
+  implementerModel: ModelRef,
   verdict: Schema.Literal("accept"),
   artifactRevision: ArtifactRevisionV1,
   acceptedRevision: ArtifactRevisionV1,

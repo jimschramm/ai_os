@@ -6,6 +6,7 @@ import {
   acknowledgmentExample,
   assignmentExample,
   completionExample,
+  exampleRepoCommit,
   happyPathEvents,
   intakeExample,
   qaAcceptExample,
@@ -26,8 +27,7 @@ import {
   type SequenceState,
 } from "./sequence.ts";
 
-const failure = (state: SequenceState, event: SequenceEvent) =>
-  Effect.flip(applySequenceEvent(state, event));
+const failure = (state: unknown, event: unknown) => Effect.flip(applySequenceEvent(state, event));
 
 it.effect("runs request, assignment, execution, QA, rework, and an accepted result", () =>
   Effect.gen(function* () {
@@ -229,7 +229,7 @@ it.effect("does not treat a differently cased model id as a different QA model",
       qa: {
         ...qaReworkExample,
         qaModel: "GPT-5.4",
-        implementerModel: "gpt-5.4",
+        implementerModel: "claude-sonnet-5",
       },
     });
     assert.strictEqual(cased.reason, "qa_same_model");
@@ -249,10 +249,127 @@ it.effect("does not treat a differently cased model id as a different QA model",
       qa: {
         ...qaReworkExample,
         qaModel: "OpenAI:GPT-5.4",
-        implementerModel: "openai/gpt-5.4",
+        implementerModel: "claude-sonnet-5",
       },
     });
     assert.strictEqual(prefixed.reason, "qa_same_model");
+
+    const azure = yield* failure(submitted, {
+      type: "qa",
+      qa: {
+        ...qaReworkExample,
+        qaModel: "azure/gpt-5.4",
+        implementerModel: "claude-sonnet-5",
+      },
+    });
+    assert.strictEqual(azure.reason, "qa_same_model");
+
+    const bare = yield* failure(awaiting, {
+      type: "qa",
+      qa: {
+        ...qaReworkExample,
+        qaModel: "openai/gpt-5.4",
+        implementerModel: "claude-sonnet-5",
+      },
+    });
+    assert.strictEqual(bare.reason, "qa_same_model");
+  }),
+);
+
+it.effect("rejects an acknowledgment that is not the task URI", () =>
+  Effect.gen(function* () {
+    const requested = yield* applySequence(happyPathEvents.slice(0, 1));
+    const nonLink = yield* failure(requested, {
+      type: "acknowledge",
+      acknowledgment: { ...acknowledgmentExample, taskLink: "task-usba-page" },
+    });
+    assert.strictEqual(nonLink.reason, "invalid_payload");
+    assert.strictEqual(nonLink.event, "acknowledge");
+  }),
+);
+
+it.effect("rejects a QA model id that is not in the model alphabet", () =>
+  Effect.gen(function* () {
+    if (qaReworkExample.availability !== "available") {
+      return yield* Effect.die("The rework example must be an available verdict.");
+    }
+    const awaiting = yield* applySequence(happyPathEvents.slice(0, 5));
+    const hidden = yield* failure(awaiting, {
+      type: "qa",
+      qa: {
+        ...qaReworkExample,
+        qaModel: "gpt-\u200b5.4",
+        implementerModel: "claude-sonnet-5",
+      },
+    });
+    assert.strictEqual(hidden.reason, "invalid_payload");
+    assert.strictEqual(hidden.event, "qa");
+  }),
+);
+
+it.effect("rejects schema-invalid input on every transition", () =>
+  Effect.gen(function* () {
+    const requested = yield* applySequence(happyPathEvents.slice(0, 1));
+    const acknowledged = yield* applySequence(happyPathEvents.slice(0, 2));
+    const assigned = yield* applySequence(happyPathEvents.slice(0, 3));
+    const executing = yield* applySequence(happyPathEvents.slice(0, 4));
+    const awaiting = yield* applySequence(happyPathEvents.slice(0, 5));
+    const cases = [
+      [initialSequenceState, { type: "intake", intake: { ...intakeExample, request: "   " } }],
+      [
+        requested,
+        {
+          type: "acknowledge",
+          acknowledgment: { ...acknowledgmentExample, taskLink: "not a link" },
+        },
+      ],
+      [
+        acknowledged,
+        { type: "assign", assignment: { ...assignmentExample, implementerModel: "gpt-\u200b5.4" } },
+      ],
+      [assigned, { type: "start_execution", extra: true }],
+      [executing, { type: "lease_expired", extra: true }],
+      [
+        executing,
+        {
+          type: "submit_completion",
+          completion: { ...completionExample, evidence: [] },
+        },
+      ],
+      [
+        awaiting,
+        {
+          type: "qa",
+          qa: { ...qaReworkExample, qaModel: "gpt-\u200b5.4" },
+        },
+      ],
+    ] as const;
+    for (const [state, event] of cases) {
+      const error = yield* failure(state, event);
+      assert.strictEqual(error.reason, "invalid_payload");
+    }
+  }),
+);
+
+it.effect("rejects abbreviated and truncated git revisions on submission", () =>
+  Effect.gen(function* () {
+    const executing = yield* applySequence(happyPathEvents.slice(0, 4));
+    const abbreviated = yield* failure(executing, {
+      type: "submit_completion",
+      completion: {
+        ...completionExample,
+        artifactRevision: { type: "git", sha: "abc1234" },
+      },
+    });
+    const truncated = yield* failure(executing, {
+      type: "submit_completion",
+      completion: {
+        ...completionExample,
+        artifactRevision: { type: "git", sha: "a".repeat(39) },
+      },
+    });
+    assert.strictEqual(abbreviated.reason, "invalid_payload");
+    assert.strictEqual(truncated.reason, "invalid_payload");
   }),
 );
 
@@ -304,7 +421,7 @@ it.effect("stores an assignment snapshot that later caller mutation cannot chang
       contextPackage: {
         requirements: "The tournament page shows the new schedule.",
         memoryVersions,
-        repoCommit: "a1b2c3d",
+        repoCommit: exampleRepoCommit,
         authorizationScope: "usba-web",
         createdAt: "2026-10-21T14:01:00Z",
       },

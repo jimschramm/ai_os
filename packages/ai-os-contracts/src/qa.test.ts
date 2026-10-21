@@ -61,15 +61,30 @@ it.effect("treats model identity as case-insensitive, including a provider prefi
       qaModel: " Claude-Sonnet-5 ",
       implementerModel: "GPT-5.4",
     });
+    const crossProvider = yield* Effect.exit(
+      decodeQaVerdictV1({
+        ...qaAcceptExample,
+        qaModel: "azure/gpt-5.4",
+        implementerModel: "openai/gpt-5.4",
+      }),
+    );
+    const bareAndPrefixed = yield* Effect.exit(
+      decodeQaVerdictV1({
+        ...qaAcceptExample,
+        qaModel: "openai/gpt-5.4",
+        implementerModel: "gpt-5.4",
+      }),
+    );
     assert.strictEqual(Exit.isFailure(cased), true);
     assert.strictEqual(Exit.isFailure(prefixed), true);
-    assert.strictEqual(
-      canonical.availability === "available" ? canonical.qaModel : null,
-      "claude-sonnet-5",
-    );
-    assert.strictEqual(
+    assert.strictEqual(Exit.isFailure(crossProvider), true);
+    assert.strictEqual(Exit.isFailure(bareAndPrefixed), true);
+    assert.deepStrictEqual(canonical.availability === "available" ? canonical.qaModel : null, {
+      model: "claude-sonnet-5",
+    });
+    assert.deepStrictEqual(
       canonical.availability === "available" ? canonical.implementerModel : null,
-      "gpt-5.4",
+      { model: "gpt-5.4" },
     );
   }),
 );

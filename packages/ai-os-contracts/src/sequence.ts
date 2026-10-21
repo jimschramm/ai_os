@@ -5,7 +5,8 @@ import { AssignmentV1, freezeSnapshot } from "./assignment.ts";
 import { CompletionSubmissionV1 } from "./completion.ts";
 import {
   ArtifactRevisionV1,
-  sameModel,
+  type ModelRef,
+  sameModelName,
   sameRevision,
   strictParse,
   taskLinkMatches,
@@ -77,12 +78,12 @@ const payloadMatches = (
 
 const independentQa = (
   assignment: AssignmentV1,
-  qa: { readonly qaModel: string; readonly implementerModel: string },
+  qa: { readonly qaModel: ModelRef | string; readonly implementerModel: ModelRef | string },
 ): true | string => {
-  if (sameModel(qa.qaModel, assignment.implementerModel)) {
+  if (sameModelName(qa.qaModel, assignment.implementerModel)) {
     return "QA must use a different model than the implementer.";
   }
-  return sameModel(qa.implementerModel, assignment.implementerModel)
+  return sameModelName(qa.implementerModel, assignment.implementerModel)
     ? true
     : "The QA payload names a different implementer than the assignment.";
 };
@@ -504,7 +505,7 @@ const applyQa = (
         reworkRevision: state.reworkRevision,
       };
     }
-    if (sameModel(qa.qaModel, state.assignment.implementerModel)) {
+    if (sameModelName(qa.qaModel, state.assignment.implementerModel)) {
       return yield* reject(
         state,
         event,
@@ -512,7 +513,7 @@ const applyQa = (
         "QA must use a different model than the implementer.",
       );
     }
-    if (!sameModel(qa.implementerModel, state.assignment.implementerModel)) {
+    if (!sameModelName(qa.implementerModel, state.assignment.implementerModel)) {
       return yield* reject(
         state,
         event,
@@ -557,7 +558,7 @@ const applyQa = (
     };
   });
 
-export const applySequenceEvent = (
+const transition = (
   state: SequenceState,
   event: SequenceEvent,
 ): Effect.Effect<SequenceState, ContractTransitionError> =>
@@ -604,14 +605,103 @@ export const applySequenceEvent = (
     }
   });
 
-export const applySequence = (
-  events: ReadonlyArray<SequenceEvent>,
-  start: SequenceState = initialSequenceState,
-): Effect.Effect<SequenceState, ContractTransitionError> =>
-  events.reduce<Effect.Effect<SequenceState, ContractTransitionError>>(
-    (step, event) => Effect.flatMap(step, (state) => applySequenceEvent(state, event)),
-    Effect.succeed(start),
-  );
+const PHASES = [
+  "idle",
+  "requested",
+  "acknowledged",
+  "assigned",
+  "executing",
+  "awaiting_qa",
+  "rework",
+  "accepted",
+  "recovery_pending",
+] as const satisfies ReadonlyArray<SequencePhase>;
+
+const phaseOf = (value: unknown): SequencePhase => {
+  if (typeof value === "object" && value !== null && "phase" in value) {
+    const phase = value.phase;
+    if (typeof phase === "string" && (PHASES as ReadonlyArray<string>).includes(phase)) {
+      return phase as SequencePhase;
+    }
+  }
+  return "idle";
+};
+
+const eventTypeOf = (value: unknown): string => {
+  if (
+    typeof value === "object" &&
+    value !== null &&
+    "type" in value &&
+    typeof value.type === "string"
+  ) {
+    return value.type;
+  }
+  return "unknown";
+};
+
+const contractNameOf = (value: unknown): ContractName => {
+  switch (eventTypeOf(value)) {
+    case "intake":
+    case "acknowledge":
+      return "intake";
+    case "assign":
+      return "assignment";
+    case "submit_completion":
+      return "completion";
+    case "qa":
+      return "qa";
+    default:
+      return "sequence";
+  }
+};
+
+const invalidPayload = (state: unknown, event: unknown, detail: string) =>
+  new ContractTransitionError({
+    contract: contractNameOf(event),
+    reason: "invalid_payload",
+    from: phaseOf(state),
+    event: eventTypeOf(event),
+    detail,
+  });
 
 export const decodeSequenceEvent = Schema.decodeUnknownEffect(SequenceEvent, strictParse);
 export const decodeSequenceState = Schema.decodeUnknownEffect(SequenceState, strictParse);
+
+export const applySequenceEvent = (
+  state: unknown,
+  event: unknown,
+): Effect.Effect<SequenceState, ContractTransitionError> =>
+  Effect.gen(function* () {
+    const decodedState = yield* decodeSequenceState(state).pipe(
+      Effect.mapError(() =>
+        invalidPayload(state, event, "The sequence state does not match its phase."),
+      ),
+    );
+    const decodedEvent = yield* decodeSequenceEvent(event).pipe(
+      Effect.mapError(() =>
+        invalidPayload(state, event, "The event does not match the contract schema."),
+      ),
+    );
+    const next = yield* transition(decodedState, decodedEvent);
+    return yield* decodeSequenceState(next).pipe(
+      Effect.mapError(() =>
+        invalidPayload(decodedState, decodedEvent, "The resulting state does not match its phase."),
+      ),
+    );
+  });
+
+export const applySequence = (
+  events: ReadonlyArray<unknown>,
+  start: unknown = initialSequenceState,
+): Effect.Effect<SequenceState, ContractTransitionError> =>
+  Effect.gen(function* () {
+    const decodedStart = yield* decodeSequenceState(start).pipe(
+      Effect.mapError(() =>
+        invalidPayload(start, { type: "unknown" }, "The sequence state does not match its phase."),
+      ),
+    );
+    return yield* events.reduce<Effect.Effect<SequenceState, ContractTransitionError>>(
+      (step, event) => Effect.flatMap(step, (state) => applySequenceEvent(state, event)),
+      Effect.succeed(decodedStart),
+    );
+  });

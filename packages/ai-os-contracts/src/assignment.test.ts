@@ -2,15 +2,15 @@ import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 
-import { assignmentExample } from "./examples.ts";
+import { assignmentExample, exampleRepoCommit } from "./examples.ts";
 import { decodeAssignmentV1, decodeContextPackageSnapshotV1 } from "./assignment.ts";
 
 it.effect("decodes an assignment whose context package is an exact snapshot", () =>
   Effect.gen(function* () {
     const assignment = yield* decodeAssignmentV1(assignmentExample);
-    assert.strictEqual(assignment.contextPackage.repoCommit, "a1b2c3d");
+    assert.strictEqual(assignment.contextPackage.repoCommit, exampleRepoCommit);
     assert.deepStrictEqual(assignment.contextPackage.memoryVersions, ["decision-12"]);
-    assert.strictEqual(assignment.implementerModel, "gpt-5.4");
+    assert.deepStrictEqual(assignment.implementerModel, { model: "gpt-5.4" });
   }),
 );
 
@@ -28,7 +28,7 @@ it.effect("rejects an assignment without a context package or an exact repo comm
       decodeContextPackageSnapshotV1({
         requirements: assignmentExample.contextPackage.requirements,
         memoryVersions: [],
-        repoCommit: "a1b2c3d",
+        repoCommit: exampleRepoCommit,
         authorizationScope: "usba-web",
       }),
     );

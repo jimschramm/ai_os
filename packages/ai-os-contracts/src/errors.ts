@@ -32,6 +32,7 @@ export const ContractErrorReason = Schema.Literals([
   "acceptance_revision_mismatch",
   "revision_mismatch",
   "recovery_pending_not_ready",
+  "invalid_payload",
 ]);
 export type ContractErrorReason = typeof ContractErrorReason.Type;
 

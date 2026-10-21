@@ -6,7 +6,7 @@ import {
   ContractVersion,
   GitSha,
   IsoDateTime,
-  ModelId,
+  ModelRef,
   strictParse,
 } from "./common.ts";
 
@@ -67,7 +67,7 @@ export const AssignmentV1 = Schema.Struct({
   attemptId: ContractId,
   assignmentId: ContractId,
   workerId: ContractId,
-  implementerModel: ModelId,
+  implementerModel: ModelRef,
   scope: ContractText,
   contextPackage: ContextPackageSnapshotV1,
 }).check(freezeDecoded);
