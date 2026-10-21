@@ -8,7 +8,7 @@ import { decodeAssignmentV1, decodeContextPackageSnapshotV1 } from "./assignment
 it.effect("decodes an assignment whose context package is an exact snapshot", () =>
   Effect.gen(function* () {
     const assignment = yield* decodeAssignmentV1(assignmentExample);
-    assert.strictEqual(assignment.contextPackage.repoCommit, "abc123");
+    assert.strictEqual(assignment.contextPackage.repoCommit, "a1b2c3d");
     assert.deepStrictEqual(assignment.contextPackage.memoryVersions, ["decision-12"]);
     assert.strictEqual(assignment.implementerModel, "gpt-5.4");
   }),
@@ -28,7 +28,7 @@ it.effect("rejects an assignment without a context package or an exact repo comm
       decodeContextPackageSnapshotV1({
         requirements: assignmentExample.contextPackage.requirements,
         memoryVersions: [],
-        repoCommit: "abc123",
+        repoCommit: "a1b2c3d",
         authorizationScope: "usba-web",
       }),
     );
@@ -47,5 +47,32 @@ it.effect("rejects vector hits so they never enter a ContextPackage", () =>
       }),
     );
     assert.strictEqual(Exit.isFailure(withVectorHits), true);
+  }),
+);
+
+it.effect("deep-copies and freezes the context snapshot at decode", () =>
+  Effect.gen(function* () {
+    const memoryVersions = ["decision-12"];
+    const input = {
+      ...assignmentExample,
+      contextPackage: {
+        ...assignmentExample.contextPackage,
+        memoryVersions,
+        requirements: "The tournament page shows the new schedule.",
+      },
+    };
+    const decoded = yield* decodeAssignmentV1(input);
+    memoryVersions.push("caller-mutation");
+    input.contextPackage.requirements = "changed by caller";
+    assert.deepStrictEqual(decoded.contextPackage.memoryVersions, ["decision-12"]);
+    assert.strictEqual(
+      decoded.contextPackage.requirements,
+      "The tournament page shows the new schedule.",
+    );
+    assert.strictEqual(Object.isFrozen(input), false);
+    assert.strictEqual(Object.isFrozen(decoded), true);
+    assert.throws(() => {
+      (decoded.contextPackage.memoryVersions as Array<string>).push("stored-mutation");
+    });
   }),
 );

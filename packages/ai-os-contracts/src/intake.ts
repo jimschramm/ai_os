@@ -7,6 +7,7 @@ import {
   IsoDateTime,
   strictParse,
   TaskLink,
+  taskLinkMatches,
 } from "./common.ts";
 
 export const AuthorizationV1 = Schema.Struct({
@@ -34,9 +35,9 @@ export const IntakeAcknowledgmentV1 = Schema.Struct({
   receivedAt: IsoDateTime,
 }).check(
   Schema.makeFilter((acknowledgment) =>
-    acknowledgment.taskLink.includes(acknowledgment.taskId)
+    taskLinkMatches(acknowledgment.taskId, acknowledgment.taskLink)
       ? true
-      : "The task link must include the task id.",
+      : "The task link must be ai-os://tasks/{taskId}.",
   ),
 );
 export type IntakeAcknowledgmentV1 = typeof IntakeAcknowledgmentV1.Type;

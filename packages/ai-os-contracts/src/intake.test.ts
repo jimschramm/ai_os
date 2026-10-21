@@ -2,6 +2,7 @@ import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 
+import { taskLinkFor } from "./common.ts";
 import { acknowledgmentExample, intakeExample } from "./examples.ts";
 import { decodeIntakeAcknowledgmentV1, decodeIntakeV1 } from "./intake.ts";
 
@@ -25,7 +26,7 @@ it.effect("decodes a v1 intake and the durable acknowledgment example", () =>
       "The tournament page shows the new schedule.",
     );
     assert.strictEqual(acknowledgmentExample.durable, true);
-    assert.strictEqual(acknowledgmentExample.taskLink.includes(acknowledgmentExample.taskId), true);
+    assert.strictEqual(acknowledgmentExample.taskLink, taskLinkFor(acknowledgmentExample.taskId));
   }),
 );
 
@@ -66,5 +67,36 @@ it.effect("rejects confirmation that is not a durable receipt or that omits the 
     assert.strictEqual(Exit.isFailure(notDurable), true);
     assert.strictEqual(Exit.isFailure(missingLink), true);
     assert.strictEqual(Exit.isFailure(linkForAnotherTask), true);
+  }),
+);
+
+it.effect("rejects a task link that is not the exact ai-os task resource", () =>
+  Effect.gen(function* () {
+    const rejectLink = (taskLink: string) =>
+      Effect.exit(
+        decodeIntakeAcknowledgmentV1({
+          ...acknowledgmentExample,
+          taskLink,
+        }),
+      );
+    const containsId = yield* rejectLink("not-a-uri-task-usba-page");
+    const otherScheme = yield* rejectLink("https://evil.example/tasks/task-usba-page");
+    const extraSegment = yield* rejectLink("ai-os://tasks/task-usba-page/extra");
+    const query = yield* rejectLink("ai-os://tasks/task-usba-page?x=1");
+    const fragment = yield* rejectLink("ai-os://tasks/task-usba-page#section");
+    const otherHost = yield* rejectLink("ai-os://files/task-usba-page");
+    const longerId = yield* rejectLink("ai-os://tasks/task-usba-page-more");
+    const exact = yield* decodeIntakeAcknowledgmentV1({
+      ...acknowledgmentExample,
+      taskLink: taskLinkFor("task-usba-page"),
+    });
+    assert.strictEqual(Exit.isFailure(containsId), true);
+    assert.strictEqual(Exit.isFailure(otherScheme), true);
+    assert.strictEqual(Exit.isFailure(extraSegment), true);
+    assert.strictEqual(Exit.isFailure(query), true);
+    assert.strictEqual(Exit.isFailure(fragment), true);
+    assert.strictEqual(Exit.isFailure(otherHost), true);
+    assert.strictEqual(Exit.isFailure(longerId), true);
+    assert.strictEqual(exact.taskLink, "ai-os://tasks/task-usba-page");
   }),
 );

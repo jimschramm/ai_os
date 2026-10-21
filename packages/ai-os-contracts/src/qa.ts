@@ -1,11 +1,13 @@
 import * as Schema from "effect/Schema";
 
 import {
+  ArtifactRevisionV1,
   ContractId,
   ContractText,
   ContractVersion,
   ModelId,
-  Revision,
+  sameModel,
+  sameRevision,
   strictParse,
 } from "./common.ts";
 
@@ -18,14 +20,17 @@ export type QaFindingV1 = typeof QaFindingV1.Type;
 
 const differentModel = Schema.makeFilter(
   (verdict: { readonly qaModel: string; readonly implementerModel: string }) =>
-    verdict.qaModel !== verdict.implementerModel
-      ? true
-      : "QA must use a different model than the implementer.",
+    sameModel(verdict.qaModel, verdict.implementerModel)
+      ? "QA must use a different model than the implementer."
+      : true,
 );
 
 const exactAcceptance = Schema.makeFilter(
-  (verdict: { readonly artifactRevision: string; readonly acceptedRevision: string }) =>
-    verdict.acceptedRevision === verdict.artifactRevision
+  (verdict: {
+    readonly artifactRevision: ArtifactRevisionV1;
+    readonly acceptedRevision: ArtifactRevisionV1;
+  }) =>
+    sameRevision(verdict.acceptedRevision, verdict.artifactRevision)
       ? true
       : "Acceptance is bound to the exact artifact revision.",
 );
@@ -46,7 +51,7 @@ export const QaReworkV1 = Schema.Struct({
   qaModel: ModelId,
   implementerModel: ModelId,
   verdict: Schema.Literal("rework"),
-  artifactRevision: Revision,
+  artifactRevision: ArtifactRevisionV1,
   findings: Schema.NonEmptyArray(QaFindingV1),
 }).check(differentModel);
 export type QaReworkV1 = typeof QaReworkV1.Type;
@@ -59,8 +64,8 @@ export const QaAcceptV1 = Schema.Struct({
   qaModel: ModelId,
   implementerModel: ModelId,
   verdict: Schema.Literal("accept"),
-  artifactRevision: Revision,
-  acceptedRevision: Revision,
+  artifactRevision: ArtifactRevisionV1,
+  acceptedRevision: ArtifactRevisionV1,
   findings: Schema.Array(QaFindingV1),
 }).check(differentModel, exactAcceptance);
 export type QaAcceptV1 = typeof QaAcceptV1.Type;

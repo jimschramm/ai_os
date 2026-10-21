@@ -1,6 +1,13 @@
 import * as Schema from "effect/Schema";
 
-import { ContractId, ContractText, ContractVersion, Revision, strictParse } from "./common.ts";
+import {
+  ArtifactRevisionV1,
+  ContractId,
+  ContractText,
+  ContractVersion,
+  EvidenceRef,
+  strictParse,
+} from "./common.ts";
 
 export const EvidenceKindV1 = Schema.Literals([
   "diff",
@@ -15,7 +22,7 @@ export type EvidenceKindV1 = typeof EvidenceKindV1.Type;
 
 export const EvidenceV1 = Schema.Struct({
   kind: EvidenceKindV1,
-  ref: Revision,
+  ref: EvidenceRef,
 });
 export type EvidenceV1 = typeof EvidenceV1.Type;
 
@@ -24,7 +31,7 @@ export const CompletionSubmissionV1 = Schema.Struct({
   taskId: ContractId,
   attemptId: ContractId,
   claimedOutcome: ContractText,
-  artifactRevision: Revision,
+  artifactRevision: ArtifactRevisionV1,
   evidence: Schema.NonEmptyArray(EvidenceV1),
 });
 export type CompletionSubmissionV1 = typeof CompletionSubmissionV1.Type;

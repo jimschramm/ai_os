@@ -8,7 +8,7 @@ import { completionExample } from "./examples.ts";
 it.effect("decodes a completion bound to an exact artifact revision and evidence", () =>
   Effect.gen(function* () {
     const completion = yield* decodeCompletionSubmissionV1(completionExample);
-    assert.strictEqual(completion.artifactRevision, "rev-1");
+    assert.deepStrictEqual(completion.artifactRevision, { type: "git", sha: "abc1234" });
     assert.strictEqual(completion.evidence.length, 1);
     assert.strictEqual(completion.evidence[0]?.kind, "diff");
   }),

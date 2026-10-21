@@ -1,9 +1,15 @@
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 
-import { AssignmentV1 } from "./assignment.ts";
+import { AssignmentV1, freezeSnapshot } from "./assignment.ts";
 import { CompletionSubmissionV1 } from "./completion.ts";
-import { Revision, strictParse } from "./common.ts";
+import {
+  ArtifactRevisionV1,
+  sameModel,
+  sameRevision,
+  strictParse,
+  taskLinkMatches,
+} from "./common.ts";
 import {
   ContractName,
   ContractTransitionError,
@@ -12,7 +18,7 @@ import {
   type ContractErrorReason,
 } from "./errors.ts";
 import { IntakeAcknowledgmentV1, IntakeV1 } from "./intake.ts";
-import { QaVerdictV1 } from "./qa.ts";
+import { QaAcceptV1, QaReworkV1, QaUnavailableV1, QaVerdictV1 } from "./qa.ts";
 
 export const KanbanColumn = Schema.Literals(["Ready", "Running", "Blocked", "Review", "Done"]);
 export type KanbanColumn = typeof KanbanColumn.Type;
@@ -34,16 +40,213 @@ export const SequenceEvent = Schema.Union([
 ]);
 export type SequenceEvent = typeof SequenceEvent.Type;
 
-export const SequenceState = Schema.Struct({
-  phase: SequencePhase,
-  intake: Schema.NullOr(IntakeV1),
-  acknowledgment: Schema.NullOr(IntakeAcknowledgmentV1),
-  assignment: Schema.NullOr(AssignmentV1),
-  completion: Schema.NullOr(CompletionSubmissionV1),
-  qa: Schema.NullOr(QaVerdictV1),
-  reworkRevision: Schema.NullOr(Revision),
-  recoveryLabel: Schema.NullOr(Schema.Literal(RECOVERY_PENDING_LABEL)),
+const linked = (acknowledgment: IntakeAcknowledgmentV1): true | string =>
+  taskLinkMatches(acknowledgment.taskId, acknowledgment.taskLink)
+    ? true
+    : "The task link must be ai-os://tasks/{taskId}.";
+
+const assignedTo = (
+  acknowledgment: IntakeAcknowledgmentV1,
+  assignment: AssignmentV1,
+): true | string => {
+  const link = linked(acknowledgment);
+  if (link !== true) {
+    return link;
+  }
+  return assignment.taskId === acknowledgment.taskId
+    ? true
+    : "The assignment task must match the acknowledged task.";
+};
+
+const payloadMatches = (
+  acknowledgment: IntakeAcknowledgmentV1,
+  assignment: AssignmentV1,
+  payload: { readonly taskId: string; readonly attemptId: string },
+): true | string => {
+  const assignmentLink = assignedTo(acknowledgment, assignment);
+  if (assignmentLink !== true) {
+    return assignmentLink;
+  }
+  if (payload.taskId !== acknowledgment.taskId) {
+    return "The payload task must match the acknowledged task.";
+  }
+  return payload.attemptId === assignment.attemptId
+    ? true
+    : "The payload attempt must match the assignment.";
+};
+
+const independentQa = (
+  assignment: AssignmentV1,
+  qa: { readonly qaModel: string; readonly implementerModel: string },
+): true | string => {
+  if (sameModel(qa.qaModel, assignment.implementerModel)) {
+    return "QA must use a different model than the implementer.";
+  }
+  return sameModel(qa.implementerModel, assignment.implementerModel)
+    ? true
+    : "The QA payload names a different implementer than the assignment.";
+};
+
+const reviewedRevision = (
+  completion: CompletionSubmissionV1,
+  qa: { readonly artifactRevision: ArtifactRevisionV1 },
+  reworkRevision: ArtifactRevisionV1 | null,
+): true | string => {
+  if (!sameRevision(completion.artifactRevision, qa.artifactRevision)) {
+    return "QA is bound to the exact revision in the completion submission.";
+  }
+  if (reworkRevision !== null && sameRevision(qa.artifactRevision, reworkRevision)) {
+    return "The revision sent back for rework is not the final revision.";
+  }
+  return true;
+};
+
+export const IdleState = Schema.Struct({
+  phase: Schema.Literal("idle"),
 });
+export type IdleState = typeof IdleState.Type;
+
+export const RequestedState = Schema.Struct({
+  phase: Schema.Literal("requested"),
+  intake: IntakeV1,
+});
+export type RequestedState = typeof RequestedState.Type;
+
+export const AcknowledgedState = Schema.Struct({
+  phase: Schema.Literal("acknowledged"),
+  intake: IntakeV1,
+  acknowledgment: IntakeAcknowledgmentV1,
+}).check(Schema.makeFilter((state) => linked(state.acknowledgment)));
+export type AcknowledgedState = typeof AcknowledgedState.Type;
+
+export const AssignedState = Schema.Struct({
+  phase: Schema.Literal("assigned"),
+  intake: IntakeV1,
+  acknowledgment: IntakeAcknowledgmentV1,
+  assignment: AssignmentV1,
+}).check(Schema.makeFilter((state) => assignedTo(state.acknowledgment, state.assignment)));
+export type AssignedState = typeof AssignedState.Type;
+
+export const ExecutingState = Schema.Struct({
+  phase: Schema.Literal("executing"),
+  intake: IntakeV1,
+  acknowledgment: IntakeAcknowledgmentV1,
+  assignment: AssignmentV1,
+  reworkRevision: Schema.NullOr(ArtifactRevisionV1),
+}).check(Schema.makeFilter((state) => assignedTo(state.acknowledgment, state.assignment)));
+export type ExecutingState = typeof ExecutingState.Type;
+
+export const AwaitingQaState = Schema.Struct({
+  phase: Schema.Literal("awaiting_qa"),
+  intake: IntakeV1,
+  acknowledgment: IntakeAcknowledgmentV1,
+  assignment: AssignmentV1,
+  completion: CompletionSubmissionV1,
+  qa: Schema.NullOr(QaUnavailableV1),
+  reworkRevision: Schema.NullOr(ArtifactRevisionV1),
+}).check(
+  Schema.makeFilter((state) => {
+    const match = payloadMatches(state.acknowledgment, state.assignment, state.completion);
+    if (match !== true) {
+      return match;
+    }
+    if (state.qa !== null) {
+      const qaMatch = payloadMatches(state.acknowledgment, state.assignment, state.qa);
+      if (qaMatch !== true) {
+        return qaMatch;
+      }
+    }
+    if (
+      state.reworkRevision !== null &&
+      sameRevision(state.completion.artifactRevision, state.reworkRevision)
+    ) {
+      return "The submitted revision was already sent back for rework.";
+    }
+    return true;
+  }),
+);
+export type AwaitingQaState = typeof AwaitingQaState.Type;
+
+export const ReworkState = Schema.Struct({
+  phase: Schema.Literal("rework"),
+  intake: IntakeV1,
+  acknowledgment: IntakeAcknowledgmentV1,
+  assignment: AssignmentV1,
+  completion: CompletionSubmissionV1,
+  qa: QaReworkV1,
+  reworkRevision: ArtifactRevisionV1,
+}).check(
+  Schema.makeFilter((state) => {
+    const match = payloadMatches(state.acknowledgment, state.assignment, state.completion);
+    if (match !== true) {
+      return match;
+    }
+    const qaMatch = payloadMatches(state.acknowledgment, state.assignment, state.qa);
+    if (qaMatch !== true) {
+      return qaMatch;
+    }
+    const models = independentQa(state.assignment, state.qa);
+    if (models !== true) {
+      return models;
+    }
+    if (!sameRevision(state.qa.artifactRevision, state.reworkRevision)) {
+      return "Rework records the revision that was reviewed.";
+    }
+    return reviewedRevision(state.completion, state.qa, null);
+  }),
+);
+export type ReworkState = typeof ReworkState.Type;
+
+export const AcceptedState = Schema.Struct({
+  phase: Schema.Literal("accepted"),
+  intake: IntakeV1,
+  acknowledgment: IntakeAcknowledgmentV1,
+  assignment: AssignmentV1,
+  completion: CompletionSubmissionV1,
+  qa: QaAcceptV1,
+}).check(
+  Schema.makeFilter((state) => {
+    const match = payloadMatches(state.acknowledgment, state.assignment, state.completion);
+    if (match !== true) {
+      return match;
+    }
+    const qaMatch = payloadMatches(state.acknowledgment, state.assignment, state.qa);
+    if (qaMatch !== true) {
+      return qaMatch;
+    }
+    const models = independentQa(state.assignment, state.qa);
+    if (models !== true) {
+      return models;
+    }
+    if (!sameRevision(state.qa.acceptedRevision, state.qa.artifactRevision)) {
+      return "Acceptance is bound to the exact artifact revision.";
+    }
+    return reviewedRevision(state.completion, state.qa, null);
+  }),
+);
+export type AcceptedState = typeof AcceptedState.Type;
+
+export const RecoveryPendingState = Schema.Struct({
+  phase: Schema.Literal("recovery_pending"),
+  intake: IntakeV1,
+  acknowledgment: IntakeAcknowledgmentV1,
+  assignment: AssignmentV1,
+  reworkRevision: Schema.NullOr(ArtifactRevisionV1),
+  recoveryLabel: Schema.Literal(RECOVERY_PENDING_LABEL),
+}).check(Schema.makeFilter((state) => assignedTo(state.acknowledgment, state.assignment)));
+export type RecoveryPendingState = typeof RecoveryPendingState.Type;
+
+export const SequenceState = Schema.Union([
+  IdleState,
+  RequestedState,
+  AcknowledgedState,
+  AssignedState,
+  ExecutingState,
+  AwaitingQaState,
+  ReworkState,
+  AcceptedState,
+  RecoveryPendingState,
+]);
 export type SequenceState = typeof SequenceState.Type;
 
 export const LEGAL_EVENTS = {
@@ -58,16 +261,7 @@ export const LEGAL_EVENTS = {
   recovery_pending: [],
 } as const satisfies Record<SequencePhase, ReadonlyArray<SequenceEvent["type"]>>;
 
-export const initialSequenceState: SequenceState = {
-  phase: "idle",
-  intake: null,
-  acknowledgment: null,
-  assignment: null,
-  completion: null,
-  qa: null,
-  reworkRevision: null,
-  recoveryLabel: null,
-};
+export const initialSequenceState: SequenceState = { phase: "idle" };
 
 export const kanbanColumn = (phase: SequencePhase): KanbanColumn | null => {
   switch (phase) {
@@ -89,13 +283,8 @@ export const kanbanColumn = (phase: SequencePhase): KanbanColumn | null => {
   }
 };
 
-export const acceptedRevision = (state: SequenceState): string | null =>
-  state.phase === "accepted" &&
-  state.qa !== null &&
-  state.qa.availability === "available" &&
-  state.qa.verdict === "accept"
-    ? state.qa.acceptedRevision
-    : null;
+export const acceptedRevision = (state: SequenceState): ArtifactRevisionV1 | null =>
+  state.phase === "accepted" ? state.qa.acceptedRevision : null;
 
 const contractFor = (event: SequenceEvent): ContractName => {
   switch (event.type) {
@@ -133,14 +322,44 @@ const reject = (
 const isLegalEvent = (phase: SequencePhase, eventType: SequenceEvent["type"]): boolean =>
   (LEGAL_EVENTS[phase] as ReadonlyArray<SequenceEvent["type"]>).includes(eventType);
 
-const requireLink = (
+const applyIntake = (
   state: SequenceState,
-  event: SequenceEvent,
-  taskId: string,
-  attemptId: string | null,
-) =>
+  event: Extract<SequenceEvent, { type: "intake" }>,
+): Effect.Effect<SequenceState, ContractTransitionError> => {
+  if (state.phase !== "idle") {
+    return reject(state, event, "illegal_transition", `Cannot intake from ${state.phase}.`);
+  }
+  return Effect.succeed({ phase: "requested", intake: event.intake });
+};
+
+const applyAcknowledge = (
+  state: SequenceState,
+  event: Extract<SequenceEvent, { type: "acknowledge" }>,
+): Effect.Effect<SequenceState, ContractTransitionError> => {
+  if (state.phase !== "requested") {
+    return reject(state, event, "illegal_transition", `Cannot acknowledge from ${state.phase}.`);
+  }
+  return Effect.succeed({
+    phase: "acknowledged",
+    intake: state.intake,
+    acknowledgment: event.acknowledgment,
+  });
+};
+
+const applyAssign = (
+  state: SequenceState,
+  event: Extract<SequenceEvent, { type: "assign" }>,
+): Effect.Effect<SequenceState, ContractTransitionError> =>
   Effect.gen(function* () {
-    if (state.acknowledgment === null || state.acknowledgment.taskId !== taskId) {
+    if (state.phase !== "acknowledged") {
+      return yield* reject(
+        state,
+        event,
+        "illegal_transition",
+        `Cannot assign from ${state.phase}.`,
+      );
+    }
+    if (state.acknowledgment.taskId !== event.assignment.taskId) {
       return yield* reject(
         state,
         event,
@@ -148,10 +367,78 @@ const requireLink = (
         "The payload task does not match the acknowledged task.",
       );
     }
-    if (
-      attemptId !== null &&
-      (state.assignment === null || state.assignment.attemptId !== attemptId)
-    ) {
+    return {
+      phase: "assigned" as const,
+      intake: state.intake,
+      acknowledgment: state.acknowledgment,
+      assignment: freezeSnapshot(event.assignment),
+    };
+  });
+
+const applyStart = (
+  state: SequenceState,
+  event: Extract<SequenceEvent, { type: "start_execution" }>,
+): Effect.Effect<SequenceState, ContractTransitionError> => {
+  if (state.phase === "assigned" || state.phase === "accepted") {
+    return Effect.succeed({
+      phase: "executing",
+      intake: state.intake,
+      acknowledgment: state.acknowledgment,
+      assignment: state.assignment,
+      reworkRevision: null,
+    });
+  }
+  if (state.phase === "rework") {
+    return Effect.succeed({
+      phase: "executing",
+      intake: state.intake,
+      acknowledgment: state.acknowledgment,
+      assignment: state.assignment,
+      reworkRevision: state.reworkRevision,
+    });
+  }
+  return reject(state, event, "illegal_transition", `Cannot start_execution from ${state.phase}.`);
+};
+
+const applyLeaseExpired = (
+  state: SequenceState,
+  event: Extract<SequenceEvent, { type: "lease_expired" }>,
+): Effect.Effect<SequenceState, ContractTransitionError> => {
+  if (state.phase !== "executing") {
+    return reject(state, event, "illegal_transition", `Cannot lease_expired from ${state.phase}.`);
+  }
+  return Effect.succeed({
+    phase: "recovery_pending",
+    intake: state.intake,
+    acknowledgment: state.acknowledgment,
+    assignment: state.assignment,
+    reworkRevision: state.reworkRevision,
+    recoveryLabel: RECOVERY_PENDING_LABEL,
+  });
+};
+
+const applyCompletion = (
+  state: SequenceState,
+  event: Extract<SequenceEvent, { type: "submit_completion" }>,
+): Effect.Effect<SequenceState, ContractTransitionError> =>
+  Effect.gen(function* () {
+    if (state.phase !== "executing") {
+      return yield* reject(
+        state,
+        event,
+        "illegal_transition",
+        `Cannot submit_completion from ${state.phase}.`,
+      );
+    }
+    if (state.acknowledgment.taskId !== event.completion.taskId) {
+      return yield* reject(
+        state,
+        event,
+        "task_mismatch",
+        "The payload task does not match the acknowledged task.",
+      );
+    }
+    if (state.assignment.attemptId !== event.completion.attemptId) {
       return yield* reject(
         state,
         event,
@@ -159,83 +446,9 @@ const requireLink = (
         "The payload attempt does not match the open assignment.",
       );
     }
-    return state.acknowledgment.taskId;
-  });
-
-const applyIntake = (state: SequenceState, event: Extract<SequenceEvent, { type: "intake" }>) =>
-  Effect.succeed<SequenceState>({
-    ...initialSequenceState,
-    phase: "requested",
-    intake: event.intake,
-  });
-
-const applyAcknowledge = (
-  state: SequenceState,
-  event: Extract<SequenceEvent, { type: "acknowledge" }>,
-) =>
-  Effect.succeed<SequenceState>({
-    ...state,
-    phase: "acknowledged",
-    acknowledgment: event.acknowledgment,
-  });
-
-const applyAssign = (state: SequenceState, event: Extract<SequenceEvent, { type: "assign" }>) =>
-  Effect.gen(function* () {
-    yield* requireLink(state, event, event.assignment.taskId, null);
-    return {
-      ...state,
-      phase: "assigned" as const,
-      assignment: event.assignment,
-      completion: null,
-      qa: null,
-      reworkRevision: null,
-      recoveryLabel: null,
-    };
-  });
-
-const applyStart = (state: SequenceState) => {
-  if (state.phase === "accepted") {
-    return Effect.succeed<SequenceState>({
-      ...state,
-      phase: "executing",
-      completion: null,
-      qa: null,
-      reworkRevision: null,
-      recoveryLabel: null,
-    });
-  }
-  if (state.phase === "rework") {
-    return Effect.succeed<SequenceState>({
-      ...state,
-      phase: "executing",
-      completion: null,
-      qa: null,
-      recoveryLabel: null,
-    });
-  }
-  return Effect.succeed<SequenceState>({
-    ...state,
-    phase: "executing",
-    recoveryLabel: null,
-  });
-};
-
-const applyLeaseExpired = (state: SequenceState) =>
-  Effect.succeed<SequenceState>({
-    ...state,
-    phase: "recovery_pending",
-    recoveryLabel: RECOVERY_PENDING_LABEL,
-  });
-
-const applyCompletion = (
-  state: SequenceState,
-  event: Extract<SequenceEvent, { type: "submit_completion" }>,
-) =>
-  Effect.gen(function* () {
-    yield* requireLink(state, event, event.completion.taskId, event.completion.attemptId);
     if (
       state.reworkRevision !== null &&
-      event.completion.artifactRevision === state.reworkRevision
+      sameRevision(event.completion.artifactRevision, state.reworkRevision)
     ) {
       return yield* reject(
         state,
@@ -245,35 +458,53 @@ const applyCompletion = (
       );
     }
     return {
-      ...state,
       phase: "awaiting_qa" as const,
+      intake: state.intake,
+      acknowledgment: state.acknowledgment,
+      assignment: state.assignment,
       completion: event.completion,
       qa: null,
-      recoveryLabel: null,
+      reworkRevision: state.reworkRevision,
     };
   });
 
-const applyQa = (state: SequenceState, event: Extract<SequenceEvent, { type: "qa" }>) =>
+const applyQa = (
+  state: SequenceState,
+  event: Extract<SequenceEvent, { type: "qa" }>,
+): Effect.Effect<SequenceState, ContractTransitionError> =>
   Effect.gen(function* () {
-    const qa = event.qa;
-    yield* requireLink(state, event, qa.taskId, qa.attemptId);
-    if (qa.availability === "unavailable") {
-      return {
-        ...state,
-        phase: "awaiting_qa" as const,
-        qa,
-        recoveryLabel: null,
-      };
+    if (state.phase !== "awaiting_qa") {
+      return yield* reject(state, event, "illegal_transition", `Cannot qa from ${state.phase}.`);
     }
-    if (state.assignment === null || state.completion === null) {
+    const qa = event.qa;
+    if (state.acknowledgment.taskId !== qa.taskId) {
       return yield* reject(
         state,
         event,
-        "illegal_transition",
-        "QA requires an assignment and a completion submission.",
+        "task_mismatch",
+        "The payload task does not match the acknowledged task.",
       );
     }
-    if (qa.qaModel === state.assignment.implementerModel) {
+    if (state.assignment.attemptId !== qa.attemptId) {
+      return yield* reject(
+        state,
+        event,
+        "attempt_mismatch",
+        "The payload attempt does not match the open assignment.",
+      );
+    }
+    if (qa.availability === "unavailable") {
+      return {
+        phase: "awaiting_qa" as const,
+        intake: state.intake,
+        acknowledgment: state.acknowledgment,
+        assignment: state.assignment,
+        completion: state.completion,
+        qa,
+        reworkRevision: state.reworkRevision,
+      };
+    }
+    if (sameModel(qa.qaModel, state.assignment.implementerModel)) {
       return yield* reject(
         state,
         event,
@@ -281,7 +512,7 @@ const applyQa = (state: SequenceState, event: Extract<SequenceEvent, { type: "qa
         "QA must use a different model than the implementer.",
       );
     }
-    if (qa.implementerModel !== state.assignment.implementerModel) {
+    if (!sameModel(qa.implementerModel, state.assignment.implementerModel)) {
       return yield* reject(
         state,
         event,
@@ -289,7 +520,7 @@ const applyQa = (state: SequenceState, event: Extract<SequenceEvent, { type: "qa
         "The QA payload names a different implementer than the assignment.",
       );
     }
-    if (qa.artifactRevision !== state.completion.artifactRevision) {
+    if (!sameRevision(qa.artifactRevision, state.completion.artifactRevision)) {
       return yield* reject(
         state,
         event,
@@ -297,7 +528,7 @@ const applyQa = (state: SequenceState, event: Extract<SequenceEvent, { type: "qa
         "QA is bound to the exact revision in the completion submission.",
       );
     }
-    if (state.reworkRevision !== null && qa.artifactRevision === state.reworkRevision) {
+    if (state.reworkRevision !== null && sameRevision(qa.artifactRevision, state.reworkRevision)) {
       return yield* reject(
         state,
         event,
@@ -307,18 +538,22 @@ const applyQa = (state: SequenceState, event: Extract<SequenceEvent, { type: "qa
     }
     if (qa.verdict === "rework") {
       return {
-        ...state,
         phase: "rework" as const,
+        intake: state.intake,
+        acknowledgment: state.acknowledgment,
+        assignment: state.assignment,
+        completion: state.completion,
         qa,
         reworkRevision: qa.artifactRevision,
-        recoveryLabel: null,
       };
     }
     return {
-      ...state,
       phase: "accepted" as const,
+      intake: state.intake,
+      acknowledgment: state.acknowledgment,
+      assignment: state.assignment,
+      completion: state.completion,
       qa,
-      recoveryLabel: null,
     };
   });
 
@@ -359,9 +594,9 @@ export const applySequenceEvent = (
       case "assign":
         return yield* applyAssign(state, event);
       case "start_execution":
-        return yield* applyStart(state);
+        return yield* applyStart(state, event);
       case "lease_expired":
-        return yield* applyLeaseExpired(state);
+        return yield* applyLeaseExpired(state, event);
       case "submit_completion":
         return yield* applyCompletion(state, event);
       case "qa":

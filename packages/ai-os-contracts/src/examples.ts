@@ -13,6 +13,10 @@ const decodeAssignment = Schema.decodeUnknownSync(AssignmentV1, strictParse);
 const decodeCompletion = Schema.decodeUnknownSync(CompletionSubmissionV1, strictParse);
 const decodeQa = Schema.decodeUnknownSync(QaVerdictV1, strictParse);
 
+export const exampleRepoCommit = "a1b2c3d";
+export const revisionOne = { type: "git" as const, sha: "abc1234" };
+export const revisionTwo = { type: "git" as const, sha: "def5678" };
+
 export const intakeExample = decodeIntake({
   version: "v1",
   workspaceId: "personal",
@@ -43,7 +47,7 @@ export const assignmentExample = decodeAssignment({
   contextPackage: {
     requirements: "The tournament page shows the new schedule.",
     memoryVersions: ["decision-12"],
-    repoCommit: "abc123",
+    repoCommit: exampleRepoCommit,
     authorizationScope: "usba-web",
     createdAt: "2026-10-21T14:01:00Z",
   },
@@ -54,8 +58,8 @@ export const completionExample = decodeCompletion({
   taskId: "task-usba-page",
   attemptId: "attempt-1",
   claimedOutcome: "Updated the tournament page.",
-  artifactRevision: "rev-1",
-  evidence: [{ kind: "diff", ref: "rev-1" }],
+  artifactRevision: revisionOne,
+  evidence: [{ kind: "diff", ref: "abc1234" }],
 });
 
 export const qaWaitingExample = decodeQa({
@@ -73,7 +77,7 @@ export const qaReworkExample = decodeQa({
   qaModel: "claude-sonnet-5",
   implementerModel: "gpt-5.4",
   verdict: "rework",
-  artifactRevision: "rev-1",
+  artifactRevision: revisionOne,
   findings: [
     {
       defect: "The schedule omits the final round.",
@@ -88,9 +92,9 @@ export const completionAfterReworkExample = decodeCompletion({
   taskId: "task-usba-page",
   attemptId: "attempt-1",
   claimedOutcome: "Added the final round to the tournament page.",
-  artifactRevision: "rev-2",
+  artifactRevision: revisionTwo,
   evidence: [
-    { kind: "diff", ref: "rev-2" },
+    { kind: "diff", ref: "def5678" },
     { kind: "browser", ref: "preview-rev-2" },
   ],
 });
@@ -103,8 +107,8 @@ export const qaAcceptExample = decodeQa({
   qaModel: "claude-sonnet-5",
   implementerModel: "gpt-5.4",
   verdict: "accept",
-  artifactRevision: "rev-2",
-  acceptedRevision: "rev-2",
+  artifactRevision: revisionTwo,
+  acceptedRevision: revisionTwo,
   findings: [],
 });
 
