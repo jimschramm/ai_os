@@ -4,19 +4,7 @@ import * as Layer from "effect/Layer";
 import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/http";
 
 import { readDesktopPrimaryBearerToken } from "./desktopAuth";
-import { resolvePrimaryEnvironmentHttpUrl } from "./target";
-
-function isSameOriginBrowserPrimary(): boolean {
-  if (
-    typeof window === "undefined" ||
-    window.desktopBridge !== undefined ||
-    !window.location.origin.startsWith("http")
-  ) {
-    return false;
-  }
-
-  return new URL(resolvePrimaryEnvironmentHttpUrl("/")).origin === window.location.origin;
-}
+import { isSameOriginBrowserPrimary } from "./primaryRequest";
 
 function withPrimaryBearerToken(client: HttpClient.HttpClient): HttpClient.HttpClient {
   return client.pipe(
