@@ -1,7 +1,8 @@
 import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 
-import { happyPathEvents, revisionOne, revisionTwo } from "./examples.ts";
+import { leaseIdFor } from "./canonical.ts";
+import { completionExample, happyPathEvents, revisionOne, revisionTwo } from "./examples.ts";
 import { applySequence, applySequenceEvent, kanbanColumn, type SequenceState } from "./sequence.ts";
 import { usageTotals } from "./usage.ts";
 
@@ -33,6 +34,7 @@ const progress = (generation: number, status: "working" | "blocked" = "working")
   taskId,
   attemptId,
   generation,
+  leaseId: leaseIdFor(generation),
   status,
   blockers: status === "blocked" ? [blocker] : [],
   partialArtifacts:
@@ -46,7 +48,7 @@ const heartbeat = (generation: number) => ({
   taskId,
   attemptId,
   generation,
-  leaseId: "lease-1",
+  leaseId: leaseIdFor(generation),
   observedAt,
   leaseExpiresAt,
 });
@@ -56,6 +58,17 @@ const lapse = (generation: number) => ({
   taskId,
   attemptId,
   generation,
+  leaseId: leaseIdFor(generation),
+});
+
+const expired = (generation: number) => ({
+  type: "lease_expired" as const,
+  lease: {
+    taskId,
+    attemptId,
+    generation,
+    leaseId: leaseIdFor(generation),
+  },
 });
 
 const command = (name: string, idempotencyKey: string, extra: Record<string, unknown> = {}) => ({
@@ -153,7 +166,12 @@ it.effect("records usage by kind and keeps the ledger on the attempt", () =>
     ];
     for (const measurement of measurements) {
       state = yield* requirePhase(
-        yield* applySequenceEvent(state, { type: "report_usage", measurement }),
+        yield* applySequenceEvent(state, {
+          type: "report_usage",
+          generation: state.run.generation,
+          leaseId: state.run.leaseId,
+          measurement,
+        }),
         "executing",
       );
     }
@@ -165,6 +183,8 @@ it.effect("records usage by kind and keeps the ledger on the attempt", () =>
 
     const otherProject = yield* failure(state, {
       type: "report_usage",
+      generation: state.run.generation,
+      leaseId: state.run.leaseId,
       measurement: {
         kind: "reported_tokens",
         inputTokens: 1,
@@ -187,6 +207,8 @@ it.effect("cancels, continues, retries within a limit, and transfers ownership",
     const executing = yield* requirePhase(
       yield* applySequenceEvent(started, {
         type: "report_usage",
+        generation: 1,
+        leaseId: leaseIdFor(1),
         measurement: {
           kind: "reported_tokens",
           inputTokens: 3,
@@ -251,6 +273,20 @@ it.effect("cancels, continues, retries within a limit, and transfers ownership",
     );
     assert.strictEqual(transferred.assignment.workerId, "t3-other");
     assert.strictEqual(transferred.run.generation, 3);
+    const replayedTransfer = yield* requirePhase(
+      yield* applySequenceEvent(transferred, {
+        type: "transfer_ownership",
+        command: command("transfer_ownership", "own-1", { ownerId: "t3-other" }),
+      }),
+      "executing",
+    );
+    assert.strictEqual(replayedTransfer.commands.length, transferred.commands.length);
+    const otherOwner = yield* failure(transferred, {
+      type: "transfer_ownership",
+      command: command("transfer_ownership", "own-1", { ownerId: "t3-third" }),
+    });
+    assert.strictEqual(otherOwner.reason, "idempotency_conflict");
+    assert.strictEqual(transferred.assignment.workerId, "t3-other");
     assert.strictEqual(transferred.assignment.attemptId, attemptId);
     const conflict = yield* failure(transferred, {
       type: "fail",
@@ -302,7 +338,7 @@ it.effect("leaves recovery_pending only through an explicit resolution", () =>
       "executing",
     );
     const blocked = yield* requirePhase(
-      yield* applySequenceEvent(executing, { type: "lease_expired" }),
+      yield* applySequenceEvent(executing, expired(executing.run.generation)),
       "recovery_pending",
     );
     assert.strictEqual(kanbanColumn(blocked.phase), "Blocked");
@@ -317,10 +353,12 @@ it.effect("leaves recovery_pending only through an explicit resolution", () =>
     assert.strictEqual(kanbanColumn(ready.phase), "Ready");
     assert.strictEqual(ready.nextGeneration, blocked.run.generation + 1);
 
+    const restarted = yield* requirePhase(
+      yield* applySequenceEvent(ready, { type: "start_execution" }),
+      "executing",
+    );
     const blockedAgain = yield* requirePhase(
-      yield* applySequenceEvent(yield* applySequenceEvent(ready, { type: "start_execution" }), {
-        type: "lease_expired",
-      }),
+      yield* applySequenceEvent(restarted, expired(restarted.run.generation)),
       "recovery_pending",
     );
     const failed = yield* requirePhase(
@@ -332,19 +370,17 @@ it.effect("leaves recovery_pending only through an explicit resolution", () =>
     );
     assert.strictEqual(kanbanColumn(failed.phase), null);
 
+    const retried = yield* requirePhase(
+      yield* applySequenceEvent(failed, {
+        type: "retry",
+        command: command("retry", "retry-after-recovery"),
+      }),
+      "executing",
+    );
     const cancelled = yield* requirePhase(
       yield* applySequenceEvent(
         yield* requirePhase(
-          yield* applySequenceEvent(
-            yield* requirePhase(
-              yield* applySequenceEvent(failed, {
-                type: "retry",
-                command: command("retry", "retry-after-recovery"),
-              }),
-              "executing",
-            ),
-            { type: "lease_expired" },
-          ),
+          yield* applySequenceEvent(retried, expired(retried.run.generation)),
           "recovery_pending",
         ),
         {
@@ -414,6 +450,12 @@ it.effect(
         "accepted",
       );
       assert.strictEqual(replayed.deliveries.length, 1);
+      const changedPayload = yield* failure(replayed, {
+        type: "deliver",
+        delivery: { ...dashboard(revisionTwo), deliveredAt: "2026-10-21T17:00:00Z" },
+      });
+      assert.strictEqual(changedPayload.reason, "idempotency_conflict");
+      assert.strictEqual(replayed.deliveries.length, 1);
       const otherKey = yield* requirePhase(
         yield* applySequenceEvent(replayed, {
           type: "deliver",
@@ -430,15 +472,63 @@ it.effect(
       });
       assert.strictEqual(reusedKey.reason, "idempotency_conflict");
 
+      const otherOrigin = yield* failure(otherKey, {
+        type: "deliver",
+        delivery: { ...conversation("deliver-other"), conversationId: "other-thread" },
+      });
+      assert.strictEqual(otherOrigin.reason, "delivery_origin_mismatch");
       const both = yield* requirePhase(
         yield* applySequenceEvent(otherKey, {
           type: "deliver",
-          delivery: conversation("deliver-conversation"),
+          delivery: { ...conversation("deliver-conversation"), conversationId: "Grok-Thread-1" },
         }),
         "accepted",
       );
       assert.strictEqual(both.deliveries.length, 2);
       assert.strictEqual(both.deliveries[1]?.conversationId, "grok-thread-1");
+      assert.strictEqual(both.intake.originatingConversationId, "grok-thread-1");
       assert.strictEqual(both.phase, "accepted");
     }),
+);
+
+it.effect("rejects a worker event whose generation or lease is not current", () =>
+  Effect.gen(function* () {
+    const executing = yield* requirePhase(
+      yield* applySequence(happyPathEvents.slice(0, 4)),
+      "executing",
+    );
+    assert.strictEqual(executing.run.leaseId, leaseIdFor(executing.run.generation));
+    const probes = [
+      { type: "lease_expired" as const, lease: { ...expired(1).lease, leaseId: "lease-9" } },
+      {
+        type: "submit_completion" as const,
+        completion: { ...completionExample, leaseId: "lease-9" },
+      },
+      { type: "report_progress" as const, report: { ...progress(1), leaseId: "lease-9" } },
+      { type: "heartbeat" as const, heartbeat: { ...heartbeat(1), leaseId: "lease-9" } },
+      { type: "heartbeat_lapsed" as const, lapse: { ...lapse(1), leaseId: "lease-9" } },
+      {
+        type: "report_usage" as const,
+        generation: 1,
+        leaseId: "lease-9",
+        measurement: {
+          kind: "unknown" as const,
+          reason: "The provider returned no usage.",
+          attribution,
+        },
+      },
+      expired(2),
+    ];
+    for (const event of probes) {
+      const error = yield* failure(executing, event);
+      assert.strictEqual(error.reason, "stale_generation");
+      assert.strictEqual(error.from, "executing");
+    }
+    const beating = yield* requirePhase(
+      yield* applySequenceEvent(executing, { type: "heartbeat", heartbeat: heartbeat(1) }),
+      "executing",
+    );
+    assert.strictEqual(beating.run.leaseId, leaseIdFor(1));
+    assert.strictEqual(beating.run.leaseExpiresAt, leaseExpiresAt);
+  }),
 );

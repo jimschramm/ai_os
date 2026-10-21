@@ -7,6 +7,7 @@ import {
   freezeInPlace,
   freezeSnapshot,
 } from "./assignment.ts";
+import { timeAtOrBefore, timeBefore } from "./canonical.ts";
 import {
   ContractId,
   ContractText,
@@ -65,7 +66,7 @@ export const ValidityWindowV1 = Schema.Struct({
   until: Schema.NullOr(IsoDateTime),
 }).check(
   Schema.makeFilter((window) =>
-    window.until === null || window.until > window.from
+    window.until === null || timeBefore(window.from, window.until)
       ? true
       : "The validity window must end after it starts.",
   ),
@@ -170,11 +171,6 @@ export const RetrievalResponseV1 = Schema.Struct({
   candidates: Schema.Array(MemoryCandidateV1),
 }).check(
   Schema.makeFilter((response) => {
-    const packaged = new Set(response.contextPackage.memoryVersions);
-    const leaked = response.candidates.find((candidate) => packaged.has(candidate.nodeId));
-    if (leaked !== undefined) {
-      return "Vector candidates cannot be included in a ContextPackage.";
-    }
     freezeInPlace(response);
     return true;
   }),
@@ -197,17 +193,47 @@ export const MemoryEvent = Schema.Union([
 export type MemoryEvent = typeof MemoryEvent.Type;
 
 const covers = (window: { readonly from: string; readonly until: string | null }, asOf: string) =>
-  window.from <= asOf && (window.until === null || asOf < window.until);
+  timeAtOrBefore(window.from, asOf) && (window.until === null || timeBefore(asOf, window.until));
+
+export type EligibleFactV1 = AcceptedFactV1 | SupersededFactV1;
+
+const supersededFactIds = (graph: MemoryGraphV1, projectId: string, asOf: string): Set<string> => {
+  const projectOf = new Map(graph.facts.map((fact) => [fact.factId, fact.projectId]));
+  const superseded = new Set<string>();
+  for (const relationship of graph.relationships) {
+    if (
+      relationship.acceptance !== "accepted" ||
+      relationship.relationshipType !== "SUPERSEDES" ||
+      relationship.projectId !== projectId ||
+      !covers(relationship.validity, asOf)
+    ) {
+      continue;
+    }
+    if (
+      projectOf.get(relationship.fromId) !== projectId ||
+      projectOf.get(relationship.toId) !== projectId
+    ) {
+      continue;
+    }
+    superseded.add(relationship.toId);
+  }
+  return superseded;
+};
 
 export const packageFacts = (
   graph: MemoryGraphV1,
   projectId: string,
   asOf: string,
-): ReadonlyArray<AcceptedFactV1> =>
-  graph.facts.filter(
-    (fact): fact is AcceptedFactV1 =>
-      fact.acceptance === "accepted" && fact.projectId === projectId && covers(fact.validity, asOf),
+): ReadonlyArray<EligibleFactV1> => {
+  const superseded = supersededFactIds(graph, projectId, asOf);
+  return graph.facts.filter(
+    (fact): fact is EligibleFactV1 =>
+      fact.acceptance !== "proposed" &&
+      fact.projectId === projectId &&
+      covers(fact.validity, asOf) &&
+      !superseded.has(fact.factId),
   );
+};
 
 export const historyFacts = (
   graph: MemoryGraphV1,
@@ -296,6 +322,9 @@ const applyMemory = (
   if (older === undefined || older.acceptance !== "accepted") {
     return Effect.fail(memoryError(event.type, "The older fact must already be accepted."));
   }
+  if (newer.projectId !== older.projectId || event.relationship.projectId !== newer.projectId) {
+    return Effect.fail(memoryError(event.type, "A relationship stays inside one project."));
+  }
   const superseded: SupersededFactV1 = {
     acceptance: "superseded",
     factId: older.factId,
@@ -370,12 +399,7 @@ export const buildRetrieval = (
     const decodedCandidates = yield* decodeCandidates(candidates).pipe(
       Effect.mapError(() => invalidMemory("retrieve", "The candidates do not match the schema.")),
     );
-    const candidateIds = new Set(decodedCandidates.map((candidate) => candidate.nodeId));
-    const eligible = packageFacts(
-      decodedGraph,
-      decodedRequest.projectId,
-      decodedRequest.asOf,
-    ).filter((fact) => !candidateIds.has(fact.factId));
+    const eligible = packageFacts(decodedGraph, decodedRequest.projectId, decodedRequest.asOf);
     const contextPackage = yield* decodeContextPackageSnapshotV1({
       requirements: decodedRequest.requirements,
       memoryVersions: eligible.map((fact) => fact.factId),

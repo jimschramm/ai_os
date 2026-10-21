@@ -15,6 +15,7 @@ import {
   revisionOne,
   revisionTwo,
 } from "./examples.ts";
+import { leaseIdFor } from "./canonical.ts";
 import {
   LEGAL_EVENTS,
   acceptedRevision,
@@ -147,9 +148,16 @@ it.effect("binds acceptance to the exact final revision", () =>
     const awaitingRework = yield* applySequence(happyPathEvents.slice(0, 6));
     const rework = yield* applySequenceEvent(awaitingRework, { type: "qa", qa: qaReworkExample });
     const executing = yield* applySequenceEvent(rework, { type: "start_execution" });
+    if (executing.phase !== "executing") {
+      return yield* Effect.die("Rework must be executing before the repeated submission.");
+    }
     const repeated = yield* failure(executing, {
       type: "submit_completion",
-      completion: completionExample,
+      completion: {
+        ...completionExample,
+        generation: executing.run.generation,
+        leaseId: executing.run.leaseId,
+      },
     });
     assert.strictEqual(repeated.reason, "revision_mismatch");
 
@@ -174,7 +182,15 @@ it.effect("binds acceptance to the exact final revision", () =>
 it.effect("blocks an expired lease as recovery_pending and does not return it to Ready", () =>
   Effect.gen(function* () {
     const executing = yield* applySequence(happyPathEvents.slice(0, 4));
-    const blocked = yield* applySequenceEvent(executing, { type: "lease_expired" });
+    const blocked = yield* applySequenceEvent(executing, {
+      type: "lease_expired",
+      lease: {
+        taskId: "task-usba-page",
+        attemptId: "attempt-1",
+        generation: 1,
+        leaseId: leaseIdFor(1),
+      },
+    });
     if (blocked.phase !== "recovery_pending") {
       return yield* Effect.die("An expired lease must be recovery_pending.");
     }
@@ -186,7 +202,15 @@ it.effect("blocks an expired lease as recovery_pending and does not return it to
       { type: "acknowledge", acknowledgment: acknowledgmentExample },
       { type: "assign", assignment: assignmentExample },
       { type: "start_execution" },
-      { type: "lease_expired" },
+      {
+        type: "lease_expired",
+        lease: {
+          taskId: "task-usba-page",
+          attemptId: "attempt-1",
+          generation: 1,
+          leaseId: leaseIdFor(1),
+        },
+      },
       { type: "submit_completion", completion: completionExample },
       { type: "qa", qa: qaAcceptExample },
     ];
@@ -352,6 +376,7 @@ it.effect("rejects schema-invalid input on every transition", () =>
             taskId: "task-usba-page",
             attemptId: "attempt-1",
             generation: 1,
+            leaseId: leaseIdFor(1),
             status: "working",
             blockers: [
               {
@@ -388,6 +413,7 @@ it.effect("rejects schema-invalid input on every transition", () =>
             taskId: "task-usba-page",
             attemptId: "attempt-1",
             generation: 0,
+            leaseId: leaseIdFor(1),
           },
         },
       ],
@@ -395,6 +421,8 @@ it.effect("rejects schema-invalid input on every transition", () =>
         executing,
         {
           type: "report_usage",
+          generation: 1,
+          leaseId: leaseIdFor(1),
           measurement: {
             kind: "reported_tokens",
             inputTokens: 1,
@@ -623,10 +651,15 @@ it.effect("treats a rework revision as stale when only the git SHA case differs"
       return yield* Effect.die("Rework must record the reviewed git revision.");
     }
     const executing = yield* applySequenceEvent(rework, { type: "start_execution" });
+    if (executing.phase !== "executing") {
+      return yield* Effect.die("Rework must be executing before the repeated submission.");
+    }
     const repeated = yield* failure(executing, {
       type: "submit_completion",
       completion: {
         ...completionExample,
+        generation: executing.run.generation,
+        leaseId: executing.run.leaseId,
         artifactRevision: { type: "git", sha: rework.reworkRevision.sha.toUpperCase() },
       },
     });

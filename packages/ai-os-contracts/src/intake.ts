@@ -1,5 +1,6 @@
 import * as Schema from "effect/Schema";
 
+import { ConversationId } from "./canonical.ts";
 import {
   ContractId,
   ContractText,
@@ -24,6 +25,7 @@ export const IntakeV1 = Schema.Struct({
   constraints: Schema.Array(ContractText),
   acceptanceCriteria: Schema.NonEmptyArray(ContractText),
   authorization: AuthorizationV1,
+  originatingConversationId: ConversationId,
 });
 export type IntakeV1 = typeof IntakeV1.Type;
 

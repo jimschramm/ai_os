@@ -28,11 +28,11 @@ Request, assignment, execution, independent QA, rework, accepted result. Progres
 
 `SequenceState` is a discriminated union on `phase`. A phase only decodes with the records that phase requires. `accepted` requires the assignment, the completion, an available accept verdict, and the delivery acks. `awaiting_qa` can carry only an unavailable verdict. `recovery_pending` requires the label `Execution status unknown`. A payload that is only `{ phase: "accepted" }` does not decode.
 
-An open attempt has a generation. The first `start_execution` uses generation 1. A new start, a retry, and an ownership transfer while executing each move to the next generation and clear the lease and partial progress. Writes that name an older generation are `stale_generation`.
+An open attempt has a generation and a lease id minted for that generation (`lease-1` for generation 1). A new start, a retry, and an ownership transfer while executing each move to the next generation and lease, and clear the lease expiry and partial progress. Worker events — progress, heartbeat, heartbeat lapse, usage, completion, and lease expiry — carry that generation and lease id. A write that names any other pair is `stale_generation` and leaves the run where it is.
 
 ## Intake
 
-`IntakeV1` carries the workspace, project, request, constraints, acceptance criteria, and authorization (`standing` or `explicit`).
+`IntakeV1` carries the workspace, project, request, constraints, acceptance criteria, authorization (`standing` or `explicit`), and the originating conversation id. That id is stored in canonical lowercase form.
 
 `IntakeAcknowledgmentV1` is a separate payload. `durable` is the literal `true`. `taskLink` must be exactly `ai-os://tasks/{taskId}`: that scheme, that path, and no extra segment, query, or fragment. A string that only contains the task id is not a link. A `false` durable flag, a missing link, or an acknowledgment before the intake fails. The failure before any intake is `confirmation_before_durable_receipt`.
 
@@ -42,7 +42,7 @@ An open attempt has a generation. The first `start_execution` uses generation 1.
 
 ## Completion submission
 
-`CompletionSubmissionV1` carries the claimed outcome, the exact `artifactRevision`, and at least one evidence item (`diff`, `commit`, `test`, `browser`, `preview`, `deployment`, or `readback`). An artifact revision is a git object id, a Drive file id plus version, or a named page, preview, deployment, or document id. A git object id is exactly 40 hex characters (SHA-1) or 64 (SHA-256), stored lowercase. Abbreviated ids are rejected. Drive file ids stay case-sensitive. Submitting a completion moves `executing` to `awaiting_qa`. It does not accept the work. Repeating the revision that QA sent back for rework, including the same full git id in a different case, is `revision_mismatch`. A completion has a claimed outcome. It does not carry an idempotency key.
+`CompletionSubmissionV1` carries the open generation, the open lease id, the claimed outcome, the exact `artifactRevision`, and at least one evidence item (`diff`, `commit`, `test`, `browser`, `preview`, `deployment`, or `readback`). An artifact revision is a git object id, a Drive file id plus version, or a named page, preview, deployment, or document id. A git object id is exactly 40 hex characters (SHA-1) or 64 (SHA-256), stored lowercase. Abbreviated ids are rejected. Drive file ids stay case-sensitive. Submitting a completion moves `executing` to `awaiting_qa`. It does not accept the work. Repeating the revision that QA sent back for rework, including the same full git id in a different case, is `revision_mismatch`. A completion has a claimed outcome. It does not carry an idempotency key.
 
 ## QA verdict and rework
 
@@ -58,23 +58,23 @@ QA's model name must differ from the assignment's implementer model name. A mode
 
 ## Progress
 
-`ProgressReportV1` is a generation-scoped snapshot: `working` or `blocked`, blockers, and partial artifacts. A blocked report needs at least one blocker. A blocker names the summary, the owner, and a concrete next action. A working report cannot carry blockers. Partial artifacts use the same revision types as completion, so an abbreviated git id is rejected. The stored report is frozen.
+`ProgressReportV1` is a snapshot for the open generation and lease: `working` or `blocked`, blockers, and partial artifacts. A blocked report needs at least one blocker. A blocker names the summary, the owner, and a concrete next action. A working report cannot carry blockers. Partial artifacts use the same revision types as completion, so an abbreviated git id is rejected. The stored report is frozen.
 
-`HeartbeatV1` names the generation, the lease, and when that lease expires. The expiry has to be later than the observation. A matching heartbeat refreshes `leaseExpiresAt` on the open run. `heartbeat_lapsed` for that same generation moves `executing` to `recovery_pending`. A lapse for an older generation is `stale_generation` and leaves the run executing. `lease_expired` does the same as a matching lapse. Neither one returns the attempt to Ready.
+`HeartbeatV1` names the generation, the lease id, and when that lease expires. The expiry is compared as an instant, so `2026-10-21T15:00:00.001Z` is after `2026-10-21T15:00:00Z`. A heartbeat refreshes `leaseExpiresAt` only when both the generation and the stored lease id match. It does not replace the lease id. `heartbeat_lapsed` and `lease_expired` for that same pair move `executing` to `recovery_pending`. A stale pair is rejected and leaves the run executing. Neither event returns the attempt to Ready.
 
 ## Shared memory
 
-Node kinds and relationship types are the ones in [the memory schema](../memory-schema.md). `MemoryGraphV1` stores facts and relationships. A fact is `proposed`, `accepted`, or `superseded`. A relationship is `proposed` or `accepted`. Both carry provenance (who, when) and a validity window. Proposed is not knowledge. `accept_fact` is the explicit acceptance. `supersede` records an accepted `SUPERSEDES` relationship from the newer accepted fact to the older accepted fact. The older fact stays in the graph. `historyFacts` returns both. `packageFacts` returns only accepted facts whose window covers `asOf` and that have not been superseded.
+Node kinds and relationship types are the ones in [the memory schema](../memory-schema.md). `MemoryGraphV1` stores facts and relationships. A fact is `proposed`, `accepted`, or `superseded`. A relationship is `proposed` or `accepted`. Both carry provenance (who, when) and a validity window. Proposed is not knowledge. `accept_fact` is the explicit acceptance. `supersede` records an accepted `SUPERSEDES` relationship from the newer accepted fact to the older accepted fact. The older fact stays in the graph. `historyFacts` returns both. `packageFacts` returns facts in that project whose window covers `asOf`, excluding anything still only proposed. An accepted `SUPERSEDES` edge that is valid at `asOf` and stays inside that project removes the older fact, whatever status the fact record stores. A proposed edge does not. A relationship whose endpoints are in different projects is rejected. There is no shared-scope exception in v1. Windows are compared as instants.
 
-`buildRetrieval` turns that set into a `ContextPackageSnapshotV1` plus a separate `candidates` list. Candidates are vector hits (`source: chroma`). A candidate id is removed from the package even when the fact is otherwise eligible. A response whose package contains a candidate id does not decode. The package schema itself has no candidates field. This contract does not write total-agent-memory.
+`buildRetrieval` builds that package from the graph first, then attaches `candidates` beside it. Candidates cannot add, remove, or reorder package entries. The package schema itself has no candidates field. This contract does not write total-agent-memory.
 
 ## Usage
 
-`UsageMeasurementV1` is one of `reported_tokens`, `estimated_cost` (USD minor units), `subscription_allocation` (basis points), or `unknown`. Each measurement carries attribution: project, task, attempt, agent, platform, provider, and model. A payload that mixes those kinds is rejected. `UsageLedgerV1` is the list of measurements. It has no total field. `usageTotals` adds values only inside a kind. Unknown increments a count. It does not become tokens or cost. `report_usage` appends one measurement to the open run. The project, task, and attempt have to match the intake and the assignment. Cancel, continue, retry, and an executing ownership transfer keep the measurements with the attempt.
+`UsageMeasurementV1` is one of `reported_tokens`, `estimated_cost` (USD minor units), `subscription_allocation` (basis points), or `unknown`. Each measurement carries attribution: project, task, attempt, agent, platform, provider, and model. A payload that mixes those kinds is rejected. `UsageLedgerV1` is the list of measurements. It has no total field. `usageTotals` adds values only inside a kind. Unknown increments a count. It does not become tokens or cost. `report_usage` appends one measurement to the open run and carries the open generation and lease id. The project, task, and attempt have to match the intake and the assignment. Cancel, continue, retry, and an executing ownership transfer keep the measurements with the attempt.
 
 ## Control and recovery
 
-Control commands carry an idempotency key. That key is not a completion claim. The same key and the same command replay the current state. The same key and a different command is `idempotency_conflict`.
+Control commands carry an idempotency key. That key is not a completion claim. The key is bound to a canonical fingerprint of the whole command payload. The same key and the same payload replay the current state. The same key and any other payload, including a different owner or blocker, is `idempotency_conflict`.
 
 | Command              | From                                     | Result                                                                              |
 | -------------------- | ---------------------------------------- | ----------------------------------------------------------------------------------- |
@@ -89,7 +89,7 @@ Control commands carry an idempotency key. That key is not a completion claim. T
 
 ## Result delivery
 
-`deliver` is legal only from `accepted`, and only for the exact accepted revision. The destination is `dashboard` or `conversation`. A conversation delivery names the originating conversation. The state stores one ack per destination. The same idempotency key replays that ack. A second key for a destination that already has an ack does not add another. The same key used for the other destination is `idempotency_conflict`. A different revision is `delivery_revision_mismatch`.
+`deliver` is legal only from `accepted`, and only for the exact accepted revision. The destination is the explicit `dashboard` target, or `conversation` when the conversation id is exactly the intake's originating conversation. Any other conversation id is `delivery_origin_mismatch`. The state stores one ack per destination. The same idempotency key replays that ack only when the delivery fingerprint matches. A different payload for that key is `idempotency_conflict`. A second key for a destination that already has an ack does not add another. A different revision is `delivery_revision_mismatch`.
 
 ## Errors
 
@@ -107,11 +107,12 @@ Invalid payloads fail schema decode. These transition errors are `ContractTransi
 | `acceptance_revision_mismatch`        | QA or acceptance names a revision other than the submitted one, or the revision already sent back for rework. |
 | `recovery_pending_not_ready`          | Any event other than `resolve_recovery` while recovery is pending.                                            |
 | `invalid_payload`                     | The state, event, or result does not match its schema.                                                        |
-| `stale_generation`                    | Progress, a heartbeat, or a lapse names a generation other than the open run.                                 |
+| `stale_generation`                    | A worker event names a generation or lease other than the open run.                                           |
 | `retry_limit_reached`                 | Retry was asked at the retry limit.                                                                           |
-| `idempotency_conflict`                | The idempotency key was already used for a different command or delivery.                                     |
+| `idempotency_conflict`                | The idempotency key was already used for a different payload.                                                 |
 | `delivery_revision_mismatch`          | Delivery names a revision other than the accepted one.                                                        |
-| `memory_not_eligible`                 | The memory event is not an acceptance of a proposed fact, or not a supersession of two accepted facts.        |
+| `delivery_origin_mismatch`            | A conversation delivery does not name the intake's originating conversation.                                  |
+| `memory_not_eligible`                 | The event is not acceptance of a proposed fact, or not a same-project supersession of two accepted facts.     |
 
 ## Tests
 

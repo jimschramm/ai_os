@@ -14,11 +14,13 @@ const validIntake = {
   constraints: [],
   acceptanceCriteria: ["The tournament page shows the new schedule."],
   authorization: { kind: "standing", scope: "usba-web" },
+  originatingConversationId: "Grok-Thread-1",
 };
 
 it.effect("decodes a v1 intake and the durable acknowledgment example", () =>
   Effect.gen(function* () {
     const intake = yield* decodeIntakeV1(validIntake);
+    assert.strictEqual(intake.originatingConversationId, "grok-thread-1");
     assert.strictEqual(intake.projectId, "usba");
     assert.strictEqual(intake.authorization.kind, "standing");
     assert.strictEqual(

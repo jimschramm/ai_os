@@ -1,5 +1,6 @@
 import * as Schema from "effect/Schema";
 
+import { ConversationId, fingerprintOf, PayloadFingerprint } from "./canonical.ts";
 import {
   ArtifactRevisionV1,
   ContractId,
@@ -18,7 +19,7 @@ export const ResultDeliveryV1 = Schema.Struct({
   acceptedRevision: ArtifactRevisionV1,
   destination: DeliveryDestinationV1,
   idempotencyKey: ContractId,
-  conversationId: Schema.optionalKey(ContractId),
+  conversationId: Schema.optionalKey(ConversationId),
   deliveredAt: IsoDateTime,
 }).check(
   Schema.makeFilter((delivery) => {
@@ -40,7 +41,8 @@ export const DeliveryAckV1 = Schema.Struct({
   destination: DeliveryDestinationV1,
   acceptedRevision: ArtifactRevisionV1,
   deliveredAt: IsoDateTime,
-  conversationId: Schema.optionalKey(ContractId),
+  conversationId: Schema.optionalKey(ConversationId),
+  fingerprint: PayloadFingerprint,
 }).check(
   Schema.makeFilter((ack) => {
     if (ack.destination === "conversation") {
@@ -56,12 +58,18 @@ export type DeliveryAckV1 = typeof DeliveryAckV1.Type;
 export const deliveryIdFor = (delivery: ResultDeliveryV1): string =>
   `delivery-${delivery.destination}-${delivery.taskId}`;
 
+export const deliveryFingerprint = (delivery: ResultDeliveryV1): string => {
+  const { idempotencyKey: _idempotencyKey, ...payload } = delivery;
+  return fingerprintOf(payload);
+};
+
 export const ackFor = (delivery: ResultDeliveryV1): DeliveryAckV1 => ({
   deliveryId: deliveryIdFor(delivery),
   idempotencyKey: delivery.idempotencyKey,
   destination: delivery.destination,
   acceptedRevision: delivery.acceptedRevision,
   deliveredAt: delivery.deliveredAt,
+  fingerprint: deliveryFingerprint(delivery),
   ...(delivery.conversationId === undefined ? {} : { conversationId: delivery.conversationId }),
 });
 

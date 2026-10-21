@@ -1,6 +1,7 @@
 import * as Schema from "effect/Schema";
 
 import { AssignmentV1 } from "./assignment.ts";
+import { leaseIdFor } from "./canonical.ts";
 import { strictParse } from "./common.ts";
 import { CompletionSubmissionV1 } from "./completion.ts";
 import { IntakeAcknowledgmentV1, IntakeV1 } from "./intake.ts";
@@ -26,6 +27,7 @@ export const intakeExample = decodeIntake({
   constraints: ["Keep the public page available during the update."],
   acceptanceCriteria: ["The tournament page shows the new schedule."],
   authorization: { kind: "standing", scope: "usba-web" },
+  originatingConversationId: "Grok-Thread-1",
 });
 
 export const acknowledgmentExample = decodeAcknowledgment({
@@ -57,6 +59,8 @@ export const completionExample = decodeCompletion({
   version: "v1",
   taskId: "task-usba-page",
   attemptId: "attempt-1",
+  generation: 1,
+  leaseId: leaseIdFor(1),
   claimedOutcome: "Updated the tournament page.",
   artifactRevision: revisionOne,
   evidence: [{ kind: "diff", ref: "diff-rev-1" }],
@@ -91,6 +95,8 @@ export const completionAfterReworkExample = decodeCompletion({
   version: "v1",
   taskId: "task-usba-page",
   attemptId: "attempt-1",
+  generation: 2,
+  leaseId: leaseIdFor(2),
   claimedOutcome: "Added the final round to the tournament page.",
   artifactRevision: revisionTwo,
   evidence: [

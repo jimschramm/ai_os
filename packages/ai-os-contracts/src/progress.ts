@@ -1,6 +1,7 @@
 import * as Schema from "effect/Schema";
 
 import { freezeInPlace } from "./assignment.ts";
+import { timeBefore } from "./canonical.ts";
 import {
   ArtifactRevisionV1,
   ContractId,
@@ -30,6 +31,7 @@ export const ProgressReportV1 = Schema.Struct({
   taskId: ContractId,
   attemptId: ContractId,
   generation: PositiveInt,
+  leaseId: ContractId,
   status: Schema.Literals(["working", "blocked"]),
   blockers: Schema.Array(BlockerV1),
   partialArtifacts: Schema.Array(PartialArtifactV1),
@@ -57,7 +59,7 @@ export const HeartbeatV1 = Schema.Struct({
   leaseExpiresAt: IsoDateTime,
 }).check(
   Schema.makeFilter((heartbeat) =>
-    heartbeat.leaseExpiresAt > heartbeat.observedAt
+    timeBefore(heartbeat.observedAt, heartbeat.leaseExpiresAt)
       ? true
       : "The lease must expire after the heartbeat.",
   ),
@@ -69,8 +71,17 @@ export const HeartbeatLapseV1 = Schema.Struct({
   taskId: ContractId,
   attemptId: ContractId,
   generation: PositiveInt,
+  leaseId: ContractId,
 });
 export type HeartbeatLapseV1 = typeof HeartbeatLapseV1.Type;
+
+export const LeaseExpiredV1 = Schema.Struct({
+  taskId: ContractId,
+  attemptId: ContractId,
+  generation: PositiveInt,
+  leaseId: ContractId,
+});
+export type LeaseExpiredV1 = typeof LeaseExpiredV1.Type;
 
 export const decodeProgressReportV1 = Schema.decodeUnknownEffect(ProgressReportV1, strictParse);
 export const decodeHeartbeatV1 = Schema.decodeUnknownEffect(HeartbeatV1, strictParse);

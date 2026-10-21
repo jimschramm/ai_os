@@ -44,6 +44,7 @@ export const ContractErrorReason = Schema.Literals([
   "retry_limit_reached",
   "idempotency_conflict",
   "delivery_revision_mismatch",
+  "delivery_origin_mismatch",
   "memory_not_eligible",
 ]);
 export type ContractErrorReason = typeof ContractErrorReason.Type;

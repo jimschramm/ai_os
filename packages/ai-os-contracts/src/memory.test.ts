@@ -199,11 +199,18 @@ it.effect("builds a context package only from accepted current facts", () =>
     const expired = yield* buildRetrieval(graph, { ...request, asOf: later }, []);
     assert.deepStrictEqual(expired.contextPackage.memoryVersions, []);
 
-    const current = yield* buildRetrieval(graph, request, [
-      { nodeId: "decision-new", score: 0.8, source: "chroma" },
-    ]);
-    assert.deepStrictEqual(current.contextPackage.memoryVersions, []);
-    assert.strictEqual(current.candidates[0]?.nodeId, "decision-new");
+    const candidates = [
+      { nodeId: "not-a-fact", score: 0.9, source: "chroma" as const },
+      { nodeId: "decision-new", score: 0.8, source: "chroma" as const },
+    ];
+    const current = yield* buildRetrieval(graph, request, candidates);
+    const withoutCandidates = yield* buildRetrieval(graph, request, []);
+    assert.deepStrictEqual(current.contextPackage, withoutCandidates.contextPackage);
+    assert.deepStrictEqual(current.contextPackage.memoryVersions, ["decision-new"]);
+    assert.deepStrictEqual(
+      current.candidates.map((candidate) => candidate.nodeId),
+      ["not-a-fact", "decision-new"],
+    );
     assert.strictEqual(Object.isFrozen(current.contextPackage), true);
     assert.throws(() => {
       (current.candidates as Array<unknown>).push({ nodeId: "extra", score: 1, source: "chroma" });
@@ -213,19 +220,18 @@ it.effect("builds a context package only from accepted current facts", () =>
 
 it.effect("rejects vector candidates inside a context package and ineligible memory events", () =>
   Effect.gen(function* () {
-    const leaked = yield* Effect.exit(
-      decodeRetrievalResponseV1({
-        version: "v1",
-        contextPackage: {
-          requirements: "The tournament page shows the new schedule.",
-          memoryVersions: ["decision-new"],
-          repoCommit: exampleRepoCommit,
-          authorizationScope: "usba-web",
-          createdAt: at,
-        },
-        candidates: [{ nodeId: "decision-new", score: 0.4, source: "chroma" }],
-      }),
-    );
+    const overlapped = yield* decodeRetrievalResponseV1({
+      version: "v1",
+      contextPackage: {
+        requirements: "The tournament page shows the new schedule.",
+        memoryVersions: ["decision-new"],
+        repoCommit: exampleRepoCommit,
+        authorizationScope: "usba-web",
+        createdAt: at,
+      },
+      candidates: [{ nodeId: "decision-new", score: 0.4, source: "chroma" }],
+    });
+    assert.deepStrictEqual(overlapped.contextPackage.memoryVersions, ["decision-new"]);
     const packagedCandidates = yield* Effect.exit(
       decodeContextPackageSnapshotV1({
         requirements: "The tournament page shows the new schedule.",
@@ -269,7 +275,6 @@ it.effect("rejects vector candidates inside a context package and ineligible mem
     const shortCommit = yield* Effect.flip(
       buildRetrieval(initialMemoryGraph, { ...request, repoCommit: "abc1234" }, []),
     );
-    assert.strictEqual(Exit.isFailure(leaked), true);
     assert.strictEqual(Exit.isFailure(packagedCandidates), true);
     assert.strictEqual(earlyAccept.reason, "memory_not_eligible");
     assert.strictEqual(supersedeProposed.reason, "memory_not_eligible");
@@ -277,5 +282,127 @@ it.effect("rejects vector candidates inside a context package and ineligible mem
     assert.strictEqual(invalid.event, "propose_fact");
     assert.strictEqual(badGraph.reason, "invalid_payload");
     assert.strictEqual(shortCommit.reason, "invalid_payload");
+  }),
+);
+
+it.effect("derives package membership from same-project SUPERSEDES edges", () =>
+  Effect.gen(function* () {
+    const accepted = (factId: string, projectId = "usba") => ({
+      acceptance: "accepted" as const,
+      factId,
+      projectId,
+      kind: "Decision" as const,
+      body: `Fact ${factId}.`,
+      provenance: { actorId: "jim", at },
+      validity: { from: at, until: null as string | null },
+      acceptedBy: "jim",
+      acceptedAt: at,
+    });
+    const supersedes = (fromId: string, toId: string, projectId = "usba") => ({
+      acceptance: "accepted" as const,
+      relationshipId: `rel-${fromId}-${toId}`,
+      projectId,
+      relationshipType: "SUPERSEDES" as const,
+      fromId,
+      toId,
+      provenance: { actorId: "jim", at },
+      validity: { from: at, until: null },
+      acceptedBy: "jim",
+      acceptedAt: at,
+    });
+    const stillAccepted = yield* buildRetrieval(
+      {
+        facts: [accepted("decision-old"), accepted("decision-new")],
+        relationships: [supersedes("decision-new", "decision-old")],
+      },
+      request,
+      [],
+    );
+    assert.deepStrictEqual(stillAccepted.contextPackage.memoryVersions, ["decision-new"]);
+
+    const statusOnly = yield* buildRetrieval(
+      {
+        facts: [
+          {
+            ...accepted("decision-old"),
+            acceptance: "superseded" as const,
+            supersededBy: "decision-new",
+          },
+        ],
+        relationships: [],
+      },
+      request,
+      [],
+    );
+    assert.deepStrictEqual(statusOnly.contextPackage.memoryVersions, ["decision-old"]);
+
+    const crossProject = {
+      facts: [accepted("decision-new"), accepted("decision-old", "other")],
+      relationships: [supersedes("decision-new", "decision-old")],
+    };
+    const otherPackage = yield* buildRetrieval(
+      crossProject,
+      { ...request, projectId: "other" },
+      [],
+    );
+    assert.deepStrictEqual(otherPackage.contextPackage.memoryVersions, ["decision-old"]);
+
+    let graph = yield* applyMemoryEvent(initialMemoryGraph, {
+      type: "propose_fact",
+      fact: fact("decision-home"),
+    });
+    graph = yield* applyMemoryEvent(graph, {
+      type: "accept_fact",
+      factId: "decision-home",
+      acceptedBy: "jim",
+      acceptedAt: at,
+    });
+    graph = yield* applyMemoryEvent(graph, {
+      type: "propose_fact",
+      fact: { ...fact("decision-away"), projectId: "other" },
+    });
+    graph = yield* applyMemoryEvent(graph, {
+      type: "accept_fact",
+      factId: "decision-away",
+      acceptedBy: "jim",
+      acceptedAt: at,
+    });
+    const crossed = yield* failure(graph, {
+      type: "supersede",
+      relationship: supersedes("decision-home", "decision-away"),
+    });
+    assert.strictEqual(crossed.reason, "memory_not_eligible");
+
+    const fractional = yield* buildRetrieval(
+      {
+        facts: [
+          {
+            ...accepted("decision-fraction"),
+            validity: {
+              from: "2026-10-21T15:00:00Z",
+              until: "2026-10-21T15:00:00.5Z",
+            },
+          },
+        ],
+        relationships: [],
+      },
+      { ...request, asOf: "2026-10-21T15:00:00.4Z" },
+      [],
+    );
+    const equalInstant = yield* buildRetrieval(
+      {
+        facts: [
+          {
+            ...accepted("decision-equal"),
+            validity: { from: "2026-10-21T15:00:00.1Z", until: null },
+          },
+        ],
+        relationships: [],
+      },
+      { ...request, asOf: "2026-10-21T15:00:00.100Z" },
+      [],
+    );
+    assert.deepStrictEqual(fractional.contextPackage.memoryVersions, ["decision-fraction"]);
+    assert.deepStrictEqual(equalInstant.contextPackage.memoryVersions, ["decision-equal"]);
   }),
 );

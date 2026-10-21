@@ -1,6 +1,7 @@
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 
+import { fingerprintOf, PayloadFingerprint } from "./canonical.ts";
 import { ContractId, strictParse } from "./common.ts";
 import { ContractTransitionError, type ContractErrorReason, type SequencePhase } from "./errors.ts";
 import { BlockerV1 } from "./progress.ts";
@@ -9,7 +10,7 @@ export const DEFAULT_RETRY_LIMIT = 3;
 
 export const AppliedCommandV1 = Schema.Struct({
   idempotencyKey: ContractId,
-  command: ContractId,
+  fingerprint: PayloadFingerprint,
 });
 export type AppliedCommandV1 = typeof AppliedCommandV1.Type;
 
@@ -81,13 +82,15 @@ export const ControlCommandV1 = Schema.Union([
 ]);
 export type ControlCommandV1 = typeof ControlCommandV1.Type;
 
-export const commandName = (command: ControlCommandV1): string =>
-  command.command === "resolve_recovery" ? `resolve_recovery:${command.outcome}` : command.command;
+export const commandFingerprint = (command: ControlCommandV1): string => {
+  const { idempotencyKey: _idempotencyKey, ...payload } = command;
+  return fingerprintOf(payload);
+};
 
 export const rememberCommand = (
   commands: ReadonlyArray<AppliedCommandV1>,
   idempotencyKey: string,
-  command: string,
+  fingerprint: string,
   phase: SequencePhase,
   event: string,
 ): Effect.Effect<
@@ -97,11 +100,11 @@ export const rememberCommand = (
   const existing = commands.find((entry) => entry.idempotencyKey === idempotencyKey);
   if (existing === undefined) {
     return Effect.succeed({
-      commands: [...commands, { idempotencyKey, command }],
+      commands: [...commands, { idempotencyKey, fingerprint }],
       replay: false,
     });
   }
-  if (existing.command === command) {
+  if (existing.fingerprint === fingerprint) {
     return Effect.succeed({ commands, replay: true });
   }
   return Effect.fail(

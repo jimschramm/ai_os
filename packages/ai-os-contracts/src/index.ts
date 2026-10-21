@@ -1,3 +1,4 @@
+export * from "./canonical.ts";
 export * from "./common.ts";
 export * from "./errors.ts";
 export * from "./intake.ts";
