@@ -350,7 +350,7 @@ export const OPERATIONS_TASKS: readonly OperationsTask[] = [
       leaseId: leaseIdFor(1),
       claimedOutcome: "Wrote the Portland note.",
       artifactRevision: git("9b1e4c2d0a6f8e7b5c3d1a9f0e8b7c6d5a4f3e21"),
-      evidence: [{ kind: "readback", ref: "note://trip/portland" }],
+      evidence: [{ kind: "readback", ref: "note:trip:portland" }],
     },
     qa: {
       version: "v1",
@@ -467,8 +467,8 @@ export const OPERATIONS_TASKS: readonly OperationsTask[] = [
     assignment: {
       version: "v1",
       taskId: "saturday-copy",
-      attemptId: "saturday-copy-attempt-2",
-      assignmentId: "saturday-copy-assignment-2",
+      attemptId: "saturday-copy-attempt-1",
+      assignmentId: "saturday-copy-assignment-1",
       workerId: "codex-t3",
       implementerModel: { model: "gpt-5.4" },
       scope: "Edit the schedule section only.",
@@ -484,9 +484,9 @@ export const OPERATIONS_TASKS: readonly OperationsTask[] = [
       {
         version: "v1",
         taskId: "saturday-copy",
-        attemptId: "saturday-copy-attempt-2",
-        generation: 2,
-        leaseId: leaseIdFor(2),
+        attemptId: "saturday-copy-attempt-1",
+        generation: 1,
+        leaseId: leaseIdFor(1),
         status: "working",
         blockers: [],
         partialArtifacts: [],
@@ -500,7 +500,7 @@ export const OPERATIONS_TASKS: readonly OperationsTask[] = [
       leaseId: leaseIdFor(1),
       claimedOutcome: "Updated the schedule heading.",
       artifactRevision: git("11aa22bb33cc44dd55ee66ff77889900aabbccdd"),
-      evidence: [{ kind: "diff", ref: "diff://usba/schedule/attempt-1" }],
+      evidence: [{ kind: "diff", ref: "diff:usba:schedule:attempt-1" }],
     },
     qa: {
       version: "v1",
@@ -776,8 +776,8 @@ export const OPERATIONS_TASKS: readonly OperationsTask[] = [
       claimedOutcome: "Drafted the announcement.",
       artifactRevision: git("44dd55ee66ff77889900aabbccddeeff00112233"),
       evidence: [
-        { kind: "diff", ref: "diff://usba/announcement" },
-        { kind: "preview", ref: "preview://usba/home" },
+        { kind: "diff", ref: "diff:usba:announcement" },
+        { kind: "preview", ref: "preview:usba:home" },
       ],
     },
     qa: {
@@ -865,8 +865,8 @@ export const OPERATIONS_TASKS: readonly OperationsTask[] = [
       claimedOutcome: "Published the tournament page.",
       artifactRevision: git("55ee66ff77889900aabbccddeeff001122334455"),
       evidence: [
-        { kind: "deployment", ref: "deploy://usba/tournament" },
-        { kind: "browser", ref: "browser://usba/tournament" },
+        { kind: "deployment", ref: "deploy:usba:tournament" },
+        { kind: "browser", ref: "browser:usba:tournament" },
       ],
     },
     qa: {
@@ -1017,7 +1017,7 @@ export const OPERATIONS_TASKS: readonly OperationsTask[] = [
       leaseId: leaseIdFor(1),
       claimedOutcome: "The mockup is ready for a look.",
       artifactRevision: git("77889900aabbccddeeff00112233445566778899"),
-      evidence: [{ kind: "browser", ref: "browser://operations" }],
+      evidence: [{ kind: "browser", ref: "browser:operations" }],
     },
     qa: {
       version: "v1",

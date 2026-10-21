@@ -2550,7 +2550,8 @@ code {
   .ops-pulse,
   .ops-sparkle,
   .ops-live::after,
-  .ops-switch::after {
+  .ops-switch::after,
+  .ops-drawer {
     animation: none;
     transition: none;
   }

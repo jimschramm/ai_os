@@ -1,7 +1,7 @@
 import { Badge } from "~/components/ui/badge";
 import { Button } from "~/components/ui/button";
 import { Input } from "~/components/ui/input";
-import { useEffect, useRef, useState } from "react";
+import { useRef, useState } from "react";
 
 import {
   MEMORY_SCOPE_FILTERS,
@@ -22,6 +22,7 @@ import {
   type MemoryStatus,
   type MemoryTypeFilter,
 } from "./memoryModel";
+import { useDialogCycle } from "./dialogFocus";
 
 const STATUS_BADGE = {
   proposed: "info",
@@ -68,6 +69,7 @@ export function MemoryBrowser({
   const [status, setStatus] = useState<MemoryStatus | "all">("all");
   const titleRef = useRef<HTMLHeadingElement>(null);
   const panelRef = useRef<HTMLElement>(null);
+  useDialogCycle(open ? "memory" : null, panelRef, titleRef, onClose);
   const rows = filterRows(memoryRows(projectId, review), {
     query,
     scope,
@@ -77,38 +79,6 @@ export function MemoryBrowser({
   });
   const conflicts = openConflicts(projectId, review);
   const selected = rows.find((row) => row.fact.factId === selectedId) ?? null;
-
-  useEffect(() => {
-    if (!open) return;
-    titleRef.current?.focus();
-  }, [open]);
-
-  useEffect(() => {
-    if (!open) return;
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") {
-        event.preventDefault();
-        onClose();
-        return;
-      }
-      if (event.key !== "Tab" || panelRef.current === null) return;
-      const focusable = panelRef.current.querySelectorAll<HTMLElement>(
-        'button, a, input, select, textarea, [tabindex]:not([tabindex="-1"])',
-      );
-      const first = focusable[0];
-      const last = focusable[focusable.length - 1];
-      if (!first || !last) return;
-      if (event.shiftKey && document.activeElement === first) {
-        event.preventDefault();
-        last.focus();
-      } else if (!event.shiftKey && document.activeElement === last) {
-        event.preventDefault();
-        first.focus();
-      }
-    };
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [open, onClose]);
 
   return (
     <>
@@ -127,7 +97,7 @@ export function MemoryBrowser({
         aria-labelledby="memory-browser-title"
         aria-hidden={!open}
         inert={!open}
-        className={`absolute inset-y-0 right-0 z-40 flex w-full max-w-3xl flex-col border-l border-border bg-popover shadow-lg transition-transform duration-200 ease-out ${open ? "translate-x-0" : "translate-x-full"}`}
+        className={`ops-drawer absolute inset-y-0 right-0 z-40 flex w-full max-w-3xl flex-col border-l border-border bg-popover shadow-lg transition-transform duration-200 ease-out motion-reduce:transition-none ${open ? "translate-x-0" : "translate-x-full"}`}
       >
         <div className="flex items-start justify-between gap-3 border-b border-border px-4 py-4">
           <div>

@@ -1,7 +1,7 @@
 import { Badge } from "~/components/ui/badge";
 import { Button } from "~/components/ui/button";
 import { CircleAlertIcon, CircleHelpIcon } from "lucide-react";
-import { useEffect, useRef, useState, type RefObject } from "react";
+import { useRef, useState, type RefObject } from "react";
 
 import {
   PROGRESS_STEPS,
@@ -14,6 +14,7 @@ import {
   touchSeries,
 } from "./boardVisuals";
 import { ContextPackageView } from "./ContextPackageView";
+import { useDialogCycle } from "./dialogFocus";
 import { CortexView } from "./CortexView";
 import { MemoryBrowser } from "./MemoryBrowser";
 import { UsageGauges } from "./UsageGauges";
@@ -513,38 +514,7 @@ function TaskDrawer({
 }) {
   const titleRef = useRef<HTMLHeadingElement>(null);
   const panelRef = useRef<HTMLElement>(null);
-
-  useEffect(() => {
-    if (task === null) return;
-    titleRef.current?.focus();
-  }, [task]);
-
-  useEffect(() => {
-    if (task === null) return;
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") {
-        event.preventDefault();
-        onClose();
-        return;
-      }
-      if (event.key !== "Tab" || panelRef.current === null) return;
-      const focusable = panelRef.current.querySelectorAll<HTMLElement>(
-        'button, a, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
-      );
-      const first = focusable[0];
-      const last = focusable[focusable.length - 1];
-      if (!first || !last) return;
-      if (event.shiftKey && document.activeElement === first) {
-        event.preventDefault();
-        last.focus();
-      } else if (!event.shiftKey && document.activeElement === last) {
-        event.preventDefault();
-        first.focus();
-      }
-    };
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [task, onClose]);
+  useDialogCycle(task?.id ?? null, panelRef, titleRef, onClose);
 
   return (
     <>
@@ -563,7 +533,7 @@ function TaskDrawer({
         aria-labelledby="task-drawer-title"
         aria-hidden={task === null}
         inert={task === null}
-        className={`absolute inset-y-0 right-0 z-30 flex w-full max-w-md flex-col border-l border-border bg-popover shadow-lg transition-transform duration-200 ease-out ${task === null ? "translate-x-full" : "translate-x-0"}`}
+        className={`ops-drawer absolute inset-y-0 right-0 z-30 flex w-full max-w-md flex-col border-l border-border bg-popover shadow-lg transition-transform duration-200 ease-out motion-reduce:transition-none ${task === null ? "translate-x-full" : "translate-x-0"}`}
       >
         {task === null ? null : (
           <TaskDrawerBody
