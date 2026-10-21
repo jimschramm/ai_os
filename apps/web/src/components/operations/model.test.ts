@@ -2,6 +2,7 @@ import { describe, expect, it } from "vite-plus/test";
 import { RECOVERY_PENDING_LABEL } from "@t3tools/ai-os-contracts";
 
 import { OPERATIONS_TASKS } from "./fixtures";
+import { factById } from "./memoryModel";
 import {
   columnFor,
   contextFactIds,
@@ -20,7 +21,7 @@ describe("operations mockup", () => {
         expect(factIds.has(candidate.nodeId)).toBe(false);
       }
       for (const factId of factIds) {
-        expect(task.facts.some((fact) => fact.factId === factId)).toBe(true);
+        expect(factById(factId)?.projectId).toBe(task.projectId);
       }
     }
   });

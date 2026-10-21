@@ -2,11 +2,14 @@ import { Badge } from "~/components/ui/badge";
 import { Button } from "~/components/ui/button";
 import { useEffect, useRef, useState, type RefObject } from "react";
 
+import { ContextPackageView } from "./ContextPackageView";
+import { CortexView } from "./CortexView";
+import { MemoryBrowser } from "./MemoryBrowser";
 import type { OperationsProjectId } from "./fixtures";
+import { INITIAL_MEMORY_REVIEW, type MemoryReviewState } from "./memoryModel";
 import {
   BOARD_COLUMNS,
   activeAgentCount,
-  contextFactIds,
   formatInstant,
   formatShare,
   formatUsdMinor,
@@ -42,12 +45,30 @@ const COLUMN_ACCENT: Record<(typeof BOARD_COLUMNS)[number]["id"], string> = {
 
 export function OperationsDashboard() {
   const [projectId, setProjectId] = useState<OperationsProjectId>("usba");
+  const [surface, setSurface] = useState<"board" | "memory">("board");
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [currentTaskId, setCurrentTaskId] = useState<string | null>(null);
   const [agentsOpen, setAgentsOpen] = useState(true);
   const [noted, setNoted] = useState<Readonly<Record<string, true>>>({});
+  const [memoryOpen, setMemoryOpen] = useState(false);
+  const [memoryId, setMemoryId] = useState<string | null>(null);
+  const [highlightId, setHighlightId] = useState<string | null>("fact-friday-7");
+  const [review, setReview] = useState<MemoryReviewState>(INITIAL_MEMORY_REVIEW);
+  const [memoryNotes, setMemoryNotes] = useState<Readonly<Record<string, string>>>({});
   const project = projectById(projectId);
   const tasks = tasksForProject(projectId);
   const selected = tasks.find((task) => task.id === selectedId) ?? null;
+  const currentTask = tasks.find((task) => task.id === currentTaskId) ?? null;
+  const openMemory = (factId: string | null) => {
+    setSelectedId(null);
+    setMemoryId(factId);
+    setMemoryOpen(true);
+  };
+  const showRelationships = (factId: string | null) => {
+    setHighlightId(factId ?? "fact-friday-7");
+    setSurface("memory");
+    setMemoryOpen(false);
+  };
   const attention = needsYou(tasks);
   const results = recentResults(tasks);
   const usage = usageFor(tasks);
@@ -62,73 +83,167 @@ export function OperationsDashboard() {
               {project.detail}
             </p>
             <h1 className="mt-1 text-xl font-semibold tracking-tight">Operations</h1>
+            <div role="tablist" aria-label="Views" className="mt-3 flex flex-wrap gap-2">
+              <Button
+                role="tab"
+                aria-selected={surface === "board"}
+                size="sm"
+                variant={surface === "board" ? "secondary" : "outline"}
+                onClick={() => setSurface("board")}
+              >
+                Board
+              </Button>
+              <Button
+                role="tab"
+                aria-selected={surface === "memory"}
+                size="sm"
+                variant={surface === "memory" ? "secondary" : "outline"}
+                onClick={() => setSurface("memory")}
+              >
+                Memory
+              </Button>
+            </div>
           </div>
-          <ProjectPicker projectId={projectId} onChange={setProjectId} />
+          <div className="flex flex-col items-stretch gap-2 sm:items-end">
+            <ProjectPicker projectId={projectId} onChange={setProjectId} />
+            <Button size="sm" variant="outline" onClick={() => openMemory(null)}>
+              Browse memory
+            </Button>
+          </div>
         </div>
       </header>
       <main className="min-h-0 flex-1 overflow-auto">
-        <div className="flex flex-col gap-4 p-4 sm:p-6">
-          <AgentStrip
-            active={active}
-            agents={project.agents}
-            open={agentsOpen}
-            onToggle={() => setAgentsOpen((open) => !open)}
-          />
-          <section aria-labelledby="board-heading">
-            <div className="mb-3 flex items-baseline justify-between gap-3">
-              <h2 id="board-heading" className="text-sm font-semibold tracking-tight">
-                Board
-              </h2>
-              <p className="text-xs text-muted-foreground">{project.label}</p>
-            </div>
-            <div className="grid grid-cols-1 gap-3 md:grid-cols-2 lg:grid-cols-5">
-              {BOARD_COLUMNS.map((column) => (
-                <section
-                  key={column.id}
-                  aria-labelledby={`column-${column.id}`}
-                  className="flex min-w-0 flex-col gap-2 rounded-xl border border-border bg-card/40 p-2"
-                >
-                  <div className="px-1.5 pt-1">
-                    <h3 id={`column-${column.id}`} className="text-sm font-medium">
-                      {column.label}
-                    </h3>
-                    <p className="text-2xs leading-4 text-muted-foreground">{column.hint}</p>
-                  </div>
-                  <div className="flex flex-col gap-2">
-                    {tasksInColumn(tasks, column.id).map((task) => (
-                      <TaskCard
-                        key={task.id}
-                        task={task}
-                        accent={COLUMN_ACCENT[column.id]}
-                        pressed={task.id === selected?.id}
-                        onOpen={() => setSelectedId(task.id)}
-                      />
-                    ))}
-                    {tasksInColumn(tasks, column.id).length === 0 ? (
-                      <p className="px-1.5 py-3 text-xs text-muted-foreground">Nothing here</p>
-                    ) : null}
-                  </div>
-                </section>
-              ))}
-            </div>
-          </section>
-          <div className="grid grid-cols-1 gap-3 lg:grid-cols-3">
-            <NeedsYouPanel
-              items={attention}
-              noted={noted}
-              onAct={(id) => setNoted((current) => ({ ...current, [id]: true }))}
-            />
-            <RecentResultsPanel results={results} onOpen={setSelectedId} />
-            <UsagePanel
-              tokens={usage.totals.reportedTokens}
-              costMinor={usage.totals.estimatedCostMinorUsd}
-              shareBps={usage.totals.subscriptionAllocationBps}
-              unknown={usage.totals.unknownCount}
+        {surface === "memory" ? (
+          <div className="p-4 sm:p-6">
+            <CortexView
+              projectId={projectId}
+              projectLabel={project.label}
+              review={review}
+              highlightId={highlightId}
+              currentTaskId={currentTaskId}
+              onOpenRecord={openMemory}
             />
           </div>
-        </div>
+        ) : (
+          <div className="flex flex-col gap-4 p-4 sm:p-6">
+            <AgentStrip
+              active={active}
+              agents={project.agents}
+              open={agentsOpen}
+              onToggle={() => setAgentsOpen((open) => !open)}
+            />
+            <section aria-labelledby="board-heading">
+              <div className="mb-3 flex items-baseline justify-between gap-3">
+                <h2 id="board-heading" className="text-sm font-semibold tracking-tight">
+                  Board
+                </h2>
+                <p className="text-xs text-muted-foreground">{project.label}</p>
+              </div>
+              <div className="grid grid-cols-1 gap-3 md:grid-cols-2 lg:grid-cols-5">
+                {BOARD_COLUMNS.map((column) => (
+                  <section
+                    key={column.id}
+                    aria-labelledby={`column-${column.id}`}
+                    className="flex min-w-0 flex-col gap-2 rounded-xl border border-border bg-card/40 p-2"
+                  >
+                    <div className="px-1.5 pt-1">
+                      <h3 id={`column-${column.id}`} className="text-sm font-medium">
+                        {column.label}
+                      </h3>
+                      <p className="text-2xs leading-4 text-muted-foreground">{column.hint}</p>
+                    </div>
+                    <div className="flex flex-col gap-2">
+                      {tasksInColumn(tasks, column.id).map((task) => (
+                        <TaskCard
+                          key={task.id}
+                          task={task}
+                          accent={COLUMN_ACCENT[column.id]}
+                          pressed={task.id === selected?.id}
+                          onOpen={() => {
+                            setCurrentTaskId(task.id);
+                            setSelectedId(task.id);
+                          }}
+                        />
+                      ))}
+                      {tasksInColumn(tasks, column.id).length === 0 ? (
+                        <p className="px-1.5 py-3 text-xs text-muted-foreground">Nothing here</p>
+                      ) : null}
+                    </div>
+                  </section>
+                ))}
+              </div>
+            </section>
+            <div className="grid grid-cols-1 gap-3 lg:grid-cols-3">
+              <NeedsYouPanel
+                items={attention}
+                noted={noted}
+                onAct={(id) => setNoted((current) => ({ ...current, [id]: true }))}
+              />
+              <RecentResultsPanel
+                results={results}
+                onOpen={(id) => {
+                  setCurrentTaskId(id);
+                  setSelectedId(id);
+                }}
+              />
+              <UsagePanel
+                tokens={usage.totals.reportedTokens}
+                costMinor={usage.totals.estimatedCostMinorUsd}
+                shareBps={usage.totals.subscriptionAllocationBps}
+                unknown={usage.totals.unknownCount}
+              />
+            </div>
+          </div>
+        )}
       </main>
-      <TaskDrawer task={selected} onClose={() => setSelectedId(null)} />
+      <TaskDrawer
+        task={selected}
+        onClose={() => setSelectedId(null)}
+        onOpenRecord={(factId) => {
+          if (selected !== null) setCurrentTaskId(selected.id);
+          openMemory(factId);
+        }}
+      />
+      <MemoryBrowser
+        open={memoryOpen}
+        projectId={projectId}
+        projectLabel={project.label}
+        currentTaskId={currentTaskId}
+        currentTaskTitle={currentTask?.title ?? null}
+        review={review}
+        selectedId={memoryId}
+        notes={memoryNotes}
+        onSelect={setMemoryId}
+        onClose={() => setMemoryOpen(false)}
+        onShowRelationships={showRelationships}
+        onReject={(factId) => {
+          setReview((current) => ({
+            ...current,
+            rejected: new Set([...current.rejected, factId]),
+          }));
+          setMemoryNotes((current) => ({
+            ...current,
+            [factId]: "Rejected. This mockup does not send the decision.",
+          }));
+        }}
+        onResolve={(conflictId, keptId) => {
+          setReview((current) => ({
+            ...current,
+            resolvedConflicts: new Set([...current.resolvedConflicts, conflictId]),
+          }));
+          const note =
+            keptId === null
+              ? "Conflict marked resolved. Nothing was saved."
+              : "Kept that claim. Nothing was saved.";
+          setMemoryNotes((current) => ({ ...current, [conflictId]: note }));
+        }}
+        onCorrect={(factId) => {
+          setReview((current) => ({
+            ...current,
+            corrections: new Set([...current.corrections, factId]),
+          }));
+        }}
+      />
     </div>
   );
 }
@@ -424,7 +539,15 @@ function UsageKind({
   );
 }
 
-function TaskDrawer({ task, onClose }: { task: OperationsTask | null; onClose: () => void }) {
+function TaskDrawer({
+  task,
+  onClose,
+  onOpenRecord,
+}: {
+  task: OperationsTask | null;
+  onClose: () => void;
+  onOpenRecord: (factId: string) => void;
+}) {
   const titleRef = useRef<HTMLHeadingElement>(null);
   const panelRef = useRef<HTMLElement>(null);
 
@@ -480,7 +603,12 @@ function TaskDrawer({ task, onClose }: { task: OperationsTask | null; onClose: (
         className={`absolute inset-y-0 right-0 z-30 flex w-full max-w-md flex-col border-l border-border bg-popover shadow-lg transition-transform duration-200 ease-out ${task === null ? "translate-x-full" : "translate-x-0"}`}
       >
         {task === null ? null : (
-          <TaskDrawerBody task={task} titleRef={titleRef} onClose={onClose} />
+          <TaskDrawerBody
+            task={task}
+            titleRef={titleRef}
+            onClose={onClose}
+            onOpenRecord={onOpenRecord}
+          />
         )}
       </aside>
     </>
@@ -491,14 +619,13 @@ function TaskDrawerBody({
   task,
   titleRef,
   onClose,
+  onOpenRecord,
 }: {
   task: OperationsTask;
   titleRef: RefObject<HTMLHeadingElement | null>;
   onClose: () => void;
+  onOpenRecord: (factId: string) => void;
 }) {
-  const factIds = contextFactIds(task);
-  const facts = task.facts.filter((fact) => factIds.has(fact.factId));
-
   return (
     <>
       <div className="flex items-start justify-between gap-3 border-b border-border px-4 py-4">
@@ -541,24 +668,7 @@ function TaskDrawerBody({
             <h3 id="context-heading" className="text-sm font-semibold">
               Context
             </h3>
-            <p className="mt-1 text-xs text-muted-foreground">
-              Accepted facts from the context package
-            </p>
-            {facts.length === 0 ? (
-              <p className="mt-2 text-sm text-muted-foreground">No accepted facts.</p>
-            ) : (
-              <ul className="mt-2 flex flex-col gap-2">
-                {facts.map((fact) => (
-                  <li
-                    key={fact.factId}
-                    className="rounded-lg border border-border/80 bg-background/40 px-3 py-2"
-                  >
-                    <p className="font-mono text-2xs text-muted-foreground">{fact.factId}</p>
-                    <p className="mt-1 text-sm">{fact.body}</p>
-                  </li>
-                ))}
-              </ul>
-            )}
+            <ContextPackageView task={task} onOpenRecord={onOpenRecord} />
           </section>
           <section aria-labelledby="suggestions-heading">
             <h3 id="suggestions-heading" className="text-sm font-semibold">

@@ -411,7 +411,7 @@ export const OPERATIONS_TASKS: readonly OperationsTask[] = [
       scope: "Draft answers. Do not publish.",
       contextPackage: context(
         "Saturday starts at 9:00 a.m. local time.",
-        ["fact-saturday-start"],
+        ["fact-governing-copy", "fact-saturday-start"],
         repo,
         "usba-conversation",
         "2026-10-21T15:08:00Z",
@@ -474,7 +474,7 @@ export const OPERATIONS_TASKS: readonly OperationsTask[] = [
       scope: "Edit the schedule section only.",
       contextPackage: context(
         "Replace the old start time. Leave the rest of the page.",
-        ["fact-saturday-start"],
+        ["fact-governing-copy", "fact-saturday-start", "fact-gym"],
         repo,
         "usba-web",
         "2026-10-21T15:40:00Z",
@@ -590,7 +590,7 @@ export const OPERATIONS_TASKS: readonly OperationsTask[] = [
       scope: "Hero only.",
       contextPackage: context(
         "Use the approved photo. Do not rewrite navigation.",
-        ["fact-hero-photo"],
+        ["fact-governing-copy", "fact-hero-photo"],
         repo,
         "usba-web",
         "2026-10-21T16:12:00Z",
@@ -749,7 +749,7 @@ export const OPERATIONS_TASKS: readonly OperationsTask[] = [
       scope: "Announcement copy only.",
       contextPackage: context(
         "Use the accepted start time and location.",
-        ["fact-saturday-start", "fact-gym"],
+        ["fact-governing-copy", "fact-saturday-start", "fact-gym"],
         repo,
         "usba-web",
         "2026-10-21T14:20:00Z",
@@ -849,7 +849,7 @@ export const OPERATIONS_TASKS: readonly OperationsTask[] = [
       scope: "Tournament page.",
       contextPackage: context(
         "Publish only after QA accepts the revision.",
-        ["fact-saturday-start"],
+        ["fact-governing-copy", "fact-saturday-start"],
         repo,
         "usba-web",
         "2026-10-21T11:02:00Z",
