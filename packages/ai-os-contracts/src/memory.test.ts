@@ -427,25 +427,37 @@ it.effect("rejects a supersession graph whose status and edges disagree", () =>
     assert.strictEqual(proposedSource.reason, "invalid_graph");
     assert.strictEqual(proposedSource.detail.includes("accepted fact"), true);
 
-    const supersededSource = yield* Effect.flip(
-      buildRetrieval(
-        {
-          facts: [
-            accepted("decision-new"),
-            superseded("decision-mid", "decision-new"),
-            superseded("decision-old", "decision-mid"),
-          ],
-          relationships: [
-            supersedes("decision-new", "decision-mid"),
-            supersedes("decision-mid", "decision-old"),
-          ],
-        },
-        request,
-        [],
-      ),
+    let chain = initialMemoryGraph;
+    for (const factId of ["decision-a", "decision-b", "decision-c"]) {
+      chain = yield* applyMemoryEvent(chain, { type: "propose_fact", fact: fact(factId) });
+      chain = yield* applyMemoryEvent(chain, {
+        type: "accept_fact",
+        factId,
+        acceptedBy: "jim",
+        acceptedAt: at,
+      });
+    }
+    chain = yield* applyMemoryEvent(chain, {
+      type: "supersede",
+      relationship: supersedes("decision-b", "decision-a"),
+    });
+    chain = yield* applyMemoryEvent(chain, {
+      type: "supersede",
+      relationship: supersedes("decision-c", "decision-b"),
+    });
+    const chained = yield* buildRetrieval(chain, request, []);
+    assert.deepStrictEqual(chained.contextPackage.memoryVersions, ["decision-c"]);
+    const acceptanceOf = new Map(chain.facts.map((item) => [item.factId, item]));
+    assert.strictEqual(acceptanceOf.get("decision-a")?.acceptance, "superseded");
+    assert.strictEqual(acceptanceOf.get("decision-b")?.acceptance, "superseded");
+    assert.strictEqual(acceptanceOf.get("decision-c")?.acceptance, "accepted");
+    assert.deepStrictEqual(
+      chain.relationships.map((edge) => [edge.relationshipType, edge.fromId, edge.toId]),
+      [
+        ["SUPERSEDES", "decision-b", "decision-a"],
+        ["SUPERSEDES", "decision-c", "decision-b"],
+      ],
     );
-    assert.strictEqual(supersededSource.reason, "invalid_graph");
-    assert.strictEqual(supersededSource.detail.includes("accepted fact"), true);
 
     const duplicateFacts = yield* Effect.flip(
       buildRetrieval(

@@ -279,9 +279,10 @@ const invalidGraph = (event: string, detail: string) =>
 
 /**
  * Status is an invariant of the accepted SUPERSEDES edges, not a second source
- * of eligibility. Ids are unique. An accepted edge starts at a fact that is
- * still accepted and ends at the superseded fact. A self-edge, a cross-project
- * edge, or a cycle is not a graph we can package.
+ * of eligibility. Ids are unique. An accepted edge starts at a fact that was accepted (status accepted or
+ * superseded) and ends at the superseded fact. A later link in the chain does
+ * not invalidate the earlier edge. A self-edge, a cross-project edge, or a
+ * cycle is not a graph we can package.
  */
 const supersessionInvariant = (graph: MemoryGraphV1): string | null => {
   const seenFacts = new Set<string>();
@@ -355,7 +356,7 @@ const supersessionInvariant = (graph: MemoryGraphV1): string | null => {
     if (newer === undefined || older === undefined) {
       return "A SUPERSEDES edge names a fact that is not in the graph.";
     }
-    if (newer.acceptance !== "accepted") {
+    if (newer.acceptance !== "accepted" && newer.acceptance !== "superseded") {
       return "An accepted SUPERSEDES edge must start from an accepted fact.";
     }
     if (older.acceptance === "proposed") {
