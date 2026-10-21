@@ -1,4 +1,4 @@
-import type { AdapterBoardCard } from "@t3tools/ai-os-adapter";
+import type { AdapterBoardCard } from "@t3tools/ai-os-adapter/board";
 import { RECOVERY_PENDING_LABEL, type SequenceState } from "@t3tools/ai-os-contracts";
 
 import type { OperationsProjectId, OperationsTask } from "./fixtures";

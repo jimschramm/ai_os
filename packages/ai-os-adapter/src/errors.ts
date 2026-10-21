@@ -10,6 +10,7 @@ export class GrokT3Error extends Schema.TaggedError<GrokT3Error>()("GrokT3Error"
     "contract",
     "t3_unavailable",
     "t3_rejected",
+    "unauthenticated",
     "not_started",
   ]),
   detail: Schema.String,

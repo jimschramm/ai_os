@@ -7,7 +7,7 @@ import {
 } from "@t3tools/ai-os-contracts";
 import * as Effect from "effect/Effect";
 
-import { encodeAdapterBoard } from "@t3tools/ai-os-adapter";
+import { encodeAdapterBoard } from "@t3tools/ai-os-adapter/board";
 
 import { tasksForBoard } from "./adapterBoard";
 import {

@@ -1,10 +1,11 @@
 import {
   ADAPTER_BOARD_EVENTS_PATH,
-  ADAPTER_BOARD_ORIGIN,
   decodeAdapterBoard,
   type AdapterBoardCard,
-} from "@t3tools/ai-os-adapter";
+} from "@t3tools/ai-os-adapter/board";
 import { useSyncExternalStore } from "react";
+
+import { resolvePrimaryEnvironmentHttpUrl } from "../../environments/primary/target";
 
 const EMPTY: readonly AdapterBoardCard[] = [];
 
@@ -23,11 +24,28 @@ export const applyAdapterBoardPayload = (text: string): boolean => {
   return true;
 };
 
+const boardUrl = (): string | null => {
+  try {
+    return resolvePrimaryEnvironmentHttpUrl(ADAPTER_BOARD_EVENTS_PATH);
+  } catch {
+    return null;
+  }
+};
+
 const ensureFeed = () => {
   if (source !== null || import.meta.env.MODE === "test") return;
-  source = new EventSource(`${ADAPTER_BOARD_ORIGIN}${ADAPTER_BOARD_EVENTS_PATH}`);
-  source.addEventListener("message", (event) => {
+  const url = boardUrl();
+  if (url === null) return;
+  // Cookies authenticate the same-origin feed. A rejected stream stops instead
+  // of reconnecting, and the dashboard keeps its fixture tasks.
+  const events = new EventSource(url, { withCredentials: true });
+  source = events;
+  events.addEventListener("message", (event) => {
     applyAdapterBoardPayload(String(event.data));
+  });
+  events.addEventListener("error", () => {
+    events.close();
+    if (source === events) source = null;
   });
 };
 

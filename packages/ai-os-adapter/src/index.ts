@@ -1,5 +1,13 @@
 export { GrokT3Error } from "./errors.ts";
 export {
+  ADAPTER_BOARD_EVENTS_PATH,
+  ADAPTER_BOARD_PATH,
+  decodeAdapterBoard,
+  encodeAdapterBoard,
+  type AdapterBoardCard,
+} from "./board.ts";
+export { encodeAdapterBoardWire, makeAdapterBoardHub } from "./boardHub.ts";
+export {
   GROK_T3_CAPABILITIES,
   boardCard,
   clearAdapterBoard,
@@ -7,20 +15,10 @@ export {
   memorySessionStore,
   readAdapterBoard,
   renderPrompt,
-  subscribeAdapterFeed,
-  type AdapterBoardCard,
   type AttemptSession,
   type GrokT3Adapter,
   type SessionStore,
 } from "./grokT3.ts";
-export {
-  ADAPTER_BOARD_EVENTS_PATH,
-  ADAPTER_BOARD_ORIGIN,
-  ADAPTER_BOARD_PATH,
-  adapterBoardLayer,
-  decodeAdapterBoard,
-  encodeAdapterBoard,
-} from "./boardFeed.ts";
 export {
   T3_LAUNCH_DEFAULTS,
   T3_LOCAL_ORIGIN,
