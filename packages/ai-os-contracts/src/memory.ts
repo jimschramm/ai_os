@@ -279,11 +279,25 @@ const invalidGraph = (event: string, detail: string) =>
 
 /**
  * Status is an invariant of the accepted SUPERSEDES edges, not a second source
- * of eligibility. A superseded fact without a matching edge, an accepted edge
- * whose target is still accepted, a self-edge, a cross-project edge, or a cycle
- * is not a graph we can package.
+ * of eligibility. Ids are unique. An accepted edge starts at a fact that is
+ * still accepted and ends at the superseded fact. A self-edge, a cross-project
+ * edge, or a cycle is not a graph we can package.
  */
 const supersessionInvariant = (graph: MemoryGraphV1): string | null => {
+  const seenFacts = new Set<string>();
+  for (const fact of graph.facts) {
+    if (seenFacts.has(fact.factId)) {
+      return "Fact ids must be unique.";
+    }
+    seenFacts.add(fact.factId);
+  }
+  const seenRelationships = new Set<string>();
+  for (const relationship of graph.relationships) {
+    if (seenRelationships.has(relationship.relationshipId)) {
+      return "Relationship ids must be unique.";
+    }
+    seenRelationships.add(relationship.relationshipId);
+  }
   const facts = new Map(graph.facts.map((fact) => [fact.factId, fact]));
   const acceptedEdges: Array<AcceptedRelationshipV1> = [];
   for (const relationship of graph.relationships) {
@@ -304,24 +318,7 @@ const supersessionInvariant = (graph: MemoryGraphV1): string | null => {
     if (relationship.acceptance !== "accepted") {
       continue;
     }
-    if (older.acceptance !== "superseded" || older.supersededBy !== relationship.fromId) {
-      return "An accepted SUPERSEDES edge requires the older fact to be superseded by the newer fact.";
-    }
     acceptedEdges.push(relationship);
-  }
-  for (const fact of graph.facts) {
-    if (fact.acceptance !== "superseded") {
-      continue;
-    }
-    const matched = acceptedEdges.some(
-      (edge) =>
-        edge.toId === fact.factId &&
-        edge.fromId === fact.supersededBy &&
-        edge.projectId === fact.projectId,
-    );
-    if (!matched) {
-      return "A superseded fact requires an accepted SUPERSEDES edge.";
-    }
   }
   const next = new Map<string, Array<string>>();
   for (const edge of acceptedEdges) {
@@ -350,6 +347,36 @@ const supersessionInvariant = (graph: MemoryGraphV1): string | null => {
   for (const factId of next.keys()) {
     if (visit(factId)) {
       return "SUPERSEDES edges form a cycle.";
+    }
+  }
+  for (const edge of acceptedEdges) {
+    const newer = facts.get(edge.fromId);
+    const older = facts.get(edge.toId);
+    if (newer === undefined || older === undefined) {
+      return "A SUPERSEDES edge names a fact that is not in the graph.";
+    }
+    if (newer.acceptance !== "accepted") {
+      return "An accepted SUPERSEDES edge must start from an accepted fact.";
+    }
+    if (older.acceptance === "proposed") {
+      return "An accepted SUPERSEDES edge cannot target a proposed fact.";
+    }
+    if (older.acceptance !== "superseded" || older.supersededBy !== edge.fromId) {
+      return "An accepted SUPERSEDES edge requires the older fact to be superseded by the newer fact.";
+    }
+  }
+  for (const fact of graph.facts) {
+    if (fact.acceptance !== "superseded") {
+      continue;
+    }
+    const matched = acceptedEdges.some(
+      (edge) =>
+        edge.toId === fact.factId &&
+        edge.fromId === fact.supersededBy &&
+        edge.projectId === fact.projectId,
+    );
+    if (!matched) {
+      return "A superseded fact requires an accepted SUPERSEDES edge.";
     }
   }
   return null;

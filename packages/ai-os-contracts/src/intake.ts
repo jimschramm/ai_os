@@ -17,7 +17,7 @@ export const AuthorizationV1 = Schema.Struct({
 });
 export type AuthorizationV1 = typeof AuthorizationV1.Type;
 
-export const IntakeV1 = Schema.Struct({
+const intakeFields = {
   version: ContractVersion,
   workspaceId: ContractId,
   projectId: ContractId,
@@ -25,9 +25,19 @@ export const IntakeV1 = Schema.Struct({
   constraints: Schema.Array(ContractText),
   acceptanceCriteria: Schema.NonEmptyArray(ContractText),
   authorization: AuthorizationV1,
+};
+
+export const IntakeV1 = Schema.Struct(intakeFields);
+export type IntakeV1 = typeof IntakeV1.Type;
+
+export const IntakeV2 = Schema.Struct({
+  ...intakeFields,
   originatingConversationId: ConversationId,
 });
-export type IntakeV1 = typeof IntakeV1.Type;
+export type IntakeV2 = typeof IntakeV2.Type;
+
+export const Intake = Schema.Union([IntakeV2, IntakeV1]);
+export type Intake = typeof Intake.Type;
 
 export const IntakeAcknowledgmentV1 = Schema.Struct({
   version: ContractVersion,
@@ -45,6 +55,8 @@ export const IntakeAcknowledgmentV1 = Schema.Struct({
 export type IntakeAcknowledgmentV1 = typeof IntakeAcknowledgmentV1.Type;
 
 export const decodeIntakeV1 = Schema.decodeUnknownEffect(IntakeV1, strictParse);
+export const decodeIntakeV2 = Schema.decodeUnknownEffect(IntakeV2, strictParse);
+export const decodeIntake = Schema.decodeUnknownEffect(Intake, strictParse);
 export const decodeIntakeAcknowledgmentV1 = Schema.decodeUnknownEffect(
   IntakeAcknowledgmentV1,
   strictParse,

@@ -700,3 +700,63 @@ it.effect("treats a rework revision as stale when only the git SHA case differs"
     assert.strictEqual(repeated.reason, "revision_mismatch");
   }),
 );
+
+it.effect("rejects stored progress or completion that names a different run", () =>
+  Effect.gen(function* () {
+    const executing = yield* applySequence(happyPathEvents.slice(0, 4));
+    if (executing.phase !== "executing") {
+      return yield* Effect.die("The run must be executing.");
+    }
+    const forgedProgress = {
+      ...executing,
+      run: {
+        ...executing.run,
+        progress: {
+          version: "v1" as const,
+          taskId: "task-usba-page",
+          attemptId: "attempt-1",
+          generation: 2,
+          leaseId: leaseIdFor(2),
+          status: "working" as const,
+          blockers: [],
+          partialArtifacts: [],
+        },
+      },
+    };
+    const progressState = yield* Effect.exit(decodeSequenceState(forgedProgress));
+    const progressWrite = yield* failure(forgedProgress, { type: "start_execution" });
+    assert.strictEqual(Exit.isFailure(progressState), true);
+    assert.strictEqual(progressWrite.reason, "invalid_payload");
+    assert.strictEqual(progressWrite.from, "executing");
+
+    const awaiting = yield* applySequence(happyPathEvents.slice(0, 5));
+    if (awaiting.phase !== "awaiting_qa") {
+      return yield* Effect.die("The completion must be awaiting QA.");
+    }
+    const forgedCompletion = {
+      ...awaiting,
+      completion: {
+        ...awaiting.completion,
+        generation: awaiting.run.generation,
+        leaseId: "lease-9",
+      },
+    };
+    const completionState = yield* Effect.exit(decodeSequenceState(forgedCompletion));
+    const qaOverStale = yield* failure(forgedCompletion, { type: "qa", qa: qaWaitingExample });
+    assert.strictEqual(Exit.isFailure(completionState), true);
+    assert.strictEqual(qaOverStale.reason, "invalid_payload");
+    assert.strictEqual(qaOverStale.from, "awaiting_qa");
+    assert.strictEqual(qaOverStale.event, "qa");
+
+    const accepted = yield* applySequence(happyPathEvents);
+    if (accepted.phase !== "accepted") {
+      return yield* Effect.die("The happy path must be accepted.");
+    }
+    const forgedAccepted = {
+      ...accepted,
+      completion: { ...accepted.completion, generation: accepted.run.generation + 1 },
+    };
+    const acceptedState = yield* Effect.exit(decodeSequenceState(forgedAccepted));
+    assert.strictEqual(Exit.isFailure(acceptedState), true);
+  }),
+);

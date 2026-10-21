@@ -37,7 +37,7 @@ import {
   SequencePhase,
   type ContractErrorReason,
 } from "./errors.ts";
-import { IntakeAcknowledgmentV1, IntakeV1 } from "./intake.ts";
+import { Intake, IntakeAcknowledgmentV1 } from "./intake.ts";
 import {
   BlockerV1,
   HeartbeatLapseV1,
@@ -53,7 +53,7 @@ export const KanbanColumn = Schema.Literals(["Ready", "Running", "Blocked", "Rev
 export type KanbanColumn = typeof KanbanColumn.Type;
 
 export const SequenceEvent = Schema.Union([
-  Schema.Struct({ type: Schema.Literal("intake"), intake: IntakeV1 }),
+  Schema.Struct({ type: Schema.Literal("intake"), intake: Intake }),
   Schema.Struct({
     type: Schema.Literal("acknowledge"),
     acknowledgment: IntakeAcknowledgmentV1,
@@ -136,6 +136,14 @@ const independentQa = (
     : "The QA payload names a different implementer than the assignment.";
 };
 
+const workerRecordMatchesRun = (
+  run: { readonly generation: number; readonly leaseId: string },
+  record: { readonly generation: number; readonly leaseId: string },
+): true | string =>
+  record.generation === run.generation && record.leaseId === run.leaseId
+    ? true
+    : "Stored worker data must name the current generation and lease.";
+
 const reviewedRevision = (
   completion: CompletionSubmissionV1,
   qa: { readonly artifactRevision: ArtifactRevisionV1 },
@@ -157,13 +165,13 @@ export type IdleState = typeof IdleState.Type;
 
 export const RequestedState = Schema.Struct({
   phase: Schema.Literal("requested"),
-  intake: IntakeV1,
+  intake: Intake,
 });
 export type RequestedState = typeof RequestedState.Type;
 
 export const AcknowledgedState = Schema.Struct({
   phase: Schema.Literal("acknowledged"),
-  intake: IntakeV1,
+  intake: Intake,
   acknowledgment: IntakeAcknowledgmentV1,
 }).check(Schema.makeFilter((state) => linked(state.acknowledgment)));
 export type AcknowledgedState = typeof AcknowledgedState.Type;
@@ -181,9 +189,10 @@ export const RunV1 = Schema.Struct({
     if (run.retryCount > run.retryLimit) {
       return "The retry count is above the limit.";
     }
-    return run.leaseId === leaseIdFor(run.generation)
-      ? true
-      : "The lease is bound to the generation.";
+    if (run.leaseId !== leaseIdFor(run.generation)) {
+      return "The lease is bound to the generation.";
+    }
+    return run.progress === null ? true : workerRecordMatchesRun(run, run.progress);
   }),
 );
 export type RunV1 = typeof RunV1.Type;
@@ -200,7 +209,7 @@ const freshRun = (generation: number, previous?: RunV1): RunV1 => ({
 
 export const AssignedState = Schema.Struct({
   phase: Schema.Literal("assigned"),
-  intake: IntakeV1,
+  intake: Intake,
   acknowledgment: IntakeAcknowledgmentV1,
   assignment: AssignmentV1,
   reworkRevision: Schema.NullOr(ArtifactRevisionV1),
@@ -223,7 +232,7 @@ export type AssignedState = typeof AssignedState.Type;
 
 export const ExecutingState = Schema.Struct({
   phase: Schema.Literal("executing"),
-  intake: IntakeV1,
+  intake: Intake,
   acknowledgment: IntakeAcknowledgmentV1,
   assignment: AssignmentV1,
   reworkRevision: Schema.NullOr(ArtifactRevisionV1),
@@ -234,7 +243,7 @@ export type ExecutingState = typeof ExecutingState.Type;
 
 export const AwaitingQaState = Schema.Struct({
   phase: Schema.Literal("awaiting_qa"),
-  intake: IntakeV1,
+  intake: Intake,
   acknowledgment: IntakeAcknowledgmentV1,
   assignment: AssignmentV1,
   completion: CompletionSubmissionV1,
@@ -260,14 +269,14 @@ export const AwaitingQaState = Schema.Struct({
     ) {
       return "The submitted revision was already sent back for rework.";
     }
-    return true;
+    return workerRecordMatchesRun(state.run, state.completion);
   }),
 );
 export type AwaitingQaState = typeof AwaitingQaState.Type;
 
 export const ReworkState = Schema.Struct({
   phase: Schema.Literal("rework"),
-  intake: IntakeV1,
+  intake: Intake,
   acknowledgment: IntakeAcknowledgmentV1,
   assignment: AssignmentV1,
   completion: CompletionSubmissionV1,
@@ -292,14 +301,15 @@ export const ReworkState = Schema.Struct({
     if (!sameRevision(state.qa.artifactRevision, state.reworkRevision)) {
       return "Rework records the revision that was reviewed.";
     }
-    return reviewedRevision(state.completion, state.qa, null);
+    const current = workerRecordMatchesRun(state.run, state.completion);
+    return current === true ? reviewedRevision(state.completion, state.qa, null) : current;
   }),
 );
 export type ReworkState = typeof ReworkState.Type;
 
 export const AcceptedState = Schema.Struct({
   phase: Schema.Literal("accepted"),
-  intake: IntakeV1,
+  intake: Intake,
   acknowledgment: IntakeAcknowledgmentV1,
   assignment: AssignmentV1,
   completion: CompletionSubmissionV1,
@@ -324,14 +334,15 @@ export const AcceptedState = Schema.Struct({
     if (!sameRevision(state.qa.acceptedRevision, state.qa.artifactRevision)) {
       return "Acceptance is bound to the exact artifact revision.";
     }
-    return reviewedRevision(state.completion, state.qa, null);
+    const current = workerRecordMatchesRun(state.run, state.completion);
+    return current === true ? reviewedRevision(state.completion, state.qa, null) : current;
   }),
 );
 export type AcceptedState = typeof AcceptedState.Type;
 
 export const RecoveryPendingState = Schema.Struct({
   phase: Schema.Literal("recovery_pending"),
-  intake: IntakeV1,
+  intake: Intake,
   acknowledgment: IntakeAcknowledgmentV1,
   assignment: AssignmentV1,
   reworkRevision: Schema.NullOr(ArtifactRevisionV1),
@@ -343,7 +354,7 @@ export type RecoveryPendingState = typeof RecoveryPendingState.Type;
 
 export const FailedState = Schema.Struct({
   phase: Schema.Literal("failed"),
-  intake: IntakeV1,
+  intake: Intake,
   acknowledgment: IntakeAcknowledgmentV1,
   assignment: AssignmentV1,
   reworkRevision: Schema.NullOr(ArtifactRevisionV1),
@@ -355,7 +366,7 @@ export type FailedState = typeof FailedState.Type;
 
 export const CancelledState = Schema.Struct({
   phase: Schema.Literal("cancelled"),
-  intake: IntakeV1,
+  intake: Intake,
   acknowledgment: IntakeAcknowledgmentV1,
   assignment: AssignmentV1,
   reworkRevision: Schema.NullOr(ArtifactRevisionV1),
@@ -670,6 +681,14 @@ const applyQa = (
   Effect.gen(function* () {
     if (state.phase !== "awaiting_qa") {
       return yield* reject(state, event, "illegal_transition", `Cannot qa from ${state.phase}.`);
+    }
+    if (workerRecordMatchesRun(state.run, state.completion) !== true) {
+      return yield* reject(
+        state,
+        event,
+        "stale_generation",
+        "QA is bound to the completion from the current run.",
+      );
     }
     const qa = event.qa;
     if (state.acknowledgment.taskId !== qa.taskId) {
@@ -1202,16 +1221,23 @@ const applyDeliver = (
         "Delivery is bound to the exact accepted revision.",
       );
     }
-    if (
-      event.delivery.destination === "conversation" &&
-      event.delivery.conversationId !== state.intake.originatingConversationId
-    ) {
-      return yield* reject(
-        state,
-        event,
-        "delivery_origin_mismatch",
-        "Delivery to a conversation must name the originating conversation.",
-      );
+    if (event.delivery.destination === "conversation") {
+      if (!("originatingConversationId" in state.intake)) {
+        return yield* reject(
+          state,
+          event,
+          "delivery_origin_mismatch",
+          "A v1 intake has no originating conversation. Deliver to the dashboard.",
+        );
+      }
+      if (event.delivery.conversationId !== state.intake.originatingConversationId) {
+        return yield* reject(
+          state,
+          event,
+          "delivery_origin_mismatch",
+          "Delivery to a conversation must name the originating conversation.",
+        );
+      }
     }
     const fingerprint = deliveryFingerprint(event.delivery);
     const sameKey = state.deliveries.find(

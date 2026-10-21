@@ -4,7 +4,18 @@ import * as Exit from "effect/Exit";
 
 import { taskLinkFor } from "./common.ts";
 import { acknowledgmentExample, intakeExample } from "./examples.ts";
-import { decodeIntakeAcknowledgmentV1, decodeIntakeV1 } from "./intake.ts";
+import { decodeIntakeAcknowledgmentV1, decodeIntakeV1, decodeIntakeV2 } from "./intake.ts";
+
+const pr3Intake = {
+  version: "v1",
+  workspaceId: "personal",
+  projectId: "usba",
+  request:
+    "Update the USBA tournament page, verify it, and have Marketing prepare the announcement.",
+  constraints: ["Keep the public page available during the update."],
+  acceptanceCriteria: ["The tournament page shows the new schedule."],
+  authorization: { kind: "standing", scope: "usba-web" },
+};
 
 const validIntake = {
   version: "v1",
@@ -14,13 +25,26 @@ const validIntake = {
   constraints: [],
   acceptanceCriteria: ["The tournament page shows the new schedule."],
   authorization: { kind: "standing", scope: "usba-web" },
-  originatingConversationId: "Grok-Thread-1",
 };
 
 it.effect("decodes a v1 intake and the durable acknowledgment example", () =>
   Effect.gen(function* () {
     const intake = yield* decodeIntakeV1(validIntake);
-    assert.strictEqual(intake.originatingConversationId, "Grok-Thread-1");
+    const pr3 = yield* decodeIntakeV1(pr3Intake);
+    assert.strictEqual("originatingConversationId" in intake, false);
+    assert.strictEqual(pr3.request, intakeExample.request);
+    assert.strictEqual("originatingConversationId" in pr3, false);
+    const v2 = yield* decodeIntakeV2({
+      ...pr3Intake,
+      originatingConversationId: " Grok-Thread-1 ",
+    });
+    assert.strictEqual(v2.originatingConversationId, "Grok-Thread-1");
+    const v1WithConversation = yield* Effect.exit(
+      decodeIntakeV1({ ...pr3Intake, originatingConversationId: "Grok-Thread-1" }),
+    );
+    const v2WithoutConversation = yield* Effect.exit(decodeIntakeV2(pr3Intake));
+    assert.strictEqual(Exit.isFailure(v1WithConversation), true);
+    assert.strictEqual(Exit.isFailure(v2WithoutConversation), true);
     assert.strictEqual(intake.projectId, "usba");
     assert.strictEqual(intake.authorization.kind, "standing");
     assert.strictEqual(

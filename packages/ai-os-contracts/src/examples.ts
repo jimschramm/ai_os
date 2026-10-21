@@ -4,11 +4,12 @@ import { AssignmentV1 } from "./assignment.ts";
 import { leaseIdFor } from "./canonical.ts";
 import { strictParse } from "./common.ts";
 import { CompletionSubmissionV1 } from "./completion.ts";
-import { IntakeAcknowledgmentV1, IntakeV1 } from "./intake.ts";
+import { IntakeAcknowledgmentV1, IntakeV1, IntakeV2 } from "./intake.ts";
 import { QaVerdictV1 } from "./qa.ts";
 import type { SequenceEvent } from "./sequence.ts";
 
 const decodeIntake = Schema.decodeUnknownSync(IntakeV1, strictParse);
+const decodeIntakeV2 = Schema.decodeUnknownSync(IntakeV2, strictParse);
 const decodeAcknowledgment = Schema.decodeUnknownSync(IntakeAcknowledgmentV1, strictParse);
 const decodeAssignment = Schema.decodeUnknownSync(AssignmentV1, strictParse);
 const decodeCompletion = Schema.decodeUnknownSync(CompletionSubmissionV1, strictParse);
@@ -19,6 +20,17 @@ export const revisionOne = { type: "git" as const, sha: "a".repeat(40) };
 export const revisionTwo = { type: "git" as const, sha: "b".repeat(40) };
 
 export const intakeExample = decodeIntake({
+  version: "v1",
+  workspaceId: "personal",
+  projectId: "usba",
+  request:
+    "Update the USBA tournament page, verify it, and have Marketing prepare the announcement.",
+  constraints: ["Keep the public page available during the update."],
+  acceptanceCriteria: ["The tournament page shows the new schedule."],
+  authorization: { kind: "standing", scope: "usba-web" },
+});
+
+export const intakeV2Example = decodeIntakeV2({
   version: "v1",
   workspaceId: "personal",
   projectId: "usba",

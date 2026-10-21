@@ -2,7 +2,13 @@ import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 
 import { leaseIdFor } from "./canonical.ts";
-import { completionExample, happyPathEvents, revisionOne, revisionTwo } from "./examples.ts";
+import {
+  completionExample,
+  happyPathEvents,
+  intakeV2Example,
+  revisionOne,
+  revisionTwo,
+} from "./examples.ts";
 import { applySequence, applySequenceEvent, kanbanColumn, type SequenceState } from "./sequence.ts";
 import { usageTotals } from "./usage.ts";
 
@@ -466,24 +472,46 @@ it.effect(
       assert.strictEqual(otherKey.deliveries.length, 1);
       assert.strictEqual(otherKey.deliveries[0]?.idempotencyKey, "deliver-dashboard");
 
-      const reusedKey = yield* failure(otherKey, {
+      const v1Conversation = yield* failure(otherKey, {
+        type: "deliver",
+        delivery: conversation("deliver-conversation"),
+      });
+      assert.strictEqual(v1Conversation.reason, "delivery_origin_mismatch");
+      assert.strictEqual(v1Conversation.detail.includes("dashboard"), true);
+      assert.strictEqual("originatingConversationId" in otherKey.intake, false);
+
+      const acceptedV2 = yield* requirePhase(
+        yield* applySequence([
+          { type: "intake", intake: intakeV2Example },
+          ...happyPathEvents.slice(1),
+        ]),
+        "accepted",
+      );
+      const dashboardV2 = yield* requirePhase(
+        yield* applySequenceEvent(acceptedV2, {
+          type: "deliver",
+          delivery: dashboard(revisionTwo),
+        }),
+        "accepted",
+      );
+      const reusedKey = yield* failure(dashboardV2, {
         type: "deliver",
         delivery: conversation("deliver-dashboard"),
       });
       assert.strictEqual(reusedKey.reason, "idempotency_conflict");
 
-      const otherOrigin = yield* failure(otherKey, {
+      const otherOrigin = yield* failure(dashboardV2, {
         type: "deliver",
         delivery: { ...conversation("deliver-other"), conversationId: "other-thread" },
       });
       assert.strictEqual(otherOrigin.reason, "delivery_origin_mismatch");
-      const otherCase = yield* failure(otherKey, {
+      const otherCase = yield* failure(dashboardV2, {
         type: "deliver",
         delivery: { ...conversation("deliver-case"), conversationId: "grok-thread-1" },
       });
       assert.strictEqual(otherCase.reason, "delivery_origin_mismatch");
       const both = yield* requirePhase(
-        yield* applySequenceEvent(otherKey, {
+        yield* applySequenceEvent(dashboardV2, {
           type: "deliver",
           delivery: { ...conversation("deliver-conversation"), conversationId: " Grok-Thread-1 " },
         }),
@@ -491,6 +519,9 @@ it.effect(
       );
       assert.strictEqual(both.deliveries.length, 2);
       assert.strictEqual(both.deliveries[1]?.conversationId, "Grok-Thread-1");
+      if (!("originatingConversationId" in both.intake)) {
+        return yield* Effect.die("Intake v2 records the originating conversation.");
+      }
       assert.strictEqual(both.intake.originatingConversationId, "Grok-Thread-1");
       assert.strictEqual(both.phase, "accepted");
     }),

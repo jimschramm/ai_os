@@ -403,6 +403,77 @@ it.effect("rejects a supersession graph whose status and edges disagree", () =>
       "decision-new",
     ]);
 
+    const proposedSource = yield* Effect.flip(
+      buildRetrieval(
+        {
+          facts: [
+            {
+              acceptance: "proposed" as const,
+              factId: "decision-new",
+              projectId: "usba",
+              kind: "Decision" as const,
+              body: "Fact decision-new.",
+              provenance: { actorId: "jim", at },
+              validity: { from: at, until: null },
+            },
+            superseded("decision-old", "decision-new"),
+          ],
+          relationships: [supersedes("decision-new", "decision-old")],
+        },
+        request,
+        [],
+      ),
+    );
+    assert.strictEqual(proposedSource.reason, "invalid_graph");
+    assert.strictEqual(proposedSource.detail.includes("accepted fact"), true);
+
+    const supersededSource = yield* Effect.flip(
+      buildRetrieval(
+        {
+          facts: [
+            accepted("decision-new"),
+            superseded("decision-mid", "decision-new"),
+            superseded("decision-old", "decision-mid"),
+          ],
+          relationships: [
+            supersedes("decision-new", "decision-mid"),
+            supersedes("decision-mid", "decision-old"),
+          ],
+        },
+        request,
+        [],
+      ),
+    );
+    assert.strictEqual(supersededSource.reason, "invalid_graph");
+    assert.strictEqual(supersededSource.detail.includes("accepted fact"), true);
+
+    const duplicateFacts = yield* Effect.flip(
+      buildRetrieval(
+        {
+          facts: [accepted("decision-old"), accepted("decision-old")],
+          relationships: [],
+        },
+        request,
+        [],
+      ),
+    );
+    assert.strictEqual(duplicateFacts.reason, "invalid_graph");
+    assert.strictEqual(duplicateFacts.detail.includes("Fact ids"), true);
+
+    const edge = supersedes("decision-new", "decision-old");
+    const duplicateRelationships = yield* Effect.flip(
+      buildRetrieval(
+        {
+          facts: [accepted("decision-new"), superseded("decision-old", "decision-new")],
+          relationships: [edge, { ...edge }],
+        },
+        request,
+        [],
+      ),
+    );
+    assert.strictEqual(duplicateRelationships.reason, "invalid_graph");
+    assert.strictEqual(duplicateRelationships.detail.includes("Relationship ids"), true);
+
     let graph = yield* applyMemoryEvent(initialMemoryGraph, {
       type: "propose_fact",
       fact: fact("decision-home"),
