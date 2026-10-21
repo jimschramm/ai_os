@@ -26,6 +26,7 @@ import * as UrlParams from "effect/http/UrlParams";
 import { ADAPTER_BOARD_PATH, decodeAdapterBoard } from "./board.ts";
 import { makeAdapterBoardHub } from "./boardHub.ts";
 import {
+  LIVE_DRIVER_COMMAND,
   LIVE_DRIVER_DEFAULT_ORIGIN,
   LIVE_DRIVER_HELP,
   LiveDriverUsageError,
@@ -218,6 +219,8 @@ it.effect("reads the pairing token from the environment and rejects the flag", (
     assert.strictEqual(rejected, true);
     assert.equal(rejectedDetail.includes(secret), false);
     assert.equal(LIVE_DRIVER_HELP.includes("--pairing-token"), false);
+    assert.equal(LIVE_DRIVER_HELP.includes("vp run"), false);
+    assert.equal(LIVE_DRIVER_HELP.includes(LIVE_DRIVER_COMMAND), true);
 
     let inline = false;
     let inlineDetail = "";

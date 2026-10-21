@@ -12,14 +12,22 @@ export const LIVE_DRIVER_DEFAULT_ORIGIN = "http://127.0.0.1:13773";
 /** Pairing token. Read from the environment so it is not echoed as a process argument. */
 export const LIVE_DRIVER_PAIRING_ENV = "T3_PAIRING_TOKEN";
 
+/**
+ * Direct Node entry. Package-manager runners print the child command before
+ * this process starts, so the token must not be passed through one.
+ */
+export const LIVE_DRIVER_COMMAND =
+  "node --experimental-strip-types packages/ai-os-adapter/scripts/live-driver.ts";
+
 const DEFAULT_MODEL = "gpt-5.4";
 
 export const LIVE_DRIVER_HELP = `Record one intake on a local T3 server and publish it to /operations.
 
 Set ${LIVE_DRIVER_PAIRING_ENV} to the pairing token from the server startup URL.
+Run this from the repository root. Do not wrap it in a package-manager runner.
 
-vp run --filter @t3tools/ai-os-adapter live-driver -- --list-projects
-vp run --filter @t3tools/ai-os-adapter live-driver -- \\
+${LIVE_DRIVER_COMMAND} --list-projects
+${LIVE_DRIVER_COMMAND} \\
   --origin ${LIVE_DRIVER_DEFAULT_ORIGIN} \\
   --project-id <id> \\
   --model ${DEFAULT_MODEL} \\
