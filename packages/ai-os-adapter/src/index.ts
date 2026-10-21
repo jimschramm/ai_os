@@ -28,6 +28,7 @@ export {
   type T3LaunchRequest,
   type T3LaunchResult,
   type T3LocalClient,
+  type T3ProjectSummary,
   type T3ThreadView,
 } from "./t3Client.ts";
 export {

@@ -19,7 +19,8 @@
   },
   "scripts": {
     "typecheck": "tsc-rs --noEmit",
-    "test": "vp test run --config ../../vite.config.ts --dir ."
+    "test": "vp test run --config ../../vite.config.ts --dir .",
+    "live-driver": "node --experimental-strip-types scripts/live-driver.ts"
   },
   "dependencies": {
     "@effect/platform-node": "catalog:",
