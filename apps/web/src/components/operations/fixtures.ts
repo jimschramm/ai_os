@@ -44,7 +44,7 @@ export interface OperationsProject {
 
 export interface OperationsTask {
   readonly id: string;
-  readonly projectId: OperationsProjectId;
+  readonly projectId: string;
   readonly phase: SequencePhase;
   readonly title: string;
   readonly agent: string;

@@ -1,6 +1,7 @@
 import * as NodeChildProcess from "node:child_process";
 
 import { runLiveDriverCli } from "../src/liveDriver.ts";
+import { openDriverSession } from "./driverSession.ts";
 
 const readRepoCommit = (workspaceRoot: string): Promise<string> =>
   new Promise((resolve, reject) => {
@@ -23,5 +24,10 @@ const readRepoCommit = (workspaceRoot: string): Promise<string> =>
     );
   });
 
-const code = await runLiveDriverCli(process.argv.slice(2), process.env, readRepoCommit);
+const code = await runLiveDriverCli(
+  process.argv.slice(2),
+  process.env,
+  readRepoCommit,
+  openDriverSession(process.env),
+);
 process.exit(code);

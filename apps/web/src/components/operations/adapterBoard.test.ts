@@ -89,6 +89,62 @@ it.effect("reads adapter cards and keeps fixture tasks as the fallback", () =>
   }),
 );
 
+it.effect("keeps a live card whose project is not one of the fixtures", () =>
+  Effect.gen(function* () {
+    const live = yield* applySequence([
+      {
+        type: "intake",
+        intake: { ...intakeV2Example, projectId: "local-repo", workspaceId: "local-repo" },
+      },
+      {
+        type: "acknowledge",
+        acknowledgment: {
+          version: "v1",
+          taskId: "task-local",
+          taskLink: taskLinkFor("task-local"),
+          durable: true,
+          receivedAt: at,
+        },
+      },
+      {
+        type: "assign",
+        assignment: {
+          ...structuredClone(assignmentExample),
+          taskId: "task-local",
+          attemptId: "task-local-attempt-1",
+          assignmentId: "task-local-assignment-1",
+        },
+      },
+    ]);
+    const card = {
+      taskId: "task-local",
+      title: "Local repo task",
+      state: live,
+      threadId: "t3-thread-local",
+      updatedAt: at,
+    };
+    const all = tasksForBoard(undefined, [card]);
+    assert.equal(
+      all.some((task) => task.id === "task-local" && task.projectId === "local-repo"),
+      true,
+    );
+    assert.equal(
+      all.some((task) => task.projectId === "personal"),
+      true,
+    );
+    assert.equal(
+      all.some((task) => task.projectId === "usba"),
+      true,
+    );
+    const only = tasksForBoard("local-repo", [card]);
+    assert.deepStrictEqual(
+      only.map((task) => task.id),
+      ["task-local"],
+    );
+    assert.deepStrictEqual(tasksForBoard("usba", [card]), tasksForProject("usba"));
+  }),
+);
+
 it.effect("re-renders from a feed payload and falls back when the payload is empty", () =>
   Effect.gen(function* () {
     const live = yield* assigned("task-usba-page");

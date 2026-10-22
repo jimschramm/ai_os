@@ -35,15 +35,35 @@ export function projects(): readonly OperationsProject[] {
   return OPERATIONS_PROJECTS;
 }
 
+export function findProject(id: string): OperationsProject | undefined {
+  return OPERATIONS_PROJECTS.find((item) => item.id === id);
+}
+
 export function projectById(id: OperationsProjectId): OperationsProject {
-  const project = OPERATIONS_PROJECTS.find((item) => item.id === id);
+  const project = findProject(id);
   if (!project) {
     throw new Error(`Unknown project ${id}`);
   }
   return project;
 }
 
-export function tasksForProject(id: OperationsProjectId): readonly OperationsTask[] {
+/** Fixture label when the id is one of the sample workspaces; otherwise the id itself. */
+export function projectLabel(id: string): string {
+  return findProject(id)?.label ?? id;
+}
+
+/** One chip per project that actually has a task, in first-seen order. */
+export function projectChoices(
+  tasks: readonly OperationsTask[],
+): readonly { readonly id: string; readonly label: string }[] {
+  const ids: string[] = [];
+  for (const task of tasks) {
+    if (!ids.includes(task.projectId)) ids.push(task.projectId);
+  }
+  return ids.map((id) => ({ id, label: projectLabel(id) }));
+}
+
+export function tasksForProject(id: string): readonly OperationsTask[] {
   return OPERATIONS_TASKS.filter((task) => task.projectId === id);
 }
 

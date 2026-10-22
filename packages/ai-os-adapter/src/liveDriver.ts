@@ -4,7 +4,14 @@ import * as Schema from "effect/Schema";
 
 import { GrokT3Error } from "./errors.ts";
 import { clearAdapterBoard, createGrokT3Adapter, type AttemptSession } from "./grokT3.ts";
-import { wsT3LocalClient, type T3LocalClient } from "./t3Client.ts";
+import {
+  T3_LAUNCH_DEFAULTS,
+  wsT3LocalClient,
+  type T3LocalClient,
+  type T3ModelCatalog,
+  type T3ModelSelection,
+  type T3SessionStore,
+} from "./t3Client.ts";
 
 /** Dev-server port. Override with `--origin` when the server picked another one. */
 export const LIVE_DRIVER_DEFAULT_ORIGIN = "http://127.0.0.1:13773";
@@ -19,22 +26,24 @@ export const LIVE_DRIVER_PAIRING_ENV = "T3_PAIRING_TOKEN";
 export const LIVE_DRIVER_COMMAND =
   "node --experimental-strip-types packages/ai-os-adapter/scripts/live-driver.ts";
 
-const DEFAULT_MODEL = "gpt-5.4";
-
 export const LIVE_DRIVER_HELP = `Record one intake on a local T3 server and publish it to /operations.
 
-Set ${LIVE_DRIVER_PAIRING_ENV} to the pairing token from the server startup URL.
+Set ${LIVE_DRIVER_PAIRING_ENV} to the pairing token from the server startup URL
+for the first run. The driver saves that session under the T3 home and later
+runs reuse it. A pairing token is not accepted as an argument.
 Run this from the repository root. Do not wrap it in a package-manager runner.
 
 ${LIVE_DRIVER_COMMAND} --list-projects
 ${LIVE_DRIVER_COMMAND} \\
   --origin ${LIVE_DRIVER_DEFAULT_ORIGIN} \\
   --project-id <id> \\
-  --model ${DEFAULT_MODEL} \\
   --title "Tournament page" \\
   --prompt "Update the tournament page schedule."
 
-Omit --project-id to print the ids from GET /api/projects.`;
+Omit --project-id to print the ids from GET /api/projects.
+Pass --list-projects together with --project-id, --title, and --prompt to list
+and launch in one run. Omit --model to use the project's configured model, then
+the server default. If that model is not offered, the error lists the valid models.`;
 
 export class LiveDriverUsageError extends Schema.TaggedError<LiveDriverUsageError>()(
   "LiveDriverUsageError",
@@ -47,9 +56,9 @@ export class LiveDriverUsageError extends Schema.TaggedError<LiveDriverUsageErro
 
 export interface LiveDriverRequest {
   readonly origin: string;
-  readonly pairingToken: string;
+  readonly pairingToken: string | undefined;
   readonly projectId: string | undefined;
-  readonly model: string;
+  readonly model: string | undefined;
   readonly title: string | undefined;
   readonly prompt: string | undefined;
   readonly listProjects: boolean;
@@ -80,9 +89,11 @@ export const parseLiveDriverArgs = (
   env: Readonly<Record<string, string | undefined>>,
 ): LiveDriverRequest => {
   let origin = LIVE_DRIVER_DEFAULT_ORIGIN;
-  let pairingToken = env[LIVE_DRIVER_PAIRING_ENV];
+  const rawToken = env[LIVE_DRIVER_PAIRING_ENV];
+  let pairingToken =
+    rawToken === undefined || rawToken.trim().length === 0 ? undefined : rawToken.trim();
   let projectId: string | undefined;
-  let model = DEFAULT_MODEL;
+  let model: string | undefined;
   let title: string | undefined;
   let prompt: string | undefined;
   let listProjects = false;
@@ -129,21 +140,93 @@ export const parseLiveDriverArgs = (
     }
   }
 
-  if (pairingToken === undefined || pairingToken.trim().length === 0) {
-    throw new LiveDriverUsageError({
-      detail: `Set ${LIVE_DRIVER_PAIRING_ENV}.\n\n${LIVE_DRIVER_HELP}`,
-    });
-  }
-
   return {
     origin: origin.replace(/\/+$/, ""),
-    pairingToken: pairingToken.trim(),
+    pairingToken,
     projectId,
     model,
     title,
     prompt,
     listProjects,
   };
+};
+
+const modelList = (catalog: T3ModelCatalog): string => {
+  const parts = catalog.providers.flatMap((provider) =>
+    provider.models.length === 0
+      ? []
+      : [`${provider.instanceId}: ${provider.models.map((model) => model.slug).join(", ")}`],
+  );
+  return parts.length === 0 ? "(none)" : parts.join("; ");
+};
+
+const canonicalModel = (
+  catalog: T3ModelCatalog,
+  instanceId: string,
+  model: string,
+): string | undefined => {
+  const provider = catalog.providers.find((entry) => entry.instanceId === instanceId);
+  const offer = provider?.models.find(
+    (entry) => entry.slug === model || entry.aliases.includes(model),
+  );
+  return offer?.slug;
+};
+
+/**
+ * Use an explicit `--model` when it is offered. Otherwise the project default,
+ * then the server default, then a model the provider marks as default.
+ */
+export const resolveDriverModel = (input: {
+  readonly requested: string | undefined;
+  readonly projectDefault: T3ModelSelection | null;
+  readonly catalog: T3ModelCatalog;
+}): { readonly instanceId: string; readonly model: string } | { readonly error: string } => {
+  const requested = input.requested?.trim() ?? "";
+  const listed = modelList(input.catalog);
+  const offered = input.catalog.providers.some((provider) => provider.models.length > 0);
+  if (!offered) {
+    return { error: "The server reported no models for this provider." };
+  }
+  if (requested.length > 0) {
+    const onLaunch = canonicalModel(input.catalog, T3_LAUNCH_DEFAULTS.instanceId, requested);
+    if (onLaunch !== undefined) {
+      return { instanceId: T3_LAUNCH_DEFAULTS.instanceId, model: onLaunch };
+    }
+    for (const provider of input.catalog.providers) {
+      const slug = canonicalModel(input.catalog, provider.instanceId, requested);
+      if (slug !== undefined) return { instanceId: provider.instanceId, model: slug };
+    }
+    return { error: `Model ${requested} is not available. Valid models: ${listed}.` };
+  }
+  const fromSelection = (selection: T3ModelSelection | null) => {
+    if (selection === null) return undefined;
+    const slug = canonicalModel(input.catalog, selection.instanceId, selection.model);
+    if (slug === undefined) return undefined;
+    return { instanceId: selection.instanceId, model: slug };
+  };
+  const fromProject = fromSelection(input.projectDefault);
+  if (fromProject !== undefined) return fromProject;
+  const fromServer = fromSelection(input.catalog.serverDefault);
+  if (fromServer !== undefined) return fromServer;
+  const providers = [
+    ...input.catalog.providers.filter(
+      (provider) => provider.instanceId === T3_LAUNCH_DEFAULTS.instanceId,
+    ),
+    ...input.catalog.providers.filter(
+      (provider) => provider.instanceId !== T3_LAUNCH_DEFAULTS.instanceId,
+    ),
+  ];
+  for (const provider of providers) {
+    const marked = provider.models.find((model) => model.isDefault);
+    if (marked !== undefined) return { instanceId: provider.instanceId, model: marked.slug };
+  }
+  const configured = input.projectDefault ?? input.catalog.serverDefault;
+  if (configured !== null) {
+    return {
+      error: `Configured model ${configured.model} is not available. Valid models: ${listed}.`,
+    };
+  }
+  return { error: `Pass --model. Valid models: ${listed}.` };
 };
 
 /** Stable task id for one title at one instant. Contract ids cannot contain spaces. */
@@ -177,17 +260,20 @@ export const runLiveDriver = (
 ): Effect.Effect<void, GrokT3Error | LiveDriverUsageError> =>
   Effect.gen(function* () {
     const projects = yield* deps.client.listProjectIds();
+    const title = request.title?.trim() ?? "";
+    const prompt = request.prompt?.trim() ?? "";
+    const launching = request.projectId !== undefined && title.length > 0 && prompt.length > 0;
     if (request.listProjects || request.projectId === undefined) {
       if (projects.length === 0) deps.write("No projects.");
       for (const project of projects) deps.write(`${project.id}\t${project.title}`);
-      if (request.listProjects) return;
-      return yield* new LiveDriverUsageError({
-        detail: "Pass --project-id. The ids above are the projects on this server.",
-      });
+      if (!launching) {
+        if (request.listProjects) return;
+        return yield* new LiveDriverUsageError({
+          detail: "Pass --project-id. The ids above are the projects on this server.",
+        });
+      }
     }
 
-    const title = request.title?.trim() ?? "";
-    const prompt = request.prompt?.trim() ?? "";
     if (title.length === 0 || prompt.length === 0) {
       return yield* new LiveDriverUsageError({ detail: "Pass --title and --prompt." });
     }
@@ -213,13 +299,23 @@ export const runLiveDriver = (
               : `Could not read git HEAD in ${project.workspaceRoot}.`,
         }),
     });
+    const catalog = yield* deps.client.listProviderModels();
+    const resolved = resolveDriverModel({
+      requested: request.model,
+      projectDefault: project.defaultModel,
+      catalog,
+    });
+    if ("error" in resolved) {
+      return yield* new LiveDriverUsageError({ detail: resolved.error });
+    }
     const stamp = deps.clock();
     const taskId = liveTaskId(title, stamp);
     clearAdapterBoard();
     const adapter = createGrokT3Adapter({
       client: deps.client,
       clock: deps.clock,
-      model: request.model,
+      model: resolved.model,
+      instanceId: resolved.instanceId,
     });
     const recorded = yield* adapter.record({
       taskId,
@@ -280,6 +376,7 @@ export const runLiveDriverCli = (
   argv: readonly string[],
   env: Readonly<Record<string, string | undefined>>,
   readRepoCommit: (workspaceRoot: string) => Promise<string>,
+  session?: T3SessionStore,
 ): Promise<number> => {
   let request: LiveDriverRequest;
   try {
@@ -294,9 +391,18 @@ export const runLiveDriverCli = (
     throw error;
   }
 
+  if (request.pairingToken === undefined && session === undefined) {
+    process.stderr.write(`Set ${LIVE_DRIVER_PAIRING_ENV}.\n\n${LIVE_DRIVER_HELP}\n`);
+    return Promise.resolve(1);
+  }
+
   return Effect.runPromise(
     runLiveDriver(request, {
-      client: wsT3LocalClient({ origin: request.origin, pairingToken: request.pairingToken }),
+      client: wsT3LocalClient({
+        origin: request.origin,
+        ...(request.pairingToken === undefined ? {} : { pairingToken: request.pairingToken }),
+        ...(session === undefined ? {} : { session }),
+      }),
       clock: () => DateTime.formatIso(DateTime.nowUnsafe()),
       write: (line) => {
         process.stdout.write(`${line}\n`);

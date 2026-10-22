@@ -9,6 +9,7 @@ import {
   AuthTokenExchangeGrantType,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
@@ -31,10 +32,18 @@ import {
   LIVE_DRIVER_HELP,
   LiveDriverUsageError,
   parseLiveDriverArgs,
+  resolveDriverModel,
   runLiveDriver,
   runLiveDriverCli,
 } from "./liveDriver.ts";
-import { wsT3LocalClient, type T3LaunchRequest, type T3LocalClient } from "./t3Client.ts";
+import {
+  readProviderCatalog,
+  wsT3LocalClient,
+  type T3LaunchRequest,
+  type T3LocalClient,
+  type T3ModelCatalog,
+  type T3SessionStore,
+} from "./t3Client.ts";
 
 const isLiveDriverUsageError = Schema.is(LiveDriverUsageError);
 
@@ -54,6 +63,7 @@ const makeServer = () => {
   const hub = makeAdapterBoardHub();
   const bearers = new Map<string, readonly string[]>();
   let issued = 0;
+  let exchanges = 0;
   const scopesFor = (request: HttpServerRequest.HttpServerRequest) => {
     const header = request.headers.authorization;
     if (typeof header !== "string" || !header.startsWith("Bearer ")) return undefined;
@@ -73,6 +83,7 @@ const makeServer = () => {
       return HttpServerResponse.text("Unauthorized", { status: 401 });
     }
     issued += 1;
+    exchanges += 1;
     const accessToken = `access-${issued}`;
     bearers.set(accessToken, [AuthOrchestrationReadScope, AuthOrchestrationOperateScope]);
     return HttpServerResponse.text(
@@ -101,6 +112,11 @@ const makeServer = () => {
             workspaceRoot: "/work/usba",
             deletedAt: null,
             scripts: [],
+            defaultModelSelection: {
+              instanceId: "codex",
+              model: "gpt-5.6-sol",
+              options: { reasoning: "low" },
+            },
           },
           {
             id: "retired",
@@ -141,10 +157,12 @@ const makeServer = () => {
     ),
     { disableListenLog: true, disableLogger: true },
   ).pipe(Layer.provideMerge(NodeHttpServer.layerTest));
-  return { layer };
+  return { layer, exchanges: () => exchanges };
 };
 
-const withServer = <A, E, R>(use: (origin: string) => Effect.Effect<A, E, R>) => {
+const withServer = <A, E, R>(
+  use: (origin: string, exchanges: () => number) => Effect.Effect<A, E, R>,
+) => {
   const server = makeServer();
   return Effect.gen(function* () {
     const formatted = yield* HttpServer.addressFormattedWith((address) => Effect.succeed(address));
@@ -152,8 +170,38 @@ const withServer = <A, E, R>(use: (origin: string) => Effect.Effect<A, E, R>) =>
     if (url.hostname === "[::]" || url.hostname === "::" || url.hostname === "0.0.0.0") {
       url.hostname = "127.0.0.1";
     }
-    return yield* use(url.origin);
+    return yield* use(url.origin, server.exchanges);
   }).pipe(Effect.provide(server.layer));
+};
+
+const CATALOG: T3ModelCatalog = {
+  providers: [
+    {
+      instanceId: "codex",
+      models: [
+        { slug: "gpt-5.6-sol", aliases: [], isDefault: false },
+        { slug: "gpt-6-sol", aliases: ["sol"], isDefault: true },
+      ],
+    },
+  ],
+  serverDefault: null,
+};
+
+const memorySession = (
+  initial?: string,
+): T3SessionStore & { readonly current: () => string | undefined } => {
+  let value = initial;
+  return {
+    current: () => value,
+    load: Effect.sync(() => value),
+    save: (bearer) =>
+      Effect.sync(() => {
+        value = bearer;
+      }),
+    clear: Effect.sync(() => {
+      value = undefined;
+    }),
+  };
 };
 
 const readBoard = (origin: string) =>
@@ -191,19 +239,12 @@ it.effect("reads the pairing token from the environment and rejects the flag", (
     );
     assert.strictEqual(parsed.origin, LIVE_DRIVER_DEFAULT_ORIGIN);
     assert.strictEqual(parsed.pairingToken, "env-token");
-    assert.strictEqual(parsed.model, "gpt-5.4");
+    assert.strictEqual(parsed.model, undefined);
     assert.strictEqual(parsed.projectId, undefined);
 
-    let missing = false;
-    let missingDetail = "";
-    try {
-      parseLiveDriverArgs(["--project-id", "usba"], {});
-    } catch (error) {
-      missing = isLiveDriverUsageError(error);
-      if (isLiveDriverUsageError(error)) missingDetail = error.detail;
-    }
-    assert.strictEqual(missing, true);
-    assert.equal(missingDetail.startsWith("Set T3_PAIRING_TOKEN."), true);
+    const missing = parseLiveDriverArgs(["--project-id", "usba"], {});
+    assert.strictEqual(missing.pairingToken, undefined);
+    assert.equal(LIVE_DRIVER_HELP.includes("gpt-5.4"), false);
 
     const secret = "pair-secret-value";
     let rejected = false;
@@ -258,7 +299,7 @@ it.effect("lists project ids and publishes the launched task to the server board
           origin,
           pairingToken: PAIR,
           projectId: undefined,
-          model: "gpt-5.4",
+          model: undefined,
           title: undefined,
           prompt: undefined,
           listProjects: true,
@@ -279,6 +320,7 @@ it.effect("lists project ids and publishes the launched task to the server board
       const real = wsT3LocalClient({ origin, pairingToken: PAIR });
       const client: T3LocalClient = {
         listProjectIds: real.listProjectIds,
+        listProviderModels: () => Effect.succeed(CATALOG),
         publishBoard: real.publishBoard,
         interrupt: () => Effect.die("interrupt is unused"),
         continueRun: () => Effect.die("continue is unused"),
@@ -303,7 +345,7 @@ it.effect("lists project ids and publishes the launched task to the server board
           origin,
           pairingToken: PAIR,
           projectId: "usba",
-          model: "gpt-5.4",
+          model: undefined,
           title: "Tournament page",
           prompt: "Update the tournament page schedule.",
           listProjects: false,
@@ -325,7 +367,8 @@ it.effect("lists project ids and publishes the launched task to the server board
       );
 
       assert.strictEqual(launched?.projectId, "usba");
-      assert.strictEqual(launched?.model, "gpt-5.4");
+      assert.strictEqual(launched?.model, "gpt-5.6-sol");
+      assert.strictEqual(launched?.instanceId, "codex");
       assert.strictEqual(launched?.title, "Tournament page");
       assert.equal(launched?.prompt.includes("Update the tournament page schedule."), true);
       assert.deepStrictEqual(progress, [
@@ -346,4 +389,255 @@ it.effect("lists project ids and publishes the launched task to the server board
       assert.strictEqual(state.phase, "awaiting_qa");
     }),
   ),
+);
+
+it.effect("reuses a saved session without exchanging the pairing token again", () =>
+  withServer((origin, exchanges) =>
+    Effect.gen(function* () {
+      const session = memorySession();
+      const lines: string[] = [];
+      yield* runLiveDriver(
+        {
+          origin,
+          pairingToken: PAIR,
+          projectId: undefined,
+          model: undefined,
+          title: undefined,
+          prompt: undefined,
+          listProjects: true,
+        },
+        {
+          client: wsT3LocalClient({ origin, pairingToken: PAIR, session }),
+          clock: () => CLOCK,
+          write: (line) => {
+            lines.push(line);
+          },
+          sleep: () => Effect.void,
+          readRepoCommit: () => Promise.resolve(SHA),
+        },
+      );
+      assert.deepStrictEqual(lines, ["usba\tUSBA"]);
+      assert.strictEqual(exchanges(), 1);
+      const saved = session.current();
+      assert.equal(saved !== undefined && saved.startsWith("access-"), true);
+      assert.equal(lines.join("\n").includes(saved ?? "missing-bearer"), false);
+
+      const again = yield* wsT3LocalClient({ origin, session }).listProjectIds();
+      assert.strictEqual(exchanges(), 1);
+      assert.strictEqual(again[0]?.id, "usba");
+      assert.deepStrictEqual(again[0]?.defaultModel, { instanceId: "codex", model: "gpt-5.6-sol" });
+    }),
+  ),
+);
+
+it.effect("drops an expired saved session without printing it", () =>
+  withServer((origin, exchanges) =>
+    Effect.gen(function* () {
+      const stale = "stale-bearer-not-for-logs";
+      const session = memorySession(stale);
+      const failed = yield* Effect.exit(wsT3LocalClient({ origin, session }).listProjectIds());
+      assert.strictEqual(Exit.isFailure(failed), true);
+      if (Exit.isFailure(failed)) {
+        const detail = failed.cause.toString();
+        assert.equal(detail.includes("Saved session expired"), true);
+        assert.equal(detail.includes(stale), false);
+      }
+      assert.strictEqual(session.current(), undefined);
+      assert.strictEqual(exchanges(), 0);
+    }),
+  ),
+);
+
+it.effect("lists projects and launches in one run", () =>
+  Effect.gen(function* () {
+    const lines: string[] = [];
+    let launches = 0;
+    const client: T3LocalClient = {
+      listProjectIds: () =>
+        Effect.succeed([
+          {
+            id: "usba",
+            title: "USBA",
+            workspaceRoot: "/work/usba",
+            defaultModel: { instanceId: "codex", model: "gpt-5.6-sol" },
+          },
+        ]),
+      listProviderModels: () => Effect.succeed(CATALOG),
+      publishBoard: () => Effect.void,
+      interrupt: () => Effect.die("interrupt is unused"),
+      continueRun: () => Effect.die("continue is unused"),
+      launch: () => {
+        launches += 1;
+        return Effect.succeed({ threadId: "t3-thread-1", runId: "run-1", resumed: false });
+      },
+      read: () =>
+        Effect.succeed({
+          threadId: "t3-thread-1",
+          runId: "run-1",
+          status: "completed",
+          text: "done",
+          revision: null,
+        }),
+    };
+    yield* runLiveDriver(
+      {
+        origin: LIVE_DRIVER_DEFAULT_ORIGIN,
+        pairingToken: PAIR,
+        projectId: "usba",
+        model: undefined,
+        title: "Tournament page",
+        prompt: "Update the tournament page schedule.",
+        listProjects: true,
+      },
+      {
+        client,
+        clock: () => CLOCK,
+        write: (line) => {
+          lines.push(line);
+        },
+        sleep: () => Effect.void,
+        readRepoCommit: () => Promise.resolve(SHA),
+        pollIntervalMs: 0,
+        maxPolls: 3,
+      },
+    );
+    assert.strictEqual(lines[0], "usba\tUSBA");
+    assert.strictEqual(launches, 1);
+    assert.equal(
+      lines.some((line) => line.startsWith("task ")),
+      true,
+    );
+  }),
+);
+
+it.effect("rejects a model the provider does not offer and lists the valid ones", () =>
+  Effect.gen(function* () {
+    let launches = 0;
+    const client: T3LocalClient = {
+      listProjectIds: () =>
+        Effect.succeed([
+          {
+            id: "usba",
+            title: "USBA",
+            workspaceRoot: "/work/usba",
+            defaultModel: null,
+          },
+        ]),
+      listProviderModels: () => Effect.succeed(CATALOG),
+      publishBoard: () => Effect.void,
+      interrupt: () => Effect.die("interrupt is unused"),
+      continueRun: () => Effect.die("continue is unused"),
+      launch: () => {
+        launches += 1;
+        return Effect.succeed({ threadId: "t3-thread-1", runId: null, resumed: false });
+      },
+      read: () => Effect.die("read is unused"),
+    };
+    const failed = yield* Effect.exit(
+      runLiveDriver(
+        {
+          origin: LIVE_DRIVER_DEFAULT_ORIGIN,
+          pairingToken: PAIR,
+          projectId: "usba",
+          model: "gpt-5.4",
+          title: "Tournament page",
+          prompt: "Update the tournament page schedule.",
+          listProjects: false,
+        },
+        {
+          client,
+          clock: () => CLOCK,
+          write: () => undefined,
+          sleep: () => Effect.void,
+          readRepoCommit: () => Promise.resolve(SHA),
+        },
+      ),
+    );
+    assert.strictEqual(Exit.isFailure(failed), true);
+    if (Exit.isFailure(failed)) {
+      const detail = failed.cause.toString();
+      assert.equal(detail.includes("gpt-5.4"), true);
+      assert.equal(detail.includes("gpt-5.6-sol"), true);
+      assert.equal(detail.includes("gpt-6-sol"), true);
+      assert.equal(detail.includes(PAIR), false);
+    }
+    assert.strictEqual(launches, 0);
+  }),
+);
+
+it.effect("resolves an omitted model from the server catalog", () =>
+  Effect.sync(() => {
+    const project = resolveDriverModel({
+      requested: undefined,
+      projectDefault: { instanceId: "codex", model: "gpt-5.6-sol" },
+      catalog: CATALOG,
+    });
+    assert.deepStrictEqual(project, { instanceId: "codex", model: "gpt-5.6-sol" });
+
+    const serverDefault = resolveDriverModel({
+      requested: undefined,
+      projectDefault: null,
+      catalog: { ...CATALOG, serverDefault: { instanceId: "codex", model: "sol" } },
+    });
+    assert.deepStrictEqual(serverDefault, { instanceId: "codex", model: "gpt-6-sol" });
+
+    const marked = resolveDriverModel({
+      requested: undefined,
+      projectDefault: null,
+      catalog: CATALOG,
+    });
+    assert.deepStrictEqual(marked, { instanceId: "codex", model: "gpt-6-sol" });
+
+    const missing = resolveDriverModel({
+      requested: undefined,
+      projectDefault: null,
+      catalog: {
+        providers: [
+          {
+            instanceId: "codex",
+            models: [{ slug: "gpt-5.6-sol", aliases: [], isDefault: false }],
+          },
+        ],
+        serverDefault: null,
+      },
+    });
+    assert.deepStrictEqual(missing, {
+      error: "Pass --model. Valid models: codex: gpt-5.6-sol.",
+    });
+
+    const empty = resolveDriverModel({
+      requested: "gpt-6-sol",
+      projectDefault: null,
+      catalog: { providers: [], serverDefault: null },
+    });
+    assert.deepStrictEqual(empty, { error: "The server reported no models for this provider." });
+
+    const catalog = readProviderCatalog({
+      providers: [
+        {
+          instanceId: "codex",
+          enabled: true,
+          models: [
+            { slug: "gpt-5.6-sol", name: "Sol", isCustom: false, capabilities: null },
+            { slug: "old", isLegacy: true, isCustom: false, capabilities: null },
+          ],
+        },
+        {
+          instanceId: "off",
+          enabled: false,
+          models: [{ slug: "hidden", isCustom: false, capabilities: null }],
+        },
+      ],
+      settings: { defaultModelSelection: { instanceId: "codex", model: "gpt-5.6-sol" } },
+    });
+    assert.deepStrictEqual(catalog, {
+      providers: [
+        {
+          instanceId: "codex",
+          models: [{ slug: "gpt-5.6-sol", aliases: [], isDefault: false }],
+        },
+      ],
+      serverDefault: { instanceId: "codex", model: "gpt-5.6-sol" },
+    });
+  }),
 );

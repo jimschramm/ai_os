@@ -1,13 +1,8 @@
 import type { AdapterBoardCard } from "@t3tools/ai-os-adapter/board";
 import { RECOVERY_PENDING_LABEL, type SequenceState } from "@t3tools/ai-os-contracts";
 
-import type { OperationsProjectId, OperationsTask } from "./fixtures";
+import { OPERATIONS_TASKS, type OperationsTask } from "./fixtures";
 import { tasksForProject } from "./model";
-
-const PROJECTS = new Set<OperationsProjectId>(["personal", "usba", "ai_os"]);
-
-const isProject = (value: string): value is OperationsProjectId =>
-  PROJECTS.has(value as OperationsProjectId);
 
 const completionOf = (state: SequenceState) => {
   switch (state.phase) {
@@ -51,7 +46,6 @@ const taskFromAdapterCard = (card: AdapterBoardCard): OperationsTask | null => {
   const { state } = card;
   if (!("assignment" in state) || !("intake" in state)) return null;
   if (!("originatingConversationId" in state.intake)) return null;
-  if (!isProject(state.intake.projectId)) return null;
   const completion = completionOf(state);
   const run = runOf(state);
   const needsYou =
@@ -94,15 +88,19 @@ const taskFromAdapterCard = (card: AdapterBoardCard): OperationsTask | null => {
   };
 };
 
-/** Live adapter cards replace a fixture with the same id. An empty list leaves the fixtures. */
+/**
+ * Live adapter cards replace a fixture with the same id.
+ * Omit `projectId` to keep every project. An empty live list leaves the fixtures.
+ */
 export const tasksForBoard = (
-  projectId: OperationsProjectId,
+  projectId: string | undefined,
   cards: readonly AdapterBoardCard[],
 ): readonly OperationsTask[] => {
-  const fixtures = tasksForProject(projectId);
+  const fixtures = projectId === undefined ? OPERATIONS_TASKS : tasksForProject(projectId);
   const live = cards.flatMap((card) => {
     const task = taskFromAdapterCard(card);
-    return task !== null && task.projectId === projectId ? [task] : [];
+    if (task === null) return [];
+    return projectId === undefined || task.projectId === projectId ? [task] : [];
   });
   if (live.length === 0) return fixtures;
   const liveIds = new Set(live.map((task) => task.id));
