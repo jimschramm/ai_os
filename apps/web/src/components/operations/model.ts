@@ -47,20 +47,26 @@ export function projectById(id: OperationsProjectId): OperationsProject {
   return project;
 }
 
-/** Fixture label when the id is one of the sample workspaces; otherwise the id itself. */
-export function projectLabel(id: string): string {
+/**
+ * T3 project title when `names` has the id, otherwise the fixture label.
+ * An unknown id stays visible as itself until the project list arrives.
+ */
+export function projectLabel(id: string, names?: ReadonlyMap<string, string>): string {
+  const named = names?.get(id);
+  if (named !== undefined && named.length > 0) return named;
   return findProject(id)?.label ?? id;
 }
 
-/** One chip per project that actually has a task, in first-seen order. */
+/** One entry per project that actually has a task, in first-seen order. */
 export function projectChoices(
   tasks: readonly OperationsTask[],
+  names?: ReadonlyMap<string, string>,
 ): readonly { readonly id: string; readonly label: string }[] {
   const ids: string[] = [];
   for (const task of tasks) {
     if (!ids.includes(task.projectId)) ids.push(task.projectId);
   }
-  return ids.map((id) => ({ id, label: projectLabel(id) }));
+  return ids.map((id) => ({ id, label: projectLabel(id, names) }));
 }
 
 export function tasksForProject(id: string): readonly OperationsTask[] {

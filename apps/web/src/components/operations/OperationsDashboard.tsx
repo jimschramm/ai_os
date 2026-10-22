@@ -1,7 +1,9 @@
 import { Badge } from "~/components/ui/badge";
 import { Button } from "~/components/ui/button";
 import { CircleAlertIcon, CircleHelpIcon } from "lucide-react";
-import { useRef, useState, type RefObject } from "react";
+import { createContext, useContext, useRef, useState, type ReactNode, type RefObject } from "react";
+
+import { useProjects } from "../../state/entities";
 
 import {
   PROGRESS_STEPS,
@@ -18,7 +20,7 @@ import { useDialogCycle } from "./dialogFocus";
 import { CortexView } from "./CortexView";
 import { MemoryBrowser } from "./MemoryBrowser";
 import { UsageGauges } from "./UsageGauges";
-import { tasksForBoard } from "./adapterBoard";
+import { hasLiveBoard, tasksForBoard } from "./adapterBoard";
 import { useAdapterBoard } from "./adapterFeed";
 import type { NeedsYouItem, OperationsAgent, OperationsTask } from "./fixtures";
 import { INITIAL_MEMORY_REVIEW, type MemoryReviewState } from "./memoryModel";
@@ -38,6 +40,27 @@ import {
 } from "./model";
 
 const ALL_PROJECTS = "all";
+const EMPTY_PROJECT_NAMES: ReadonlyMap<string, string> = new Map();
+const ProjectNames = createContext(EMPTY_PROJECT_NAMES);
+
+export function ProvideOperationsProjectNames({
+  names,
+  children,
+}: {
+  names: ReadonlyMap<string, string>;
+  children: ReactNode;
+}) {
+  return <ProjectNames.Provider value={names}>{children}</ProjectNames.Provider>;
+}
+
+/** Titles from the connected T3 project list, so a live id shows as aios-test rather than a uuid. */
+export function OperationsProjectNamesFromServer({ children }: { children: ReactNode }) {
+  const projects = useProjects();
+  const names = new Map<string, string>(projects.map((project) => [project.id, project.title]));
+  return <ProvideOperationsProjectNames names={names}>{children}</ProvideOperationsProjectNames>;
+}
+
+const useProjectNames = (): ReadonlyMap<string, string> => useContext(ProjectNames);
 
 const COLUMN_ACCENT: Record<(typeof BOARD_COLUMNS)[number]["id"], string> = {
   Ready: "border-l-info",
@@ -48,7 +71,9 @@ const COLUMN_ACCENT: Record<(typeof BOARD_COLUMNS)[number]["id"], string> = {
 };
 
 export function OperationsDashboard() {
+  const names = useProjectNames();
   const [projectFilter, setProjectFilter] = useState(ALL_PROJECTS);
+  const [demoData, setDemoData] = useState(false);
   const [surface, setSurface] = useState<"board" | "memory">("board");
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [currentTaskId, setCurrentTaskId] = useState<string | null>(null);
@@ -59,20 +84,27 @@ export function OperationsDashboard() {
   const [review, setReview] = useState<MemoryReviewState>(INITIAL_MEMORY_REVIEW);
   const [memoryNotes, setMemoryNotes] = useState<Readonly<Record<string, string>>>({});
   const cards = useAdapterBoard();
-  const allTasks = tasksForBoard(undefined, cards);
-  const choices = projectChoices(allTasks);
+  const live = hasLiveBoard(cards);
+  const includeFixtures = !live || (import.meta.env.DEV && demoData);
+  const allTasks = tasksForBoard(undefined, cards, includeFixtures);
+  const choices = projectChoices(allTasks, names);
   const workspace =
     projectFilter !== ALL_PROJECTS && choices.some((choice) => choice.id === projectFilter)
       ? projectFilter
       : ALL_PROJECTS;
-  const tasks = workspace === ALL_PROJECTS ? allTasks : tasksForBoard(workspace, cards);
+  const tasks =
+    workspace === ALL_PROJECTS ? allTasks : tasksForBoard(workspace, cards, includeFixtures);
   const memoryProject =
     (workspace === ALL_PROJECTS ? undefined : findProject(workspace)) ??
     choices.map((choice) => findProject(choice.id)).find((project) => project !== undefined) ??
     projectById("personal");
   const agents =
-    workspace === ALL_PROJECTS ? agentsForChoices(choices) : (findProject(workspace)?.agents ?? []);
-  const heading = workspace === ALL_PROJECTS ? "All projects" : projectLabel(workspace);
+    live && !includeFixtures
+      ? agentsFromTasks(tasks)
+      : workspace === ALL_PROJECTS
+        ? agentsForChoices(choices)
+        : (findProject(workspace)?.agents ?? []);
+  const heading = workspace === ALL_PROJECTS ? "All projects" : projectLabel(workspace, names);
   const detail =
     workspace === ALL_PROJECTS ? "All projects" : (findProject(workspace)?.detail ?? heading);
   const selected = tasks.find((task) => task.id === selectedId) ?? null;
@@ -121,6 +153,17 @@ export function OperationsDashboard() {
           </div>
           <div className="flex flex-col items-stretch gap-2 sm:items-end">
             <ProjectPicker selected={workspace} choices={choices} onChange={setProjectFilter} />
+            {import.meta.env.DEV && live ? (
+              <label className="flex items-center justify-end gap-2 text-xs text-muted-foreground">
+                <input
+                  aria-label="Demo data"
+                  type="checkbox"
+                  checked={demoData}
+                  onChange={(event) => setDemoData(event.currentTarget.checked)}
+                />
+                Demo data
+              </label>
+            ) : null}
             <Button size="sm" variant="outline" onClick={() => openMemory(null)}>
               Browse memory
             </Button>
@@ -156,7 +199,9 @@ export function OperationsDashboard() {
                 <h2 id="board-heading" className="text-sm font-semibold tracking-tight">
                   Board
                 </h2>
-                <p className="text-xs text-muted-foreground">{heading}</p>
+                <p id="board-filter-label" className="text-xs text-muted-foreground">
+                  {heading}
+                </p>
               </div>
               <div className="grid grid-cols-1 gap-3 md:grid-cols-2 lg:grid-cols-5">
                 {BOARD_COLUMNS.map((column) => {
@@ -262,33 +307,42 @@ function ProjectPicker({
   choices: readonly { readonly id: string; readonly label: string }[];
   onChange: (id: string) => void;
 }) {
-  const allSelected = selected === ALL_PROJECTS;
   return (
-    <div aria-label="Workspace" className="flex flex-wrap gap-2" role="group">
-      <Button
-        aria-pressed={allSelected}
-        size="sm"
-        variant={allSelected ? "secondary" : "outline"}
-        onClick={() => onChange(ALL_PROJECTS)}
-      >
-        All
-      </Button>
-      {choices.map((choice) => {
-        const pressed = choice.id === selected;
-        return (
-          <Button
-            key={choice.id}
-            aria-pressed={pressed}
-            size="sm"
-            variant={pressed ? "secondary" : "outline"}
-            onClick={() => onChange(choice.id)}
-          >
-            {choice.label}
-          </Button>
-        );
-      })}
-    </div>
+    <select
+      aria-label="Projects"
+      value={selected}
+      onChange={(event) => onChange(event.currentTarget.value)}
+      className="h-7 max-w-56 rounded-md border border-border bg-background px-2 text-xs text-foreground"
+    >
+      <option value={ALL_PROJECTS}>All projects</option>
+      {choices.map((choice) => (
+        <option key={choice.id} value={choice.id}>
+          {choice.label}
+        </option>
+      ))}
+    </select>
   );
+}
+
+function agentsFromTasks(tasks: readonly OperationsTask[]): readonly OperationsAgent[] {
+  const byName = new Map<string, OperationsAgent>();
+  for (const task of tasks) {
+    const active =
+      task.phase === "executing" || task.phase === "assigned" || task.phase === "rework";
+    const existing = byName.get(task.agent);
+    if (existing === undefined) {
+      byName.set(task.agent, {
+        id: task.agent,
+        name: task.agent,
+        surface: task.surface,
+        mode: active ? "active" : "update-only",
+        assignment: task.title,
+      });
+    } else if (active && existing.mode !== "active") {
+      byName.set(task.agent, { ...existing, mode: "active", assignment: task.title });
+    }
+  }
+  return [...byName.values()];
 }
 
 function agentsForChoices(choices: readonly { readonly id: string }[]): readonly OperationsAgent[] {
@@ -501,6 +555,7 @@ function TaskCard({
   pressed: boolean;
   onOpen: () => void;
 }) {
+  const names = useProjectNames();
   const percent = progressPercent(task.phase);
   return (
     <button
@@ -520,7 +575,7 @@ function TaskCard({
         <span className="min-w-0">
           <span className="line-clamp-2 block text-sm font-medium">{task.title}</span>
           <span className="mt-0.5 block text-xs text-muted-foreground">
-            {projectLabel(task.projectId)}
+            {projectLabel(task.projectId, names)}
           </span>
         </span>
       </span>
@@ -602,12 +657,13 @@ function TaskDrawerBody({
   onClose: () => void;
   onOpenRecord: (factId: string) => void;
 }) {
+  const names = useProjectNames();
   return (
     <>
       <div className="flex items-start justify-between gap-3 border-b border-border px-4 py-4">
         <div className="min-w-0">
           <p className="text-xs text-muted-foreground">
-            {projectLabel(task.projectId)} · {task.agent} · {task.surface}
+            {projectLabel(task.projectId, names)} · {task.agent} · {task.surface}
           </p>
           <h2
             id="task-drawer-title"

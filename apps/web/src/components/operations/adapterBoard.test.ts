@@ -43,7 +43,7 @@ const assigned = (taskId: string) =>
     },
   ]);
 
-it.effect("reads adapter cards and keeps fixture tasks as the fallback", () =>
+it.effect("shows fixtures only when the live feed is empty", () =>
   Effect.gen(function* () {
     assert.deepStrictEqual(tasksForBoard("usba", []), tasksForProject("usba"));
 
@@ -57,17 +57,14 @@ it.effect("reads adapter cards and keeps fixture tasks as the fallback", () =>
         updatedAt: at,
       },
     ]);
-    assert.equal(
-      withLive.some((task) => task.id === "task-usba-page" && task.phase === "assigned"),
-      true,
+    assert.deepStrictEqual(
+      withLive.map((task) => task.id),
+      ["task-usba-page"],
     );
+    assert.strictEqual(withLive[0]?.title, "Live page");
     assert.equal(
       withLive.some((task) => task.id === "saturday-copy"),
-      true,
-    );
-    assert.strictEqual(
-      withLive.filter((task) => task.projectId === "usba").length,
-      withLive.length,
+      false,
     );
 
     const replacement = yield* assigned("saturday-copy");
@@ -80,11 +77,27 @@ it.effect("reads adapter cards and keeps fixture tasks as the fallback", () =>
         updatedAt: at,
       },
     ]);
-    assert.strictEqual(replaced.length, tasksForProject("usba").length);
-    assert.strictEqual(replaced.find((task) => task.id === "saturday-copy")?.phase, "assigned");
-    assert.strictEqual(
-      replaced.find((task) => task.id === "saturday-copy")?.title,
-      "Live Saturday",
+    assert.deepStrictEqual(
+      replaced.map((task) => task.id),
+      ["saturday-copy"],
+    );
+    assert.strictEqual(replaced[0]?.phase, "assigned");
+    assert.strictEqual(replaced[0]?.title, "Live Saturday");
+    assert.deepStrictEqual(
+      tasksForBoard(
+        "usba",
+        [
+          {
+            taskId: "saturday-copy",
+            title: "Live Saturday",
+            state: replacement,
+            threadId: "t3-thread-2",
+            updatedAt: at,
+          },
+        ],
+        true,
+      ).map((task) => task.id).length,
+      tasksForProject("usba").length,
     );
   }),
 );
@@ -124,24 +137,27 @@ it.effect("keeps a live card whose project is not one of the fixtures", () =>
       updatedAt: at,
     };
     const all = tasksForBoard(undefined, [card]);
-    assert.equal(
-      all.some((task) => task.id === "task-local" && task.projectId === "local-repo"),
-      true,
+    assert.deepStrictEqual(
+      all.map((task) => task.id),
+      ["task-local"],
     );
     assert.equal(
       all.some((task) => task.projectId === "personal"),
-      true,
+      false,
     );
     assert.equal(
       all.some((task) => task.projectId === "usba"),
-      true,
+      false,
     );
     const only = tasksForBoard("local-repo", [card]);
     assert.deepStrictEqual(
       only.map((task) => task.id),
       ["task-local"],
     );
-    assert.deepStrictEqual(tasksForBoard("usba", [card]), tasksForProject("usba"));
+    assert.deepStrictEqual(
+      tasksForBoard("usba", [card]).map((task) => task.id),
+      [],
+    );
   }),
 );
 

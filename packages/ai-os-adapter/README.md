@@ -13,7 +13,7 @@ node --experimental-strip-types packages/ai-os-adapter/scripts/live-driver.ts \
   --list-projects
 ```
 
-Launch one task. `--origin` defaults to `http://127.0.0.1:13773`. Omit `--model` to use the project's configured model, then the server default. If the model is not one the provider offers, the error lists the valid models. The same command can list and launch when `--project-id`, `--title`, and `--prompt` are all present. Omit `T3_PAIRING_TOKEN` on loopback. Set it when `--origin` is not loopback.
+Launch one task. `--origin` defaults to `http://127.0.0.1:13773`. Omit `--model` to use the project's configured model when the provider offers it, then the server default, then the provider's default or the first available model. An explicit `--model` the provider does not offer is an error listing the valid models. The same command can list and launch when `--project-id`, `--title`, and `--prompt` are all present. Omit `T3_PAIRING_TOKEN` on loopback. Set it when `--origin` is not loopback.
 
 ```sh
 node --experimental-strip-types packages/ai-os-adapter/scripts/live-driver.ts \
