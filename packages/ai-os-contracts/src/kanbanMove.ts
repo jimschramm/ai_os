@@ -14,10 +14,13 @@ import {
 const DONE_REQUIRES_QA =
   "Done requires a passed independent QA from a different model than the builder. Moving a card here does not accept it.";
 
-const RUNNING_FROM_BOARD =
-  "In Progress starts when the adapter launches the run. The board does not mark it started.";
+const RUNNING_NEEDS_ASSIGNMENT = "In Progress starts from Ready only after a worker is assigned.";
 
 const KEY = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
+
+/** Stable launch key shared by the board and the adapter. The same task and attempt replay one thread. */
+export const executionLaunchKey = (taskId: string, attemptId: string): string =>
+  `board-launch-${taskId}-${attemptId}`;
 
 export interface KanbanMoveRecord {
   readonly column: KanbanColumn;
@@ -61,6 +64,12 @@ export type KanbanMoveResult =
       readonly detail: string;
       readonly state: SequenceState;
       readonly ledger: KanbanMoveLedger;
+    }
+  | {
+      readonly _tag: "NeedsLaunch";
+      readonly detail: string;
+      readonly state: SequenceState;
+      readonly ledger: KanbanMoveLedger;
     };
 
 const applied = (
@@ -87,6 +96,12 @@ const needsInterrupt = (
   state: SequenceState,
   ledger: KanbanMoveLedger,
 ): KanbanMoveResult => ({ _tag: "NeedsInterrupt", action, detail, state, ledger });
+
+const needsLaunch = (
+  detail: string,
+  state: SequenceState,
+  ledger: KanbanMoveLedger,
+): KanbanMoveResult => ({ _tag: "NeedsLaunch", detail, state, ledger });
 
 const remember = (
   ledger: KanbanMoveLedger,
@@ -228,7 +243,13 @@ export const requestKanbanMove = (
   }
 
   if (request.column === "Running") {
-    return Effect.succeed(rejected(RUNNING_FROM_BOARD, state, request.ledger));
+    if (state.phase === "assigned" || state.phase === "rework") {
+      // The card stays queued until the caller confirms the run is active.
+      return Effect.succeed(
+        needsLaunch("In Progress waits until this run is confirmed active.", state, request.ledger),
+      );
+    }
+    return Effect.succeed(rejected(RUNNING_NEEDS_ASSIGNMENT, state, request.ledger));
   }
 
   if (request.column === "Ready" && state.phase === "requested") {

@@ -15,9 +15,11 @@ import {
   encodeAdapterBoard,
   type AdapterBoardCard,
 } from "@t3tools/ai-os-adapter/board";
+import { encodeAdapterBoardWire } from "@t3tools/ai-os-adapter/board-hub";
 import {
   applySequence,
   assignmentExample,
+  executionLaunchKey,
   happyPathEvents,
   intakeV2Example,
   leaseIdFor,
@@ -31,9 +33,17 @@ import * as EnvironmentAuth from "./auth/EnvironmentAuth.ts";
 import * as AiOsBoard from "./aiOsBoard.ts";
 import * as ServerConfig from "./config.ts";
 
+const activeLaunch = (): AiOsBoard.BoardLaunchResult => ({
+  threadId: "thread-1",
+  runId: "run-1",
+  disposition: "active",
+  summary: null,
+});
+
 const allowRuns: AiOsBoard.BoardRuns["Service"] = {
   interrupt: () => Effect.succeed("requested"),
-  confirmLaunch: () => Effect.void,
+  confirmLaunch: () => Effect.succeed("active"),
+  launch: () => Effect.succeed(activeLaunch()),
 };
 
 const disposers: Array<() => Promise<void>> = [];
@@ -78,13 +88,41 @@ const handlerFor = (stateDir?: string, runs: AiOsBoard.BoardRuns["Service"] = al
   return { handler, stateDir: dir };
 };
 
-const idleCard = (taskId: string, title: string): AdapterBoardCard => ({
+const idleCard = (taskId: string, title: string, revision = 1): AdapterBoardCard => ({
   taskId,
   title,
   state: { phase: "idle" },
   threadId: null,
+  runId: null,
+  revision,
   updatedAt: "2026-10-21T18:00:00Z",
 });
+
+const preparedDir = () => {
+  const dir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "aios-board-"));
+  dirs.push(dir);
+  return dir;
+};
+
+const seedIdle = (
+  dir: string,
+  cards: ReadonlyArray<{ taskId: string; title: string; revision?: number }>,
+) => {
+  NodeFS.writeFileSync(
+    NodePath.join(dir, "ai-os-board.json"),
+    encodeAdapterBoardWire(
+      cards.map((card) => ({
+        taskId: card.taskId,
+        title: card.title,
+        state: { phase: "idle" as const },
+        threadId: null,
+        runId: null,
+        revision: card.revision ?? 1,
+        updatedAt: "2026-10-21T18:00:00Z",
+      })),
+    ),
+  );
+};
 
 const boardUrl = (path: string) => `http://t3.test${path}`;
 
@@ -229,8 +267,13 @@ describe("ai-os board route", () => {
     expect(new TextDecoder().decode(first.value)).toContain("data:");
   });
 
-  it("upserts each task and reloads the snapshot after a restart", async () => {
-    const first = handlerFor();
+  it("updates metadata and reloads the snapshot after a restart", async () => {
+    const dir = preparedDir();
+    seedIdle(dir, [
+      { taskId: "task-a", title: "First" },
+      { taskId: "task-b", title: "Second" },
+    ]);
+    const first = handlerFor(dir);
     const post = (handler: typeof first.handler, card: AdapterBoardCard) =>
       handler(
         new Request(boardUrl(ADAPTER_BOARD_PATH), {
@@ -249,8 +292,8 @@ describe("ai-os board route", () => {
         }),
       );
 
-    expect((await post(first.handler, idleCard("task-a", "First"))).status).toBe(200);
-    expect((await post(first.handler, idleCard("task-b", "Second"))).status).toBe(200);
+    const created = await post(first.handler, idleCard("task-c", "Third", 0));
+    expect(created.status).toBe(409);
     const kept = decodeAdapterBoard(await (await read(first.handler)).text());
     expect(kept?.map((card) => card.taskId)).toEqual(["task-a", "task-b"]);
 
@@ -266,8 +309,7 @@ describe("ai-os board route", () => {
     expect(
       (
         await post(second.handler, {
-          ...idleCard("task-a", "Updated"),
-          revision,
+          ...idleCard("task-a", "Updated", revision),
         })
       ).status,
     ).toBe(200);
@@ -279,7 +321,9 @@ describe("ai-os board route", () => {
   });
 
   it("rejects an empty id, a blank title, and a non-Z timestamp", async () => {
-    const { handler } = handlerFor();
+    const dir = preparedDir();
+    seedIdle(dir, [{ taskId: "task-a", title: "First" }]);
+    const { handler } = handlerFor(dir);
     const post = (body: string) =>
       handler(
         new Request(boardUrl(ADAPTER_BOARD_PATH), {
@@ -291,7 +335,7 @@ describe("ai-os board route", () => {
           body,
         }),
       );
-    const valid = encodeAdapterBoard([idleCard("task-a", "First")]);
+    const valid = encodeAdapterBoard([idleCard("task-a", "First", 1)]);
     expect((await post(valid)).status).toBe(200);
     for (const body of [
       encodeAdapterBoard([{ ...idleCard("task-a", "First"), taskId: "" }]),
@@ -315,8 +359,13 @@ describe("ai-os board route", () => {
   });
 
   it("keeps every card when publishes run together", async () => {
-    const { handler } = handlerFor();
     const ids = Array.from({ length: 12 }, (_, index) => `task-${index}`);
+    const dir = preparedDir();
+    seedIdle(
+      dir,
+      ids.map((id) => ({ taskId: id, title: `Title ${id}` })),
+    );
+    const { handler } = handlerFor(dir);
     const statuses = await Promise.all(
       ids.map((id) =>
         handler(
@@ -326,7 +375,7 @@ describe("ai-os board route", () => {
               authorization: `Bearer ${AuthOrchestrationOperateScope}`,
               "content-type": "application/json",
             },
-            body: encodeAdapterBoard([idleCard(id, `Title ${id}`)]),
+            body: encodeAdapterBoard([idleCard(id, `Renamed ${id}`, 1)]),
           }),
         ).then((response) => response.status),
       ),
@@ -339,10 +388,13 @@ describe("ai-os board route", () => {
     );
     const cards = decodeAdapterBoard(await reader.text());
     expect(cards?.map((card) => card.taskId).sort()).toEqual([...ids].sort());
+    expect(cards?.every((card) => card.title.startsWith("Renamed "))).toBe(true);
   });
 
   it("returns 500 when the snapshot cannot be written", async () => {
-    const { handler, stateDir } = handlerFor();
+    const dir = preparedDir();
+    seedIdle(dir, [{ taskId: "task-a", title: "First" }]);
+    const { handler, stateDir } = handlerFor(dir);
     NodeFS.chmodSync(stateDir, 0o555);
     try {
       const denied = await handler(
@@ -352,7 +404,7 @@ describe("ai-os board route", () => {
             authorization: `Bearer ${AuthOrchestrationOperateScope}`,
             "content-type": "application/json",
           },
-          body: encodeAdapterBoard([idleCard("task-a", "First")]),
+          body: encodeAdapterBoard([idleCard("task-a", "Updated", 1)]),
         }),
       );
       expect(denied.status).toBe(500);
@@ -364,17 +416,22 @@ describe("ai-os board route", () => {
         headers: { authorization: `Bearer ${AuthOrchestrationReadScope}` },
       }),
     );
-    expect(decodeAdapterBoard(await reader.text())).toEqual([]);
+    expect(decodeAdapterBoard(await reader.text())?.map((card) => card.title)).toEqual(["First"]);
   });
 
   it("moves a card only through the workflow and refuses a second run or a silent cancel", async () => {
     const interrupts: string[] = [];
+    const launches: string[] = [];
     const { handler } = handlerFor(undefined, {
       interrupt: (input) => {
         interrupts.push(input.runId);
         return Effect.succeed("requested");
       },
-      confirmLaunch: () => Effect.void,
+      confirmLaunch: () => Effect.succeed("active"),
+      launch: (input) => {
+        launches.push(input.idempotencyKey);
+        return Effect.succeed(activeLaunch());
+      },
     });
     const operate = (path: string, body: unknown) =>
       handler(
@@ -470,26 +527,19 @@ describe("ai-os board route", () => {
     expect(await phaseOf()).toBe("assigned");
 
     const fromBoard = await move("Running", "start-1");
-    expect(fromBoard.status).toBe(409);
-    expect(await fromBoard.json()).toMatchObject({
-      _tag: "Rejected",
-      detail: expect.stringMatching(/adapter launches the run/),
-    });
-    expect(await phaseOf()).toBe("assigned");
-
-    const missingRun = await event("start-missing", { type: "start_execution" });
-    expect(missingRun.status).toBe(409);
-    expect(await phaseOf()).toBe("assigned");
-
-    const started = await event(
-      "start-1",
-      { type: "start_execution" },
-      { threadId: "thread-1", runId: "run-1" },
-    );
-    expect(started.status).toBe(200);
-    expect(await started.json()).toMatchObject({ _tag: "Applied", changed: true });
+    expect(fromBoard.status).toBe(200);
+    expect(await fromBoard.json()).toMatchObject({ _tag: "Applied", changed: true });
+    expect(launches).toEqual([executionLaunchKey("task-demo", "attempt-1")]);
     expect(await phaseOf()).toBe("executing");
-    expect(await generationOf()).toBe(1);
+    const runningCard = (await readCards(handler)).find((card) => card.taskId === "task-demo");
+    expect(runningCard?.threadId).toBe("thread-1");
+    expect(runningCard?.runId).toBe("run-1");
+
+    const secondDrop = await move("Running", "start-2");
+    expect(secondDrop.status).toBe(200);
+    expect(await secondDrop.json()).toMatchObject({ _tag: "Applied", changed: false });
+    expect(launches).toEqual([executionLaunchKey("task-demo", "attempt-1")]);
+    expect(await phaseOf()).toBe("executing");
 
     const repeatedStart = await event(
       "start-again",
@@ -519,7 +569,8 @@ describe("ai-os board route", () => {
         Effect.fail(
           new AiOsBoard.BoardRunError({ detail: "The run did not confirm the interrupt." }),
         ),
-      confirmLaunch: () => Effect.void,
+      confirmLaunch: () => Effect.succeed("active"),
+      launch: () => Effect.succeed(activeLaunch()),
     });
     await reachExecuting(handler);
     const cancelled = await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
@@ -544,6 +595,7 @@ describe("ai-os board route", () => {
             detail: "That run is not active, so the board will not mark it in progress.",
           }),
         ),
+      launch: () => Effect.succeed(activeLaunch()),
     });
     await reachAssigned(handler);
     const started = await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
@@ -560,11 +612,13 @@ describe("ai-os board route", () => {
 
   effectIt.effect("rejects a stale snapshot and a snapshot that would accept the card", () =>
     Effect.gen(function* () {
-      const { handler } = handlerFor();
+      const dir = preparedDir();
+      seedIdle(dir, [{ taskId: "task-a", title: "First" }]);
+      const { handler } = handlerFor(dir);
       const created = yield* Effect.promise(() =>
-        postJson(handler, ADAPTER_BOARD_PATH, [idleCard("task-a", "First")]),
+        postJson(handler, ADAPTER_BOARD_PATH, [idleCard("task-new", "Created", 0)]),
       );
-      expect(created.status).toBe(200);
+      expect(created.status).toBe(409);
       const stale = yield* Effect.promise(() =>
         postJson(handler, ADAPTER_BOARD_PATH, [{ ...idleCard("task-a", "Renamed"), revision: 0 }]),
       );
@@ -598,6 +652,122 @@ describe("ai-os board route", () => {
       ]);
     }),
   );
+
+  it("records a finished launch as review instead of leaving it Ready", async () => {
+    let launches = 0;
+    const { handler } = handlerFor(undefined, {
+      interrupt: () => Effect.succeed("requested"),
+      confirmLaunch: () => Effect.succeed("settled"),
+      launch: () => {
+        launches += 1;
+        return Effect.succeed({
+          threadId: "thread-fast",
+          runId: "run-fast",
+          disposition: "completed",
+          summary: "Done already.",
+        });
+      },
+    });
+    await reachAssigned(handler);
+    const moved = await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
+      taskId: "task-demo",
+      column: "Running",
+      idempotencyKey: "fast-1",
+    });
+    expect(moved.status).toBe(200);
+    expect(launches).toBe(1);
+    expect(await phaseOfHandler(handler)).toBe("awaiting_qa");
+    const again = await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
+      taskId: "task-demo",
+      column: "Running",
+      idempotencyKey: "fast-2",
+    });
+    expect(again.status).toBe(409);
+    expect(launches).toBe(1);
+    expect(await phaseOfHandler(handler)).toBe("awaiting_qa");
+  });
+
+  it("records a failed launch as blocked instead of leaving it Ready", async () => {
+    const { handler } = handlerFor(undefined, {
+      interrupt: () => Effect.succeed("requested"),
+      confirmLaunch: () => Effect.succeed("settled"),
+      launch: () =>
+        Effect.succeed({
+          threadId: "thread-fail",
+          runId: "run-fail",
+          disposition: "failed",
+          summary: "The provider exited.",
+        }),
+    });
+    await reachAssigned(handler);
+    const moved = await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
+      taskId: "task-demo",
+      column: "Running",
+      idempotencyKey: "fail-fast",
+    });
+    expect(moved.status).toBe(200);
+    expect(await phaseOfHandler(handler)).toBe("failed");
+  });
+
+  it("accepts start for a run that already finished, then the completion", async () => {
+    const { handler } = handlerFor(undefined, {
+      interrupt: () => Effect.succeed("requested"),
+      confirmLaunch: () => Effect.succeed("settled"),
+      launch: () => Effect.succeed(activeLaunch()),
+    });
+    await reachAssigned(handler);
+    const started = await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
+      taskId: "task-demo",
+      title: "Demo task",
+      idempotencyKey: "start-settled",
+      threadId: "thread-1",
+      runId: "run-1",
+      event: { type: "start_execution" },
+    });
+    expect(started.status).toBe(200);
+    expect(await phaseOfHandler(handler)).toBe("executing");
+    const done = await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
+      taskId: "task-demo",
+      title: "Demo task",
+      idempotencyKey: "complete-settled",
+      threadId: "thread-1",
+      runId: "run-1",
+      event: {
+        type: "submit_completion",
+        completion: {
+          version: "v1",
+          taskId: "task-demo",
+          attemptId: "attempt-1",
+          generation: 1,
+          leaseId: leaseIdFor(1),
+          claimedOutcome: "Finished before the board caught up.",
+          artifactRevision: { type: "named", kind: "page", id: "t3-result" },
+          evidence: [{ kind: "readback", ref: "thread:thread-1" }],
+        },
+      },
+    });
+    expect(done.status).toBe(200);
+    expect(await phaseOfHandler(handler)).toBe("awaiting_qa");
+  });
+
+  it("leaves the card Ready when the launch is refused", async () => {
+    const { handler } = handlerFor(undefined, {
+      interrupt: () => Effect.succeed("requested"),
+      confirmLaunch: () => Effect.succeed("active"),
+      launch: () => Effect.fail(new AiOsBoard.BoardRunError({ detail: "The provider is down." })),
+    });
+    await reachAssigned(handler);
+    const moved = await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
+      taskId: "task-demo",
+      column: "Running",
+      idempotencyKey: "launch-down",
+    });
+    expect(moved.status).toBe(409);
+    expect(await moved.json()).toMatchObject({
+      detail: expect.stringMatching(/provider is down/),
+    });
+    expect(await phaseOfHandler(handler)).toBe("assigned");
+  });
 
   it("does not append usage again when the same event is replayed after a restart", async () => {
     const first = handlerFor();

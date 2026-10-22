@@ -203,9 +203,16 @@ it.effect("does not start a second run when the same drop is repeated", () =>
   Effect.gen(function* () {
     const assigned = phase(yield* applySequence(happyPathEvents.slice(0, 3)), "assigned");
     const fromBoard = yield* move(assigned, "Running", "start-1");
-    assert.strictEqual(fromBoard._tag, "Rejected");
+    assert.strictEqual(fromBoard._tag, "NeedsLaunch");
     assert.strictEqual(fromBoard.state.phase, "assigned");
-    if (fromBoard._tag === "Rejected") assert.match(fromBoard.detail, /adapter launches the run/);
+    assert.deepStrictEqual(fromBoard.ledger, empty);
+    if (fromBoard._tag === "NeedsLaunch") assert.match(fromBoard.detail, /confirmed active/);
+
+    const rework = phase(yield* applySequence(happyPathEvents.slice(0, 7)), "rework");
+    const reworkLaunch = yield* move(rework, "Running", "start-rework");
+    assert.strictEqual(reworkLaunch._tag, "NeedsLaunch");
+    assert.strictEqual(reworkLaunch.state.phase, "rework");
+    assert.deepStrictEqual(reworkLaunch.ledger, empty);
 
     const first = applied(
       yield* applyBoardWorkflowEvent(

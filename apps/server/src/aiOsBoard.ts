@@ -3,18 +3,24 @@ import {
   ADAPTER_BOARD_EVENTS_PATH,
   ADAPTER_BOARD_MOVE_PATH,
   ADAPTER_BOARD_PATH,
-  decodeAdapterBoard,
   type AdapterBoardCard,
 } from "@t3tools/ai-os-adapter/board";
-import { encodeAdapterBoardWire, makeAdapterBoardHub } from "@t3tools/ai-os-adapter/board-hub";
+import {
+  decodeAdapterBoardWire,
+  encodeAdapterBoardWire,
+  makeAdapterBoardHub,
+} from "@t3tools/ai-os-adapter/board-hub";
+import { launchCommandId, renderPrompt, T3_LAUNCH_DEFAULTS } from "@t3tools/ai-os-adapter";
 import {
   applyBoardWorkflowEvent,
   commitInterruptedMove,
   decodeSequenceEvent,
   decodeSequenceState,
+  executionLaunchKey,
   openBoardTask,
   requestKanbanMove,
   SequenceState,
+  type ContextPackageSnapshotV1,
   type KanbanColumn,
   type KanbanMoveLedger,
   type KanbanMoveResult,
@@ -23,7 +29,9 @@ import {
   AuthOrchestrationOperateScope,
   AuthOrchestrationReadScope,
   CommandId,
+  OrchestrationMessageContext,
   ProjectId,
+  ProviderInstanceId,
   RunId,
   ThreadId,
 } from "@t3tools/contracts";
@@ -51,6 +59,7 @@ import {
   failEnvironmentScopeRequired,
 } from "./auth/http.ts";
 import * as ServerConfig from "./config.ts";
+import * as ThreadLaunch from "./orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadManagement from "./orchestration-v2/ThreadManagementService.ts";
 
 const BOARD_FILE = "ai-os-board.json";
@@ -74,6 +83,15 @@ export class BoardRunError extends Data.TaggedError("BoardRunError")<{
 
 export type BoardInterruptConfirmation = "requested" | "already_stopped";
 
+export type BoardLaunchDisposition = "active" | "completed" | "failed";
+
+export interface BoardLaunchResult {
+  readonly threadId: string;
+  readonly runId: string | null;
+  readonly disposition: BoardLaunchDisposition;
+  readonly summary: string | null;
+}
+
 /**
  * The board asks the orchestration runtime before it records a run phase.
  * Tests substitute this. Production uses the live thread service.
@@ -91,7 +109,16 @@ export class BoardRuns extends Context.Service<
       readonly projectId: string;
       readonly threadId: string;
       readonly runId: string;
-    }) => Effect.Effect<void, BoardRunError>;
+    }) => Effect.Effect<"active" | "settled", BoardRunError>;
+    readonly launch: (input: {
+      readonly idempotencyKey: string;
+      readonly projectId: string;
+      readonly title: string;
+      readonly prompt: string;
+      readonly model: string;
+      readonly instanceId: string;
+      readonly contextPackage: ContextPackageSnapshotV1;
+    }) => Effect.Effect<BoardLaunchResult, BoardRunError>;
   }
 >()("t3/aiOsBoard/BoardRuns") {}
 
@@ -99,10 +126,38 @@ const runError = (detail: string) => new BoardRunError({ detail });
 
 const INTERRUPT_UNCONFIRMED = "The run did not confirm the interrupt.";
 
+const NOT_ACTIVE = "That run is not active, so the board will not mark it in progress.";
+
+const decodeMessageContext = Schema.decodeUnknownSync(OrchestrationMessageContext);
+
+const launchContext = (contextPackage: ContextPackageSnapshotV1) =>
+  decodeMessageContext({
+    version: 1,
+    records: [
+      {
+        version: 1,
+        contextId: "context-package",
+        label: "Context package",
+        kind: "context-package",
+        payload: contextPackage,
+      },
+    ],
+  });
+
+const errorDetail = (error: unknown, fallback: string): string =>
+  typeof error === "object" &&
+  error !== null &&
+  "message" in error &&
+  typeof error.message === "string" &&
+  error.message.length > 0
+    ? error.message
+    : fallback;
+
 export const liveRuns = Layer.effect(
   BoardRuns,
   Effect.gen(function* () {
     const threads = yield* ThreadManagement.ThreadManagementService;
+    const launches = yield* ThreadLaunch.ThreadLaunchService;
     const interrupt: BoardRuns["Service"]["interrupt"] = (input) =>
       threads
         .interruptThread({
@@ -126,21 +181,60 @@ export const liveRuns = Layer.effect(
         );
     const confirmLaunch: BoardRuns["Service"]["confirmLaunch"] = (input) =>
       threads.getThreadShell(ThreadId.make(input.threadId)).pipe(
-        Effect.mapError(() =>
-          runError("That run is not active, so the board will not mark it in progress."),
-        ),
+        Effect.mapError(() => runError(NOT_ACTIVE)),
         Effect.flatMap((shell) => {
-          const detail = "That run is not active, so the board will not mark it in progress.";
-          if (shell === null || shell.activeRunId !== RunId.make(input.runId)) {
-            return Effect.fail(runError(detail));
-          }
+          if (shell === null) return Effect.fail(runError(NOT_ACTIVE));
           if (shell.projectId !== ProjectId.make(input.projectId)) {
             return Effect.fail(runError("The run belongs to a different project."));
           }
-          return Effect.void;
+          const runId = RunId.make(input.runId);
+          if (shell.activeRunId === runId) return Effect.succeed("active" as const);
+          if (shell.activeRunId === null && shell.latestRunId === runId) {
+            return Effect.succeed("settled" as const);
+          }
+          return Effect.fail(runError(NOT_ACTIVE));
         }),
       );
-    return { interrupt, confirmLaunch };
+    const launch: BoardRuns["Service"]["launch"] = (input) =>
+      launches
+        .launch({
+          commandId: CommandId.make(launchCommandId(input.idempotencyKey)),
+          projectId: ProjectId.make(input.projectId),
+          title: input.title,
+          modelSelection: {
+            instanceId: ProviderInstanceId.make(input.instanceId),
+            model: input.model,
+          },
+          runtimeMode: T3_LAUNCH_DEFAULTS.runtimeMode,
+          interactionMode: T3_LAUNCH_DEFAULTS.interactionMode,
+          workspaceStrategy: T3_LAUNCH_DEFAULTS.workspaceStrategy,
+          initialMessage: {
+            text: input.prompt,
+            attachments: [],
+            context: launchContext(input.contextPackage),
+          },
+          createdBy: "user",
+          creationSource: "web",
+        })
+        .pipe(
+          Effect.map((result) => {
+            const run = result.projection.runs.at(-1);
+            const status = run?.status;
+            const assistant = result.projection.messages.findLast(
+              (message) => message.role === "assistant" && message.text.length > 0,
+            );
+            const disposition: BoardLaunchDisposition =
+              status === "completed" ? "completed" : status === "failed" ? "failed" : "active";
+            return {
+              threadId: result.threadId,
+              runId: run?.id ?? null,
+              disposition,
+              summary: assistant?.text ?? null,
+            };
+          }),
+          Effect.mapError((error) => runError(errorDetail(error, "The run did not launch."))),
+        );
+    return { interrupt, confirmLaunch, launch };
   }),
 );
 
@@ -182,6 +276,101 @@ const stamped = Effect.map(DateTime.now, DateTime.formatIso);
 
 const projectIdOf = (state: BoardSequence): string | null =>
   "intake" in state ? state.intake.projectId : null;
+
+const claimText = (value: string | null, fallback: string): string => {
+  const trimmed = (value ?? "").trim().slice(0, 8_000);
+  return trimmed.length > 0 ? trimmed : fallback;
+};
+
+const evidenceRef = (threadId: string): string => {
+  const ref = `thread:${threadId}`;
+  return /^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(ref) && ref.length <= 128 ? ref : "thread:t3";
+};
+
+const rejectedMove = (
+  detail: string,
+  state: BoardSequence,
+  ledger: KanbanMoveLedger,
+): KanbanMoveResult => ({ _tag: "Rejected", detail, state, ledger });
+
+/**
+ * Record start, then a terminal outcome when the run already finished.
+ * The card leaves Ready only after both events apply, in that order.
+ */
+const recordConfirmedRun = (input: {
+  readonly state: BoardSequence;
+  readonly taskId: string;
+  readonly threadId: string;
+  readonly disposition: BoardLaunchDisposition;
+  readonly summary: string | null;
+  readonly ledger: KanbanMoveLedger;
+}): Effect.Effect<KanbanMoveResult> =>
+  Effect.gen(function* () {
+    const queued =
+      input.state.phase === "assigned" || input.state.phase === "rework" ? input.state : null;
+    if (queued === null) {
+      return rejectedMove(
+        "In Progress starts from Ready only after a worker is assigned.",
+        input.state,
+        input.ledger,
+      );
+    }
+    const generation =
+      queued.phase === "assigned" ? queued.nextGeneration : queued.run.generation + 1;
+    const attemptId = queued.assignment.attemptId;
+    const started = yield* applyBoardWorkflowEvent(
+      queued,
+      { type: "start_execution" },
+      `start-${input.taskId}-${generation}`,
+      input.taskId,
+      input.ledger,
+    );
+    if (started._tag !== "Applied" || started.state.phase !== "executing") return started;
+    if (input.disposition === "active") return started;
+    const run = started.state.run;
+    const terminal =
+      input.disposition === "completed"
+        ? yield* applyBoardWorkflowEvent(
+            started.state,
+            {
+              type: "submit_completion",
+              completion: {
+                version: "v1",
+                taskId: input.taskId,
+                attemptId,
+                generation: run.generation,
+                leaseId: run.leaseId,
+                claimedOutcome: claimText(input.summary, "The run finished."),
+                artifactRevision: { type: "named", kind: "page", id: "t3-result" },
+                evidence: [{ kind: "readback", ref: evidenceRef(input.threadId) }],
+              },
+            },
+            `complete-${input.taskId}-${run.generation}`,
+            input.taskId,
+            started.ledger,
+          )
+        : yield* applyBoardWorkflowEvent(
+            started.state,
+            {
+              type: "fail",
+              failure: {
+                taskId: input.taskId,
+                attemptId,
+                generation: run.generation,
+                leaseId: run.leaseId,
+                blocker: {
+                  summary: claimText(input.summary, "The run failed."),
+                  ownerId: queued.assignment.workerId,
+                  nextAction: "Review the thread, then retry or reassign the task.",
+                },
+              },
+            },
+            `fail-${input.taskId}-${run.generation}`,
+            input.taskId,
+            started.ledger,
+          );
+    return terminal._tag === "Applied" ? terminal : started;
+  });
 
 const publicMove = (result: KanbanMoveResult) =>
   result._tag === "Applied"
@@ -333,7 +522,7 @@ export const layer = Layer.unwrap(
       yield* authorize(AuthOrchestrationReadScope);
       return yield* hub.events;
     }).pipe(Effect.catchTags(authResponse));
-    const cardsNow = () => decodeAdapterBoard(hub.snapshot()) ?? [];
+    const cardsNow = () => decodeAdapterBoardWire(hub.snapshot()) ?? [];
     const commitCard = (card: AdapterBoardCard) => {
       const current = cardsNow();
       const next = current.some((item) => item.taskId === card.taskId)
@@ -407,6 +596,8 @@ export const layer = Layer.unwrap(
             ledger,
           };
           const asked = yield* requestKanbanMove(decoded.state, requestInput);
+          let launchedThread = card.threadId;
+          let launchedRun = card.runId ?? null;
           const outcome =
             asked._tag === "NeedsInterrupt"
               ? yield* Effect.gen(function* () {
@@ -450,13 +641,81 @@ export const layer = Layer.unwrap(
                   }
                   return yield* commitInterruptedMove(decoded.state, requestInput);
                 })
-              : asked;
+              : asked._tag === "NeedsLaunch"
+                ? yield* Effect.gen(function* () {
+                    const queued = decoded.state;
+                    if (queued.phase !== "assigned" && queued.phase !== "rework") {
+                      return rejectedMove(
+                        "In Progress starts from Ready only after a worker is assigned.",
+                        queued,
+                        ledger,
+                      );
+                    }
+                    const projectId = projectIdOf(queued);
+                    if (projectId === null) {
+                      return rejectedMove(
+                        "This card has no project, so the run cannot be launched.",
+                        queued,
+                        ledger,
+                      );
+                    }
+                    const launched = yield* asRun(
+                      runs.launch({
+                        idempotencyKey: executionLaunchKey(taskId, queued.assignment.attemptId),
+                        projectId,
+                        title: card.title,
+                        prompt: renderPrompt(queued.intake, queued.assignment.contextPackage),
+                        model: queued.assignment.implementerModel.model,
+                        instanceId: T3_LAUNCH_DEFAULTS.instanceId,
+                        contextPackage: queued.assignment.contextPackage,
+                      }),
+                    );
+                    if (launched._tag === "No") {
+                      return rejectedMove(launched.detail, queued, ledger);
+                    }
+                    const runId = launched.value.runId;
+                    if (runId === null) {
+                      return rejectedMove(
+                        "Launch did not return a run, so the card stays Ready.",
+                        queued,
+                        ledger,
+                      );
+                    }
+                    const confirmed = yield* asRun(
+                      runs.confirmLaunch({
+                        projectId,
+                        threadId: launched.value.threadId,
+                        runId,
+                      }),
+                    );
+                    if (confirmed._tag === "No") {
+                      return rejectedMove(confirmed.detail, queued, ledger);
+                    }
+                    if (confirmed.value === "settled" && launched.value.disposition === "active") {
+                      return rejectedMove(
+                        "That run already stopped. Resume it before marking In Progress.",
+                        queued,
+                        ledger,
+                      );
+                    }
+                    launchedThread = launched.value.threadId;
+                    launchedRun = runId;
+                    return yield* recordConfirmedRun({
+                      state: queued,
+                      taskId,
+                      threadId: launched.value.threadId,
+                      disposition: launched.value.disposition,
+                      summary: launched.value.summary,
+                      ledger,
+                    });
+                  })
+                : asked;
           if (outcome._tag !== "Applied") return json(409, publicMove(outcome));
           const saved = yield* persistApplied(outcome, card, {
             taskId,
             title: card.title,
-            threadId: card.threadId,
-            runId: card.runId ?? null,
+            threadId: launchedThread,
+            runId: launchedRun,
           });
           if (saved !== "stored") {
             return json(500, { detail: "The workflow state could not be stored." });

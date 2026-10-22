@@ -20,38 +20,58 @@ const card = (taskId: string, title: string, revision = 0) =>
     },
   ]);
 
-it.effect("upserts cards by task id and leaves the others", () =>
+it.effect("updates metadata by task id and refuses a new card", () =>
   Effect.sync(() => {
     const hub = makeAdapterBoardHub();
     assert.equal(hub.upsert("nope"), "invalid");
     assert.strictEqual(decodeAdapterBoard(hub.snapshot())?.length, 0);
+    assert.equal(hub.upsert(card("task-a", "First")), "forbidden");
 
-    assert.equal(hub.upsert(card("task-a", "First")), "ok");
-    assert.equal(hub.upsert(card("task-b", "Second")), "ok");
+    assert.equal(
+      hub.replace(
+        encodeAdapterBoardWire([
+          {
+            taskId: "task-a",
+            title: "First",
+            state: { phase: "idle" },
+            threadId: null,
+            runId: null,
+            revision: 1,
+            updatedAt: at,
+          },
+          {
+            taskId: "task-b",
+            title: "Second",
+            state: { phase: "idle" },
+            threadId: null,
+            runId: null,
+            revision: 1,
+            updatedAt: at,
+          },
+        ]),
+      ),
+      true,
+    );
     assert.equal(hub.upsert("[]"), "ok");
-    const both = decodeAdapterBoard(hub.snapshot());
     assert.deepStrictEqual(
-      both?.map((item) => item.taskId),
+      decodeAdapterBoard(hub.snapshot())?.map((item) => item.taskId),
       ["task-a", "task-b"],
     );
 
-    const storedRevision = decodeAdapterBoard(hub.snapshot())?.find(
-      (item) => item.taskId === "task-a",
-    )?.revision;
-    assert.equal(hub.upsert(card("task-a", "Updated", storedRevision)), "ok");
+    assert.equal(hub.upsert(card("task-a", "Updated", 1)), "ok");
     const updated = decodeAdapterBoard(hub.snapshot());
     assert.deepStrictEqual(
-      updated?.map((item) => [item.taskId, item.title]),
+      updated?.map((item) => [item.taskId, item.title, item.revision]),
       [
-        ["task-a", "Updated"],
-        ["task-b", "Second"],
+        ["task-a", "Updated", 2],
+        ["task-b", "Second", 1],
       ],
     );
 
     assert.equal(hub.upsert("nope"), "invalid");
     assert.strictEqual(decodeAdapterBoard(hub.snapshot())?.length, 2);
 
-    assert.equal(hub.replace(card("task-c", "Only")), true);
+    assert.equal(hub.replace(card("task-c", "Only", 1)), true);
     assert.deepStrictEqual(
       decodeAdapterBoard(hub.snapshot())?.map((item) => item.taskId),
       ["task-c"],
@@ -74,7 +94,7 @@ const rawCard = (patch: Record<string, unknown>) =>
 it.effect("rejects an empty id, a blank title, and a timestamp that is not RFC3339 Z", () =>
   Effect.sync(() => {
     const hub = makeAdapterBoardHub();
-    assert.equal(hub.upsert(card("task-a", "First")), "ok");
+    assert.equal(hub.replace(card("task-a", "First", 1)), true);
     for (const payload of [
       rawCard({ taskId: "" }),
       rawCard({ taskId: " has space" }),
@@ -90,6 +110,22 @@ it.effect("rejects an empty id, a blank title, and a timestamp that is not RFC33
       assert.equal(hub.upsert(payload), "invalid");
     }
     assert.equal(hub.upsert(rawCard({ updatedAt: "2026-10-21T18:00:00.000Z", revision: 1 })), "ok");
+    const runtimeRunId =
+      "run:thread:thread%3Aproject%3A65a6f28e-e24a-4dee-81c1-d79c8b80a3f3%3Aac08f581-66bd-486e-978d-d4b6371c884e:ordinal:1";
+    assert.equal(
+      hub.upsert(
+        rawCard({
+          revision: 2,
+          threadId: "thread:project:65a6f28e-e24a-4dee-81c1-d79c8b80a3f3:ac08f581",
+          runId: runtimeRunId,
+        }),
+      ),
+      "ok",
+    );
+    assert.strictEqual(
+      decodeAdapterBoard(hub.snapshot())?.find((item) => item.taskId === "task-a")?.runId,
+      runtimeRunId,
+    );
     assert.deepStrictEqual(
       decodeAdapterBoard(hub.snapshot())?.map((item) => item.taskId),
       ["task-a"],
@@ -97,10 +133,10 @@ it.effect("rejects an empty id, a blank title, and a timestamp that is not RFC33
   }),
 );
 
-it.effect("rejects a stale revision and a snapshot that changes phase", () =>
+it.effect("rejects a stale revision and a snapshot that creates a phase", () =>
   Effect.gen(function* () {
     const hub = makeAdapterBoardHub();
-    assert.equal(hub.upsert(card("task-a", "First")), "ok");
+    assert.equal(hub.replace(card("task-a", "First", 1)), true);
     assert.equal(hub.upsert(card("task-a", "Stale title", 0)), "stale");
     assert.strictEqual(decodeAdapterBoard(hub.snapshot())?.[0]?.title, "First");
 
@@ -131,31 +167,34 @@ it.effect("rejects a stale revision and a snapshot that changes phase", () =>
       },
     ]);
     assert.equal(hub.upsert(done), "forbidden");
+
+    const assigned = yield* applySequence(happyPathEvents.slice(0, 3));
+    const acknowledged = yield* applySequence(happyPathEvents.slice(0, 2));
+    for (const [taskId, title, state] of [
+      ["task-requested", "Backlog", { phase: "requested" as const, intake: intakeV2Example }],
+      ["task-acked", "Acknowledged", acknowledged],
+      ["task-ready", "Queued", assigned],
+    ] as const) {
+      assert.equal(
+        hub.upsert(
+          encodeAdapterBoardWire([
+            {
+              taskId,
+              title,
+              state,
+              threadId: null,
+              runId: null,
+              revision: 0,
+              updatedAt: at,
+            },
+          ]),
+        ),
+        "forbidden",
+      );
+    }
     assert.deepStrictEqual(
       decodeAdapterBoard(hub.snapshot())?.map((item) => item.taskId),
       ["task-a"],
-    );
-
-    const assigned = yield* applySequence(happyPathEvents.slice(0, 3));
-    assert.equal(
-      hub.upsert(
-        encodeAdapterBoardWire([
-          {
-            taskId: "task-ready",
-            title: "Queued",
-            state: assigned,
-            threadId: null,
-            runId: null,
-            revision: 0,
-            updatedAt: at,
-          },
-        ]),
-      ),
-      "ok",
-    );
-    assert.deepStrictEqual(
-      decodeAdapterBoard(hub.snapshot())?.map((item) => item.taskId),
-      ["task-a", "task-ready"],
     );
   }),
 );

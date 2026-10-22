@@ -17,21 +17,29 @@ import * as Queue from "effect/Queue";
 
 import { encodeAdapterBoard, type AdapterBoardCard } from "./board.ts";
 
+// T3 thread and run ids are entity ids. They contain ":" and "%" and can
+// exceed a contract id, so the board stores them as runtime ids.
+const RuntimeId = Schema.String.check(
+  Schema.isMinLength(1),
+  Schema.isMaxLength(512),
+  Schema.makeFilter((value: string) =>
+    value === value.trim() && !/\s/u.test(value) ? true : "Expected a runtime id.",
+  ),
+);
+
 const WireCards = Schema.Array(
   Schema.Struct({
     taskId: ContractId,
     title: ContractText,
     state: SequenceState,
-    threadId: Schema.NullOr(ContractId),
-    runId: Schema.NullOr(ContractId).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
+    threadId: Schema.NullOr(RuntimeId),
+    runId: Schema.NullOr(RuntimeId).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
     revision: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)).pipe(
       Schema.withDecodingDefault(Effect.succeed(0)),
     ),
     updatedAt: IsoDateTime,
   }),
 );
-
-const SNAPSHOT_PHASES = new Set(["idle", "requested", "acknowledged", "assigned"]);
 
 export type AdapterBoardWrite = "ok" | "invalid" | "stale" | "forbidden";
 
@@ -60,8 +68,9 @@ export interface AdapterBoardHub {
   /** Replace the snapshot. Used when a saved file is loaded. */
   readonly replace: (text: string) => boolean;
   /**
-   * Insert or update each card by task id. A stale revision or a phase change
-   * writes nothing. Cards missing from the payload stay.
+   * Update metadata on cards that are already stored. A new card, a stale
+   * revision, or a phase change writes nothing. Cards missing from the payload
+   * stay. Intake, acknowledge, and assign arrive as workflow events.
    */
   readonly upsert: (text: string) => AdapterBoardWrite;
   readonly events: Effect.Effect<HttpServerResponse.HttpServerResponse, never, Scope.Scope>;
@@ -80,6 +89,10 @@ const decodeCards = (text: string): readonly WireCard[] | null => {
     return null;
   }
 };
+
+/** Strict decode. The loose board decoder does not turn model strings back into model objects. */
+export const decodeAdapterBoardWire = (text: string): readonly AdapterBoardCard[] | null =>
+  decodeCards(text);
 
 /** In-memory snapshot and server-sent-event fanout. Callers authenticate first. */
 export const makeAdapterBoardHub = (): AdapterBoardHub => {
@@ -110,12 +123,7 @@ export const makeAdapterBoardHub = (): AdapterBoardHub => {
       const planned = new Map<string, WireCard>();
       for (const card of incoming) {
         const previous = stored.get(card.taskId);
-        if (previous === undefined) {
-          if (!SNAPSHOT_PHASES.has(card.state.phase)) return "forbidden";
-          if (card.revision !== 0) return "stale";
-          planned.set(card.taskId, { ...card, revision: 1 });
-          continue;
-        }
+        if (previous === undefined) return "forbidden";
         if (card.revision !== previous.revision) return "stale";
         if (!sameState(card.state, previous.state)) return "forbidden";
         const changed =

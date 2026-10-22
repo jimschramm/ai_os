@@ -352,6 +352,7 @@ it.effect("lists project ids and publishes the launched task to the server board
         listProviderModels: () => Effect.succeed(CATALOG),
         publishBoard: real.publishBoard,
         publishEvent: real.publishEvent,
+        readBoard: real.readBoard,
         interrupt: () => Effect.die("interrupt is unused"),
         continueRun: () => Effect.die("continue is unused"),
         launch: (input) => {
@@ -363,8 +364,8 @@ it.effect("lists project ids and publishes the launched task to the server board
           return Effect.succeed({
             threadId: "t3-thread-1",
             runId: "run-1",
-            status: reads < 3 ? "running" : "completed",
-            text: reads < 3 ? "draft" : "done",
+            status: reads < 4 ? "running" : "completed",
+            text: reads < 4 ? "draft" : "done",
             revision: null,
           });
         },
@@ -473,6 +474,7 @@ it.effect("lists projects and launches in one run", () =>
       publishBoard: (cards) =>
         Effect.succeed(cards.map((card) => ({ ...card, revision: (card.revision ?? 0) + 1 }))),
       publishEvent: () => Effect.succeed({ revision: 1 }),
+      readBoard: () => Effect.succeed([]),
       interrupt: () => Effect.die("interrupt is unused"),
       continueRun: () => Effect.die("continue is unused"),
       launch: () => {
@@ -540,6 +542,7 @@ it.effect("launches the offered default when the configured model is gpt-5.4", (
       publishBoard: (cards) =>
         Effect.succeed(cards.map((card) => ({ ...card, revision: (card.revision ?? 0) + 1 }))),
       publishEvent: () => Effect.succeed({ revision: 1 }),
+      readBoard: () => Effect.succeed([]),
       interrupt: () => Effect.die("interrupt is unused"),
       continueRun: () => Effect.die("continue is unused"),
       launch: (input) => {
@@ -597,6 +600,7 @@ it.effect("rejects a model the provider does not offer and lists the valid ones"
       publishBoard: (cards) =>
         Effect.succeed(cards.map((card) => ({ ...card, revision: (card.revision ?? 0) + 1 }))),
       publishEvent: () => Effect.succeed({ revision: 1 }),
+      readBoard: () => Effect.succeed([]),
       interrupt: () => Effect.die("interrupt is unused"),
       continueRun: () => Effect.die("continue is unused"),
       launch: () => {

@@ -117,7 +117,7 @@ export interface T3LaunchResult {
 export interface T3ThreadView {
   readonly threadId: string;
   readonly runId: string | null;
-  readonly status: "running" | "completed" | "interrupted" | "idle";
+  readonly status: "running" | "completed" | "interrupted" | "failed" | "idle";
   readonly text: string | null;
   readonly revision: string | null;
   readonly inputTokens?: number;
@@ -180,6 +180,7 @@ export interface T3LocalClient {
   readonly publishEvent: (
     input: T3BoardEvent,
   ) => Effect.Effect<{ readonly revision: number }, GrokT3Error>;
+  readonly readBoard: () => Effect.Effect<readonly AdapterBoardCard[], GrokT3Error>;
   readonly listProjectIds: () => Effect.Effect<readonly T3ProjectSummary[], GrokT3Error>;
   readonly listProviderModels: () => Effect.Effect<T3ModelCatalog, GrokT3Error>;
 }
@@ -248,12 +249,13 @@ const viewFromProjection = (
       ? "idle"
       : run.status === "completed"
         ? "completed"
-        : run.status === "interrupted" ||
-            run.status === "failed" ||
-            run.status === "cancelled" ||
-            run.status === "rolled_back"
-          ? "interrupted"
-          : "running";
+        : run.status === "failed"
+          ? "failed"
+          : run.status === "interrupted" ||
+              run.status === "cancelled" ||
+              run.status === "rolled_back"
+            ? "interrupted"
+            : "running";
   const assistant = projection.messages.findLast(
     (message) => message.role === "assistant" && message.text.length > 0,
   );
@@ -613,6 +615,16 @@ export const wsT3LocalClient = (options: T3ClientOptions): T3LocalClient => {
         return { revision: parsed.revision };
       }),
     );
+  const readBoard = () =>
+    http(
+      Effect.gen(function* () {
+        const response = yield* responseFor(() =>
+          HttpClientRequest.get(`${origin}${ADAPTER_BOARD_PATH}`),
+        );
+        if (response.status >= 400) return yield* statusError(response.status, "read the board");
+        return yield* readCards(yield* response.text);
+      }),
+    );
   const listProjectIds = () =>
     http(
       Effect.gen(function* () {
@@ -677,6 +689,7 @@ export const wsT3LocalClient = (options: T3ClientOptions): T3LocalClient => {
     continueRun,
     publishBoard,
     publishEvent,
+    readBoard,
     listProjectIds,
     listProviderModels,
   };
