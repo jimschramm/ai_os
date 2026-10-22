@@ -126,6 +126,144 @@ const artifactRevision = (view: T3ThreadView) =>
     ? { type: "git" as const, sha: view.revision }
     : { type: "named" as const, kind: "page" as const, id: "t3-result" };
 
+const claimText = (value: string | null, fallback: string): string => {
+  const trimmed = (value ?? "").trim().slice(0, 8_000);
+  return trimmed.length > 0 ? trimmed : fallback;
+};
+
+export interface ObservationEvent {
+  readonly idempotencyKey: string;
+  readonly event: SequenceEvent;
+}
+
+/**
+ * Progress, usage, completion, and failure for one executing run.
+ * A missing or interrupted view lapses only when the caller still owns the heartbeat.
+ */
+export const observationEvents = (input: {
+  readonly taskId: string;
+  readonly threadId: string;
+  readonly state: SequenceState;
+  readonly view: T3ThreadView | null;
+  readonly allowLapse: boolean;
+  readonly model: string;
+  readonly workerId: string;
+}): readonly ObservationEvent[] => {
+  if (input.state.phase !== "executing") return [];
+  const run = input.state.run;
+  const attemptId = input.state.assignment.attemptId;
+  const taskId = input.taskId;
+  if (input.view === null || input.view.status === "interrupted") {
+    if (!input.allowLapse) return [];
+    return [
+      {
+        idempotencyKey: `lapse-${taskId}-${run.generation}`,
+        event: {
+          type: "heartbeat_lapsed",
+          lapse: {
+            version: "v1",
+            taskId,
+            attemptId,
+            generation: run.generation,
+            leaseId: run.leaseId,
+          },
+        },
+      },
+    ];
+  }
+  const view = input.view;
+  if (view.status === "running") {
+    const events: ObservationEvent[] = [];
+    if (run.progress?.status !== "working") {
+      events.push({
+        idempotencyKey: `progress-${taskId}-${run.generation}-working`,
+        event: {
+          type: "report_progress",
+          report: {
+            version: "v1",
+            taskId,
+            attemptId,
+            generation: run.generation,
+            leaseId: run.leaseId,
+            status: "working",
+            blockers: [],
+            partialArtifacts: [],
+          },
+        },
+      });
+    }
+    if (
+      run.usage.length === 0 &&
+      view.inputTokens !== undefined &&
+      view.outputTokens !== undefined
+    ) {
+      events.push({
+        idempotencyKey: `usage-${taskId}-${run.generation}`,
+        event: {
+          type: "report_usage",
+          generation: run.generation,
+          leaseId: run.leaseId,
+          measurement: {
+            kind: "reported_tokens",
+            inputTokens: view.inputTokens,
+            outputTokens: view.outputTokens,
+            attribution: {
+              projectId: input.state.intake.projectId,
+              taskId,
+              attemptId,
+              agentId: input.workerId,
+              platform: "t3",
+              provider: "openai",
+              model: { model: input.model },
+            },
+          },
+        },
+      });
+    }
+    return events;
+  }
+  if (view.status === "failed") {
+    return [
+      {
+        idempotencyKey: `fail-${taskId}-${run.generation}`,
+        event: {
+          type: "fail",
+          failure: {
+            taskId,
+            attemptId,
+            generation: run.generation,
+            leaseId: run.leaseId,
+            blocker: {
+              summary: claimText(view.text, "The run failed."),
+              ownerId: input.state.assignment.workerId,
+              nextAction: "Review the thread, then retry or reassign the task.",
+            },
+          },
+        },
+      },
+    ];
+  }
+  if (view.status !== "completed") return [];
+  return [
+    {
+      idempotencyKey: `complete-${taskId}-${run.generation}`,
+      event: {
+        type: "submit_completion",
+        completion: {
+          version: "v1",
+          taskId,
+          attemptId,
+          generation: run.generation,
+          leaseId: run.leaseId,
+          claimedOutcome: claimText(view.text, "T3 thread completed."),
+          artifactRevision: artifactRevision(view),
+          evidence: [{ kind: "readback", ref: evidenceRefFor(input.threadId) }],
+        },
+      },
+    },
+  ];
+};
+
 export interface GrokT3Adapter extends WorkerAdapter<AttemptSession, AdapterBoardCard> {
   readonly record: (input: {
     readonly taskId: string;
@@ -283,6 +421,7 @@ export const createGrokT3Adapter = (input: {
     assignmentId: `${taskId}-assignment-1`,
     workerId,
     implementerModel: { model },
+    instanceId: resolvedInstanceId,
     scope: context.authorizationScope,
     contextPackage: context,
   });
@@ -363,10 +502,27 @@ export const createGrokT3Adapter = (input: {
       );
     });
 
-  const claimText = (value: string | null, fallback: string): string => {
-    const trimmed = (value ?? "").trim().slice(0, 8_000);
-    return trimmed.length > 0 ? trimmed : fallback;
-  };
+  const applyObservation = (
+    session: AttemptSession,
+    view: T3ThreadView | null,
+    allowLapse: boolean,
+  ) =>
+    Effect.gen(function* () {
+      const planned = observationEvents({
+        taskId: session.taskId,
+        threadId: session.threadId ?? "",
+        state: session.state,
+        view,
+        allowLapse,
+        model,
+        workerId,
+      });
+      let current = session;
+      for (const item of planned) {
+        current = yield* saveEvent(current, item.event, item.idempotencyKey);
+      }
+      return current;
+    });
   const launch = (taskId: string) =>
     Effect.gen(function* () {
       yield* requireModel;
@@ -381,7 +537,7 @@ export const createGrokT3Adapter = (input: {
       if (session.threadId === null) {
         const intake = session.state.intake;
         const launched = yield* input.client.launch({
-          idempotencyKey: executionLaunchKey(taskId, attemptId),
+          idempotencyKey: executionLaunchKey(taskId, attemptId, session.state.nextGeneration),
           projectId: intake.projectId,
           title: session.title,
           model,
@@ -414,49 +570,8 @@ export const createGrokT3Adapter = (input: {
           `start-${taskId}-${generation}`,
         );
       }
-      if (session.state.phase !== "executing" || view === null) return session;
-      const run = session.state.run;
-      if (view.status === "completed") {
-        const outcome = claimText(view.text, "T3 thread completed.");
-        return yield* saveEvent(
-          session,
-          {
-            type: "submit_completion",
-            completion: {
-              version: "v1",
-              taskId,
-              attemptId,
-              generation: run.generation,
-              leaseId: run.leaseId,
-              claimedOutcome: outcome,
-              artifactRevision: artifactRevision(view),
-              evidence: [{ kind: "readback", ref: evidenceRefFor(session.threadId ?? "") }],
-            },
-          },
-          `complete-${taskId}-${run.generation}`,
-        );
-      }
-      if (view.status === "failed") {
-        return yield* saveEvent(
-          session,
-          {
-            type: "fail",
-            failure: {
-              taskId,
-              attemptId,
-              generation: run.generation,
-              leaseId: run.leaseId,
-              blocker: {
-                summary: claimText(view.text, "The run failed."),
-                ownerId: session.state.assignment.workerId,
-                nextAction: "Review the thread, then retry or reassign the task.",
-              },
-            },
-          },
-          `fail-${taskId}-${run.generation}`,
-        );
-      }
-      return session;
+      if (session.state.phase !== "executing") return session;
+      return yield* applyObservation(session, view, false);
     });
 
   const reportProgress = (taskId: string, report: ProgressReportV1) =>
@@ -487,118 +602,7 @@ export const createGrokT3Adapter = (input: {
       if (view !== null && view.runId !== null && view.runId !== session.runId) {
         session = yield* saveSnapshot({ ...session, runId: view.runId, updatedAt: input.clock() });
       }
-      if (view === null || view.status === "interrupted") {
-        if (pulled.unread || session.state.phase !== "executing") return session;
-        const run = session.state.run;
-        return yield* saveEvent(
-          session,
-          {
-            type: "heartbeat_lapsed",
-            lapse: {
-              version: "v1",
-              taskId,
-              attemptId: session.state.assignment.attemptId,
-              generation: run.generation,
-              leaseId: run.leaseId,
-            },
-          },
-          `lapse-${taskId}-${run.generation}`,
-        );
-      }
-      if (session.state.phase !== "executing") return session;
-      const run = session.state.run;
-      const attemptId = session.state.assignment.attemptId;
-      if (view.status === "running") {
-        if (run.progress?.status !== "working") {
-          session = yield* saveEvent(
-            session,
-            {
-              type: "report_progress",
-              report: {
-                version: "v1",
-                taskId,
-                attemptId,
-                generation: run.generation,
-                leaseId: run.leaseId,
-                status: "working",
-                blockers: [],
-                partialArtifacts: [],
-              },
-            },
-            uniqueEventKey("progress", taskId),
-          );
-        }
-        if (
-          session.state.phase === "executing" &&
-          session.state.run.usage.length === 0 &&
-          view.inputTokens !== undefined &&
-          view.outputTokens !== undefined
-        ) {
-          session = yield* saveEvent(
-            session,
-            {
-              type: "report_usage",
-              generation: session.state.run.generation,
-              leaseId: session.state.run.leaseId,
-              measurement: {
-                kind: "reported_tokens",
-                inputTokens: view.inputTokens,
-                outputTokens: view.outputTokens,
-                attribution: {
-                  projectId: session.state.intake.projectId,
-                  taskId,
-                  attemptId,
-                  agentId: workerId,
-                  platform: "t3",
-                  provider: "openai",
-                  model: { model },
-                },
-              },
-            },
-            uniqueEventKey("usage", taskId),
-          );
-        }
-        return session;
-      }
-      if (view.status === "failed") {
-        return yield* saveEvent(
-          session,
-          {
-            type: "fail",
-            failure: {
-              taskId,
-              attemptId,
-              generation: run.generation,
-              leaseId: run.leaseId,
-              blocker: {
-                summary: claimText(view.text, "The run failed."),
-                ownerId: session.state.assignment.workerId,
-                nextAction: "Review the thread, then retry or reassign the task.",
-              },
-            },
-          },
-          `fail-${taskId}-${run.generation}`,
-        );
-      }
-      if (view.status !== "completed") return session;
-      const outcome = claimText(view.text, "T3 thread completed.");
-      return yield* saveEvent(
-        session,
-        {
-          type: "submit_completion",
-          completion: {
-            version: "v1",
-            taskId,
-            attemptId,
-            generation: run.generation,
-            leaseId: run.leaseId,
-            claimedOutcome: outcome,
-            artifactRevision: artifactRevision(view),
-            evidence: [{ kind: "readback", ref: evidenceRefFor(threadId) }],
-          },
-        },
-        `complete-${taskId}-${run.generation}`,
-      );
+      return yield* applyObservation(session, view, !pulled.unread);
     });
 
   const recover = (taskId: string) =>

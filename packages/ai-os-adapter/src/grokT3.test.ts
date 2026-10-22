@@ -650,6 +650,9 @@ it.effect("fingerprints the provider launch will use", () =>
 
       const started = yield* grok.launch(grokRecorded.taskId);
       assert.strictEqual(started.threadId, "t3-thread-1");
+      if (grokRecorded.state.phase === "assigned") {
+        assert.strictEqual(grokRecorded.state.assignment.instanceId, "grok");
+      }
       assert.strictEqual(fake.instanceId("t3-thread-1"), "grok");
       assert.strictEqual(fake.model("t3-thread-1"), "gpt-5.4");
     }),
@@ -814,7 +817,7 @@ it.effect("reuses the server thread when the local record lost the id", () =>
       });
       const recorded = yield* record(adapter);
       const request = {
-        idempotencyKey: executionLaunchKey(recorded.taskId, `${recorded.taskId}-attempt-1`),
+        idempotencyKey: executionLaunchKey(recorded.taskId, `${recorded.taskId}-attempt-1`, 1),
         projectId: intakeV2Example.projectId,
         title: recorded.title,
         prompt: "already sent",

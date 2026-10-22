@@ -10,12 +10,20 @@ import {
   encodeAdapterBoardWire,
   makeAdapterBoardHub,
 } from "@t3tools/ai-os-adapter/board-hub";
-import { launchCommandId, renderPrompt, T3_LAUNCH_DEFAULTS } from "@t3tools/ai-os-adapter";
+import {
+  launchCommandId,
+  observationEvents,
+  renderPrompt,
+  T3_LAUNCH_DEFAULTS,
+  threadViewFromProjection,
+  type T3ThreadView,
+} from "@t3tools/ai-os-adapter";
 import {
   applyBoardWorkflowEvent,
   commitInterruptedMove,
   decodeSequenceEvent,
   decodeSequenceState,
+  executionGeneration,
   executionLaunchKey,
   openBoardTask,
   requestKanbanMove,
@@ -29,6 +37,7 @@ import {
   AuthOrchestrationOperateScope,
   AuthOrchestrationReadScope,
   CommandId,
+  MessageId,
   OrchestrationMessageContext,
   ProjectId,
   ProviderInstanceId,
@@ -63,6 +72,7 @@ import * as ThreadLaunch from "./orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadManagement from "./orchestration-v2/ThreadManagementService.ts";
 
 const BOARD_FILE = "ai-os-board.json";
+const BOARD_FOLLOW_INTERVAL = "1 second";
 const COLUMNS = ["Backlog", "Ready", "Running", "Review", "Blocked", "Done"] as const;
 
 type BoardSequence = SequenceState;
@@ -119,6 +129,17 @@ export class BoardRuns extends Context.Service<
       readonly instanceId: string;
       readonly contextPackage: ContextPackageSnapshotV1;
     }) => Effect.Effect<BoardLaunchResult, BoardRunError>;
+    readonly continueRun: (input: {
+      readonly projectId: string;
+      readonly threadId: string;
+      readonly runId: string;
+      readonly commandId: string;
+      readonly messageId: string;
+      readonly text: string;
+    }) => Effect.Effect<{ readonly runId: string | null }, BoardRunError>;
+    readonly watchThread: (threadId: string) => Effect.Effect<T3ThreadView | null, BoardRunError>;
+    /** Production follows launched runs. Tests leave this off so a tick cannot race the assertion. */
+    readonly followRuns: boolean;
   }
 >()("t3/aiOsBoard/BoardRuns") {}
 
@@ -234,7 +255,31 @@ export const liveRuns = Layer.effect(
           }),
           Effect.mapError((error) => runError(errorDetail(error, "The run did not launch."))),
         );
-    return { interrupt, confirmLaunch, launch };
+    const continueRun: BoardRuns["Service"]["continueRun"] = (input) =>
+      threads
+        .dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make(input.commandId),
+          createdBy: "user",
+          creationSource: "web",
+          threadId: ThreadId.make(input.threadId),
+          messageId: MessageId.make(input.messageId),
+          text: input.text,
+          attachments: [],
+          manualContinuationOfRunId: RunId.make(input.runId),
+          dispatchMode: { type: "start_immediately" },
+        })
+        .pipe(
+          Effect.andThen(threads.getThreadProjection(ThreadId.make(input.threadId))),
+          Effect.map((projection) => ({ runId: projection.runs.at(-1)?.id ?? null })),
+          Effect.mapError((error) => runError(errorDetail(error, "The run did not continue."))),
+        );
+    const watchThread: BoardRuns["Service"]["watchThread"] = (threadId) =>
+      threads.getThreadProjection(ThreadId.make(threadId)).pipe(
+        Effect.map((projection) => threadViewFromProjection(threadId, projection)),
+        Effect.mapError((error) => runError(errorDetail(error, "The thread could not be read."))),
+      );
+    return { interrupt, confirmLaunch, launch, continueRun, watchThread, followRuns: true };
   }),
 );
 
@@ -568,6 +613,55 @@ export const layer = Layer.unwrap(
         );
         return "stored" as const;
       });
+    const followLaunched = (
+      outcome: KanbanMoveResult,
+      taskId: string,
+      threadId: string | null,
+      runId: string | null,
+    ) =>
+      Effect.gen(function* () {
+        if (
+          outcome._tag !== "Applied" ||
+          outcome.state.phase !== "executing" ||
+          threadId === null
+        ) {
+          return { outcome, runId };
+        }
+        const executing = outcome.state;
+        const view = yield* runs
+          .watchThread(threadId)
+          .pipe(Effect.catchTags({ BoardRunError: () => Effect.succeed(null) }));
+        if (view === null) return { outcome, runId };
+        const planned = observationEvents({
+          taskId,
+          threadId,
+          state: executing,
+          view,
+          allowLapse: view.status === "interrupted",
+          model: executing.assignment.implementerModel.model,
+          workerId: executing.assignment.workerId,
+        });
+        let state: BoardSequence = executing;
+        let book: KanbanMoveLedger = outcome.ledger;
+        let changed = outcome.changed;
+        for (const item of planned) {
+          const next: KanbanMoveResult = yield* applyBoardWorkflowEvent(
+            state,
+            item.event,
+            item.idempotencyKey,
+            taskId,
+            book,
+          );
+          if (next._tag !== "Applied") break;
+          state = next.state;
+          book = next.ledger;
+          changed = changed || next.changed;
+        }
+        return {
+          outcome: { _tag: "Applied" as const, state, ledger: book, changed },
+          runId: view.runId ?? runId,
+        };
+      });
     const move = Effect.gen(function* () {
       yield* authorize(AuthOrchestrationOperateScope);
       const request = yield* HttpServerRequest.HttpServerRequest;
@@ -661,12 +755,16 @@ export const layer = Layer.unwrap(
                     }
                     const launched = yield* asRun(
                       runs.launch({
-                        idempotencyKey: executionLaunchKey(taskId, queued.assignment.attemptId),
+                        idempotencyKey: executionLaunchKey(
+                          taskId,
+                          queued.assignment.attemptId,
+                          executionGeneration(queued),
+                        ),
                         projectId,
                         title: card.title,
                         prompt: renderPrompt(queued.intake, queued.assignment.contextPackage),
                         model: queued.assignment.implementerModel.model,
-                        instanceId: T3_LAUNCH_DEFAULTS.instanceId,
+                        instanceId: queued.assignment.instanceId ?? T3_LAUNCH_DEFAULTS.instanceId,
                         contextPackage: queued.assignment.contextPackage,
                       }),
                     );
@@ -709,20 +807,91 @@ export const layer = Layer.unwrap(
                       ledger,
                     });
                   })
-                : asked;
-          if (outcome._tag !== "Applied") return json(409, publicMove(outcome));
-          const saved = yield* persistApplied(outcome, card, {
+                : asked._tag === "NeedsRecover"
+                  ? yield* Effect.gen(function* () {
+                      const waiting = decoded.state;
+                      if (waiting.phase !== "recovery_pending") {
+                        return rejectedMove(
+                          "In Progress resumes from Blocked only after a run was interrupted.",
+                          waiting,
+                          ledger,
+                        );
+                      }
+                      const threadId = card.threadId;
+                      const runId = card.runId ?? null;
+                      if (threadId === null || runId === null) {
+                        return rejectedMove(
+                          "The interrupted task has no T3 run to continue.",
+                          waiting,
+                          ledger,
+                        );
+                      }
+                      const projectId = projectIdOf(waiting);
+                      if (projectId === null) {
+                        return rejectedMove(
+                          "This card has no project, so the run cannot be resumed.",
+                          waiting,
+                          ledger,
+                        );
+                      }
+                      const resolved = yield* applyBoardWorkflowEvent(
+                        waiting,
+                        {
+                          type: "resolve_recovery",
+                          command: {
+                            command: "resolve_recovery",
+                            outcome: "continue",
+                            idempotencyKey: `resume-${taskId}`,
+                            taskId,
+                            attemptId: waiting.assignment.attemptId,
+                          },
+                        },
+                        `resume-${taskId}`,
+                        taskId,
+                        ledger,
+                      );
+                      if (resolved._tag !== "Applied" || resolved.state.phase !== "assigned") {
+                        return resolved;
+                      }
+                      const generation = resolved.state.nextGeneration;
+                      const continued = yield* asRun(
+                        runs.continueRun({
+                          projectId,
+                          threadId,
+                          runId,
+                          commandId: `continue-${taskId}-${generation}`,
+                          messageId: `continue-msg-${taskId}-${generation}`,
+                          text: "Continue the interrupted run on this thread.",
+                        }),
+                      );
+                      if (continued._tag === "No") {
+                        return rejectedMove(continued.detail, waiting, ledger);
+                      }
+                      launchedThread = threadId;
+                      launchedRun = continued.value.runId ?? runId;
+                      return yield* applyBoardWorkflowEvent(
+                        resolved.state,
+                        { type: "start_execution" },
+                        `start-${taskId}-${generation}`,
+                        taskId,
+                        resolved.ledger,
+                      );
+                    })
+                  : asked;
+          const followed = yield* followLaunched(outcome, taskId, launchedThread, launchedRun);
+          if (followed.outcome._tag !== "Applied") return json(409, publicMove(followed.outcome));
+          const saved = yield* persistApplied(followed.outcome, card, {
             taskId,
             title: card.title,
             threadId: launchedThread,
-            runId: launchedRun,
+            runId: followed.runId,
           });
           if (saved !== "stored") {
             return json(500, { detail: "The workflow state could not be stored." });
           }
           return json(200, {
-            ...publicMove(outcome),
-            revision: (card.revision ?? 0) + (outcome.changed ? 1 : 0),
+            ...publicMove(followed.outcome),
+            revision: (card.revision ?? 0) + (followed.outcome.changed ? 1 : 0),
           });
         }),
       );
@@ -853,12 +1022,57 @@ export const layer = Layer.unwrap(
         ),
       ),
     );
+    const followExecuting = Effect.gen(function* () {
+      const open = cardsNow().filter(
+        (card) => card.state.phase === "executing" && card.threadId !== null,
+      );
+      for (const card of open) {
+        yield* writes.withPermits(1)(
+          Effect.gen(function* () {
+            const fresh = cardsNow().find((item) => item.taskId === card.taskId);
+            if (
+              fresh === undefined ||
+              fresh.state.phase !== "executing" ||
+              fresh.threadId === null
+            ) {
+              return;
+            }
+            const decoded = yield* decodeState(fresh.state);
+            if (decoded._tag === "Bad") return;
+            const followed = yield* followLaunched(
+              { _tag: "Applied", state: decoded.state, changed: false, ledger },
+              fresh.taskId,
+              fresh.threadId,
+              fresh.runId ?? null,
+            );
+            if (followed.outcome._tag !== "Applied" || !followed.outcome.changed) return;
+            yield* persistApplied(followed.outcome, fresh, {
+              taskId: fresh.taskId,
+              title: fresh.title,
+              threadId: fresh.threadId,
+              runId: followed.runId,
+            });
+          }),
+        );
+      }
+    });
+    const followLoop = followExecuting.pipe(
+      Effect.catch(() => Effect.void),
+      Effect.andThen(Effect.sleep(BOARD_FOLLOW_INTERVAL)),
+      Effect.forever,
+    );
     return Layer.mergeAll(
       HttpRouter.add("GET", ADAPTER_BOARD_PATH, snapshot),
       HttpRouter.add("POST", ADAPTER_BOARD_PATH, replace),
       HttpRouter.add("GET", ADAPTER_BOARD_EVENTS_PATH, events),
       HttpRouter.add("POST", ADAPTER_BOARD_MOVE_PATH, move),
       HttpRouter.add("POST", ADAPTER_BOARD_EVENT_PATH, workflowEvent),
+      Layer.effectDiscard(
+        Effect.gen(function* () {
+          if (!runs.followRuns) return;
+          yield* Effect.forkScoped(followLoop);
+        }),
+      ),
     );
   }),
 );

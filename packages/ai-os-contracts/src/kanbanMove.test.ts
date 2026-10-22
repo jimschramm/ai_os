@@ -6,6 +6,7 @@ import { assignmentExample, happyPathEvents, intakeExample, revisionOne } from "
 import {
   applyBoardWorkflowEvent,
   commitInterruptedMove,
+  executionLaunchKey,
   requestKanbanMove,
   type KanbanMoveLedger,
   type KanbanMoveResult,
@@ -185,7 +186,6 @@ it.effect("rejects the other illegal column moves and leaves the phase alone", (
       [rework, "Review"],
       [rework, "Blocked"],
       [rework, "Backlog"],
-      [blocked, "Running"],
       [blocked, "Ready"],
       [blocked, "Review"],
       [blocked, "Backlog"],
@@ -213,6 +213,18 @@ it.effect("does not start a second run when the same drop is repeated", () =>
     assert.strictEqual(reworkLaunch._tag, "NeedsLaunch");
     assert.strictEqual(reworkLaunch.state.phase, "rework");
     assert.deepStrictEqual(reworkLaunch.ledger, empty);
+    if (rework.phase === "rework") {
+      const generation = rework.run.generation + 1;
+      assert.strictEqual(generation, 2);
+      assert.strictEqual(
+        executionLaunchKey("task-usba-page", "attempt-1", generation),
+        "board-launch-task-usba-page-attempt-1-2",
+      );
+      assert.notStrictEqual(
+        executionLaunchKey("task-usba-page", "attempt-1", 1),
+        executionLaunchKey("task-usba-page", "attempt-1", generation),
+      );
+    }
 
     const first = applied(
       yield* applyBoardWorkflowEvent(
@@ -316,6 +328,10 @@ it.effect("queues a backlog card through acknowledge and pauses only through the
     );
     assert.strictEqual(landed.state.phase, "recovery_pending");
     assert.strictEqual(kanbanColumn(landed.state.phase), "Blocked");
+    const resume = yield* move(landed.state, "Running", "resume-1");
+    assert.strictEqual(resume._tag, "NeedsRecover");
+    assert.strictEqual(resume.state.phase, "recovery_pending");
+    assert.deepStrictEqual(resume.ledger, empty);
   }),
 );
 

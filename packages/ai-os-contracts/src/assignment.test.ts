@@ -11,6 +11,9 @@ it.effect("decodes an assignment whose context package is an exact snapshot", ()
     assert.strictEqual(assignment.contextPackage.repoCommit, exampleRepoCommit);
     assert.deepStrictEqual(assignment.contextPackage.memoryVersions, ["decision-12"]);
     assert.deepStrictEqual(assignment.implementerModel, { model: "gpt-5.4" });
+    assert.strictEqual(assignment.instanceId, undefined);
+    const withInstance = yield* decodeAssignmentV1({ ...assignmentExample, instanceId: "grok" });
+    assert.strictEqual(withInstance.instanceId, "grok");
   }),
 );
 

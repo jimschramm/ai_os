@@ -44,6 +44,9 @@ const allowRuns: AiOsBoard.BoardRuns["Service"] = {
   interrupt: () => Effect.succeed("requested"),
   confirmLaunch: () => Effect.succeed("active"),
   launch: () => Effect.succeed(activeLaunch()),
+  continueRun: () => Effect.succeed({ runId: "run-continued" }),
+  watchThread: () => Effect.succeed(null),
+  followRuns: false,
 };
 
 const disposers: Array<() => Promise<void>> = [];
@@ -423,6 +426,7 @@ describe("ai-os board route", () => {
     const interrupts: string[] = [];
     const launches: string[] = [];
     const { handler } = handlerFor(undefined, {
+      ...allowRuns,
       interrupt: (input) => {
         interrupts.push(input.runId);
         return Effect.succeed("requested");
@@ -529,7 +533,7 @@ describe("ai-os board route", () => {
     const fromBoard = await move("Running", "start-1");
     expect(fromBoard.status).toBe(200);
     expect(await fromBoard.json()).toMatchObject({ _tag: "Applied", changed: true });
-    expect(launches).toEqual([executionLaunchKey("task-demo", "attempt-1")]);
+    expect(launches).toEqual([executionLaunchKey("task-demo", "attempt-1", 1)]);
     expect(await phaseOf()).toBe("executing");
     const runningCard = (await readCards(handler)).find((card) => card.taskId === "task-demo");
     expect(runningCard?.threadId).toBe("thread-1");
@@ -538,7 +542,7 @@ describe("ai-os board route", () => {
     const secondDrop = await move("Running", "start-2");
     expect(secondDrop.status).toBe(200);
     expect(await secondDrop.json()).toMatchObject({ _tag: "Applied", changed: false });
-    expect(launches).toEqual([executionLaunchKey("task-demo", "attempt-1")]);
+    expect(launches).toEqual([executionLaunchKey("task-demo", "attempt-1", 1)]);
     expect(await phaseOf()).toBe("executing");
 
     const repeatedStart = await event(
@@ -565,12 +569,11 @@ describe("ai-os board route", () => {
 
   it("leaves the card executing when the interrupt is not confirmed", async () => {
     const { handler } = handlerFor(undefined, {
+      ...allowRuns,
       interrupt: () =>
         Effect.fail(
           new AiOsBoard.BoardRunError({ detail: "The run did not confirm the interrupt." }),
         ),
-      confirmLaunch: () => Effect.succeed("active"),
-      launch: () => Effect.succeed(activeLaunch()),
     });
     await reachExecuting(handler);
     const cancelled = await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
@@ -588,14 +591,13 @@ describe("ai-os board route", () => {
 
   it("does not mark In Progress when the launch is not active", async () => {
     const { handler } = handlerFor(undefined, {
-      interrupt: () => Effect.succeed("requested"),
+      ...allowRuns,
       confirmLaunch: () =>
         Effect.fail(
           new AiOsBoard.BoardRunError({
             detail: "That run is not active, so the board will not mark it in progress.",
           }),
         ),
-      launch: () => Effect.succeed(activeLaunch()),
     });
     await reachAssigned(handler);
     const started = await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
@@ -656,7 +658,7 @@ describe("ai-os board route", () => {
   it("records a finished launch as review instead of leaving it Ready", async () => {
     let launches = 0;
     const { handler } = handlerFor(undefined, {
-      interrupt: () => Effect.succeed("requested"),
+      ...allowRuns,
       confirmLaunch: () => Effect.succeed("settled"),
       launch: () => {
         launches += 1;
@@ -689,7 +691,7 @@ describe("ai-os board route", () => {
 
   it("records a failed launch as blocked instead of leaving it Ready", async () => {
     const { handler } = handlerFor(undefined, {
-      interrupt: () => Effect.succeed("requested"),
+      ...allowRuns,
       confirmLaunch: () => Effect.succeed("settled"),
       launch: () =>
         Effect.succeed({
@@ -711,9 +713,8 @@ describe("ai-os board route", () => {
 
   it("accepts start for a run that already finished, then the completion", async () => {
     const { handler } = handlerFor(undefined, {
-      interrupt: () => Effect.succeed("requested"),
+      ...allowRuns,
       confirmLaunch: () => Effect.succeed("settled"),
-      launch: () => Effect.succeed(activeLaunch()),
     });
     await reachAssigned(handler);
     const started = await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
@@ -752,8 +753,7 @@ describe("ai-os board route", () => {
 
   it("leaves the card Ready when the launch is refused", async () => {
     const { handler } = handlerFor(undefined, {
-      interrupt: () => Effect.succeed("requested"),
-      confirmLaunch: () => Effect.succeed("active"),
+      ...allowRuns,
       launch: () => Effect.fail(new AiOsBoard.BoardRunError({ detail: "The provider is down." })),
     });
     await reachAssigned(handler);
@@ -814,5 +814,197 @@ describe("ai-os board route", () => {
     expect(replay.status).toBe(200);
     expect(await replay.json()).toMatchObject({ _tag: "Applied", changed: false });
     expect(usageCount(await readCards(second.handler))).toBe(1);
+  });
+
+  it("launches with the assignment's provider instance", async () => {
+    const launched: Array<{ instanceId: string; model: string }> = [];
+    const { handler } = handlerFor(undefined, {
+      ...allowRuns,
+      launch: (input) => {
+        launched.push({ instanceId: input.instanceId, model: input.model });
+        return Effect.succeed(activeLaunch());
+      },
+    });
+    await reachAssigned(handler);
+    const assigned = await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
+      taskId: "task-grok",
+      title: "Grok task",
+      idempotencyKey: "intake-grok",
+      event: {
+        type: "intake",
+        intake: { ...intakeV2Example, projectId: "usba", workspaceId: "usba" },
+      },
+    });
+    expect(assigned.status).toBe(200);
+    expect(
+      (
+        await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
+          taskId: "task-grok",
+          column: "Ready",
+          idempotencyKey: "ready-grok",
+        })
+      ).status,
+    ).toBe(200);
+    expect(
+      (
+        await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
+          taskId: "task-grok",
+          title: "Grok task",
+          idempotencyKey: "assign-grok",
+          event: {
+            type: "assign",
+            assignment: {
+              ...assignmentExample,
+              taskId: "task-grok",
+              attemptId: "attempt-grok",
+              assignmentId: "assignment-grok",
+              instanceId: "grok",
+            },
+          },
+        })
+      ).status,
+    ).toBe(200);
+    const moved = await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
+      taskId: "task-grok",
+      column: "Running",
+      idempotencyKey: "run-grok",
+    });
+    expect(moved.status).toBe(200);
+    expect(launched).toEqual([{ instanceId: "grok", model: "gpt-5.4" }]);
+  });
+
+  it("launches rework as the next generation and does not launch that generation twice", async () => {
+    const launches: string[] = [];
+    const { handler } = handlerFor(undefined, {
+      ...allowRuns,
+      launch: (input) => {
+        launches.push(input.idempotencyKey);
+        return Effect.succeed({
+          threadId: "thread-2",
+          runId: "run-2",
+          disposition: "active",
+          summary: null,
+        });
+      },
+    });
+    for (const [index, event] of happyPathEvents.slice(0, 7).entries()) {
+      const posted = await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
+        taskId: "task-usba-page",
+        title: "Tournament page",
+        idempotencyKey: `path-${index}`,
+        threadId: "thread-rework",
+        runId: "run-rework",
+        event,
+      });
+      expect(posted.status).toBe(200);
+    }
+    const phase = async () =>
+      (await readCards(handler)).find((card) => card.taskId === "task-usba-page")?.state.phase;
+    expect(await phase()).toBe("rework");
+    const moved = await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
+      taskId: "task-usba-page",
+      column: "Running",
+      idempotencyKey: "rework-run",
+    });
+    expect(moved.status).toBe(200);
+    expect(launches).toEqual([executionLaunchKey("task-usba-page", "attempt-1", 2)]);
+    expect(await phase()).toBe("executing");
+    const again = await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
+      taskId: "task-usba-page",
+      column: "Running",
+      idempotencyKey: "rework-run-2",
+    });
+    expect(again.status).toBe(200);
+    expect(await again.json()).toMatchObject({ changed: false });
+    expect(launches).toEqual([executionLaunchKey("task-usba-page", "attempt-1", 2)]);
+  });
+
+  it("records failure from the thread view after an active launch", async () => {
+    const { handler } = handlerFor(undefined, {
+      ...allowRuns,
+      watchThread: () =>
+        Effect.succeed({
+          threadId: "thread-1",
+          runId: "run-1",
+          status: "failed",
+          text: "codex exited",
+          revision: null,
+        }),
+    });
+    await reachAssigned(handler);
+    const moved = await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
+      taskId: "task-demo",
+      column: "Running",
+      idempotencyKey: "watch-fail",
+    });
+    expect(moved.status).toBe(200);
+    expect(await phaseOfHandler(handler)).toBe("failed");
+    const card = (await readCards(handler)).find((item) => item.taskId === "task-demo");
+    expect(card?.state.phase === "failed" ? card.state.blocker.summary : "").toBe("codex exited");
+  });
+
+  it("records working progress from a still-running thread", async () => {
+    const { handler } = handlerFor(undefined, {
+      ...allowRuns,
+      watchThread: () =>
+        Effect.succeed({
+          threadId: "thread-1",
+          runId: "run-1",
+          status: "running",
+          text: "draft",
+          revision: null,
+        }),
+    });
+    await reachAssigned(handler);
+    const moved = await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
+      taskId: "task-demo",
+      column: "Running",
+      idempotencyKey: "watch-run",
+    });
+    expect(moved.status).toBe(200);
+    const card = (await readCards(handler)).find((item) => item.taskId === "task-demo");
+    expect(card?.state.phase).toBe("executing");
+    expect(card?.state.phase === "executing" ? card.state.run.progress?.status : null).toBe(
+      "working",
+    );
+  });
+
+  it("resumes a blocked card on the same thread and does not continue twice", async () => {
+    const continued: string[] = [];
+    const { handler } = handlerFor(undefined, {
+      ...allowRuns,
+      continueRun: (input) => {
+        continued.push(input.commandId);
+        return Effect.succeed({ runId: "run-2" });
+      },
+    });
+    await reachExecuting(handler);
+    const paused = await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
+      taskId: "task-demo",
+      column: "Blocked",
+      idempotencyKey: "pause-1",
+      confirmed: true,
+    });
+    expect(paused.status).toBe(200);
+    expect(await phaseOfHandler(handler)).toBe("recovery_pending");
+    const resumed = await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
+      taskId: "task-demo",
+      column: "Running",
+      idempotencyKey: "resume-drop",
+    });
+    expect(resumed.status).toBe(200);
+    expect(continued).toEqual(["continue-task-demo-2"]);
+    expect(await phaseOfHandler(handler)).toBe("executing");
+    const card = (await readCards(handler)).find((item) => item.taskId === "task-demo");
+    expect(card?.runId).toBe("run-2");
+    expect(card?.state.phase === "executing" ? card.state.run.generation : 0).toBe(2);
+    const again = await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
+      taskId: "task-demo",
+      column: "Running",
+      idempotencyKey: "resume-drop-2",
+    });
+    expect(again.status).toBe(200);
+    expect(await again.json()).toMatchObject({ changed: false });
+    expect(continued).toEqual(["continue-task-demo-2"]);
   });
 });

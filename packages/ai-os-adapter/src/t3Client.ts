@@ -239,7 +239,7 @@ const messageContext = (context: ContextPackageSnapshotV1) => ({
   ],
 });
 
-const viewFromProjection = (
+export const threadViewFromProjection = (
   threadId: string,
   projection: OrchestrationV2ThreadProjection,
 ): T3ThreadView => {
@@ -499,7 +499,7 @@ export const wsT3LocalClient = (options: T3ClientOptions): T3LocalClient => {
         const projection = yield* client[ORCHESTRATION_V2_WS_METHODS.getThreadProjection]({
           threadId: ThreadId.make(threadId),
         }).pipe(Effect.mapError((error) => rejected(detailOf(error))));
-        return viewFromProjection(threadId, projection);
+        return threadViewFromProjection(threadId, projection);
       }),
     );
   const interrupt = (threadId: string, runId: string) =>

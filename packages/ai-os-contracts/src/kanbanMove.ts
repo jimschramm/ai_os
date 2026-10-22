@@ -18,9 +18,16 @@ const RUNNING_NEEDS_ASSIGNMENT = "In Progress starts from Ready only after a wor
 
 const KEY = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
 
-/** Stable launch key shared by the board and the adapter. The same task and attempt replay one thread. */
-export const executionLaunchKey = (taskId: string, attemptId: string): string =>
-  `board-launch-${taskId}-${attemptId}`;
+/**
+ * One launch per task, attempt, and generation. Rework uses the next generation,
+ * so it starts a new run. A second drop of the same generation replays the first.
+ */
+export const executionLaunchKey = (taskId: string, attemptId: string, generation: number): string =>
+  `board-launch-${taskId}-${attemptId}-${generation}`;
+
+export const executionGeneration = (
+  state: Extract<SequenceState, { phase: "assigned" } | { phase: "rework" }>,
+): number => (state.phase === "assigned" ? state.nextGeneration : state.run.generation + 1);
 
 export interface KanbanMoveRecord {
   readonly column: KanbanColumn;
@@ -70,6 +77,12 @@ export type KanbanMoveResult =
       readonly detail: string;
       readonly state: SequenceState;
       readonly ledger: KanbanMoveLedger;
+    }
+  | {
+      readonly _tag: "NeedsRecover";
+      readonly detail: string;
+      readonly state: SequenceState;
+      readonly ledger: KanbanMoveLedger;
     };
 
 const applied = (
@@ -102,6 +115,12 @@ const needsLaunch = (
   state: SequenceState,
   ledger: KanbanMoveLedger,
 ): KanbanMoveResult => ({ _tag: "NeedsLaunch", detail, state, ledger });
+
+const needsRecover = (
+  detail: string,
+  state: SequenceState,
+  ledger: KanbanMoveLedger,
+): KanbanMoveResult => ({ _tag: "NeedsRecover", detail, state, ledger });
 
 const remember = (
   ledger: KanbanMoveLedger,
@@ -247,6 +266,16 @@ export const requestKanbanMove = (
       // The card stays queued until the caller confirms the run is active.
       return Effect.succeed(
         needsLaunch("In Progress waits until this run is confirmed active.", state, request.ledger),
+      );
+    }
+    if (state.phase === "recovery_pending") {
+      // The card stays blocked until continue and start_execution both apply.
+      return Effect.succeed(
+        needsRecover(
+          "In Progress resumes the interrupted run on the same thread.",
+          state,
+          request.ledger,
+        ),
       );
     }
     return Effect.succeed(rejected(RUNNING_NEEDS_ASSIGNMENT, state, request.ledger));
