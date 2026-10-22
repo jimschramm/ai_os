@@ -124,7 +124,7 @@ export function OperationsDashboard() {
   const active = activeAgentCount(agents);
 
   return (
-    <div className="relative flex h-full min-h-0 flex-col bg-background text-foreground">
+    <div className="relative flex h-full min-h-0 flex-col overflow-clip bg-background text-foreground">
       <header className="shrink-0 border-b border-border px-4 py-4 sm:px-6">
         <div className="flex flex-wrap items-end justify-between gap-4">
           <div className="min-w-0">
@@ -631,7 +631,8 @@ function TaskDrawer({
         aria-labelledby="task-drawer-title"
         aria-hidden={task === null}
         inert={task === null}
-        className={`ops-drawer absolute inset-y-0 right-0 z-30 flex w-full max-w-md flex-col border-l border-border bg-popover shadow-lg transition-transform duration-200 ease-out motion-reduce:transition-none ${task === null ? "translate-x-full" : "translate-x-0"}`}
+        data-state={task === null ? "closed" : "open"}
+        className="ops-drawer absolute inset-y-0 right-0 z-30 flex w-full max-w-md flex-col border-l border-border bg-popover shadow-lg"
       >
         {task === null ? null : (
           <TaskDrawerBody

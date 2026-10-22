@@ -19,7 +19,8 @@ export function useDialogCycle(
       const opener = openerRef.current;
       openerRef.current = null;
       if (opener !== null && opener.isConnected) {
-        opener.focus();
+        // The opener is already on screen. Scrolling it into view shifts the page.
+        opener.focus({ preventScroll: true });
       }
       return;
     }
@@ -28,7 +29,8 @@ export function useDialogCycle(
     if (current instanceof HTMLElement && (panel === null || !panel.contains(current))) {
       openerRef.current = current;
     }
-    initialFocusRef.current?.focus();
+    // The title can still be offscreen on the first frame. Don't scroll the shell to chase it.
+    initialFocusRef.current?.focus({ preventScroll: true });
   }, [activeKey, initialFocusRef, panelRef]);
 
   useEffect(() => {
@@ -46,10 +48,10 @@ export function useDialogCycle(
       if (!first || !last) return;
       if (event.shiftKey && document.activeElement === first) {
         event.preventDefault();
-        last.focus();
+        last.focus({ preventScroll: true });
       } else if (!event.shiftKey && document.activeElement === last) {
         event.preventDefault();
-        first.focus();
+        first.focus({ preventScroll: true });
       }
     };
     window.addEventListener("keydown", onKeyDown);

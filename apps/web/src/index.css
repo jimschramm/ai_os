@@ -2544,6 +2544,17 @@ code {
   }
 }
 
+/* Past the shell edge, shadow included. A plain 100% translate leaves the shadow
+   in the page, and the offscreen box widens scroll width unless the shell clips. */
+.ops-drawer {
+  transform: translateX(calc(100% + 1.5rem));
+  transition: transform 200ms ease-out;
+}
+
+.ops-drawer[data-state="open"] {
+  transform: translateX(0);
+}
+
 @media (prefers-reduced-motion: reduce) {
   .ops-orbit,
   .ops-flow,
