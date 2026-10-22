@@ -7,6 +7,8 @@ import * as Schema from "effect/Schema";
  */
 export const ADAPTER_BOARD_PATH = "/api/ai-os/board";
 export const ADAPTER_BOARD_EVENTS_PATH = "/api/ai-os/board/events";
+export const ADAPTER_BOARD_MOVE_PATH = "/api/ai-os/board/move";
+export const ADAPTER_BOARD_EVENT_PATH = "/api/ai-os/board/event";
 
 export interface AdapterBoardCard {
   readonly taskId: string;

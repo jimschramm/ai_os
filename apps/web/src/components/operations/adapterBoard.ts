@@ -35,6 +35,8 @@ const runOf = (state: SequenceState) => {
     case "recovery_pending":
     case "failed":
       return state.run;
+    case "assigned":
+      return state.heldRun;
     case "cancelled":
       return state.run;
     default:
@@ -44,10 +46,13 @@ const runOf = (state: SequenceState) => {
 
 const taskFromAdapterCard = (card: AdapterBoardCard): OperationsTask | null => {
   const { state } = card;
-  if (!("assignment" in state) || !("intake" in state)) return null;
+  if (state.phase === "cancelled" || !("intake" in state)) return null;
   if (!("originatingConversationId" in state.intake)) return null;
+  const assignment = "assignment" in state ? state.assignment : null;
   const completion = completionOf(state);
   const run = runOf(state);
+  const report = run?.progress ?? null;
+  const progressBlocker = report?.status === "blocked" ? report.blockers[0] : undefined;
   const needsYou =
     state.phase === "recovery_pending"
       ? {
@@ -65,18 +70,26 @@ const taskFromAdapterCard = (card: AdapterBoardCard): OperationsTask | null => {
             nextAction: state.blocker.nextAction,
             actionLabel: "I'll take it",
           }
-        : null;
+        : progressBlocker === undefined
+          ? null
+          : {
+              id: `${card.taskId}-progress-block`,
+              kind: "blocker" as const,
+              summary: progressBlocker.summary,
+              nextAction: progressBlocker.nextAction,
+              actionLabel: "I'll take it",
+            };
   return {
     id: card.taskId,
     projectId: state.intake.projectId,
     phase: state.phase,
     title: card.title,
-    agent: "Codex via T3",
+    agent: assignment?.workerId ?? "Unassigned",
     surface: "T3",
     updatedAt: card.updatedAt,
     intake: state.intake,
-    assignment: state.assignment,
-    progress: run?.progress === null || run?.progress === undefined ? [] : [run.progress],
+    assignment,
+    progress: report === null ? [] : [report],
     completion,
     qa: qaOf(state),
     revision: completion?.artifactRevision ?? null,

@@ -308,7 +308,7 @@ it.effect("cancels, continues, retries within a limit, and transfers ownership",
       }),
       "failed",
     );
-    assert.strictEqual(kanbanColumn(failed.phase), null);
+    assert.strictEqual(kanbanColumn(failed.phase), "Blocked");
     assert.strictEqual(failed.blocker.nextAction, blocker.nextAction);
     for (let count = 0; count < 3; count += 1) {
       const retried = yield* requirePhase(
@@ -374,7 +374,7 @@ it.effect("leaves recovery_pending only through an explicit resolution", () =>
       }),
       "failed",
     );
-    assert.strictEqual(kanbanColumn(failed.phase), null);
+    assert.strictEqual(kanbanColumn(failed.phase), "Blocked");
 
     const retried = yield* requirePhase(
       yield* applySequenceEvent(failed, {
