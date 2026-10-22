@@ -85,6 +85,22 @@ transaction](../../apps/server/src/persistence/AuthSessions.ts); a failed
 replacement must leave the old credential usable. Pairing and browser sessions
 do not follow this replacement rule.
 
+### Loopback owner
+
+`T3CODE_TRUST_LOOPBACK` defaults on. A request or WebSocket upgrade whose socket
+remote address is `127.0.0.0/8` or `::1` is the owner session, with the standard
+client scopes, and does not need a pairing cookie or bearer. Every other remote
+address still needs a pairing credential. A loopback bind also covers a socket
+that did not report a peer. Listening on every interface does not extend that
+trust past a loopback peer.
+
+Trust stops when `X-Forwarded-For` or `Forwarded` is present, so a proxy cannot
+present a public client as loopback. `Host`, and `Origin` when the browser sends
+one, must be `localhost`, `127.0.0.1`, or `::1`. The dev proxy rewrites `Host`
+on `/api` to the backend target and leaves `Origin` as the page origin, so those
+names do not have to be identical. A real bearer or cookie is checked first and
+keeps its own scopes.
+
 ### Reusable dev credential
 
 Web development environments can accept one `T3CODE_DEV_AUTH_TOKEN` across

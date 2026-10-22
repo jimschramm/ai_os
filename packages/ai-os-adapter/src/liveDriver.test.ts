@@ -31,6 +31,7 @@ import {
   LIVE_DRIVER_DEFAULT_ORIGIN,
   LIVE_DRIVER_HELP,
   LiveDriverUsageError,
+  isLoopbackDriverOrigin,
   parseLiveDriverArgs,
   resolveDriverModel,
   runLiveDriver,
@@ -42,7 +43,6 @@ import {
   type T3LaunchRequest,
   type T3LocalClient,
   type T3ModelCatalog,
-  type T3SessionStore,
 } from "./t3Client.ts";
 
 const isLiveDriverUsageError = Schema.is(LiveDriverUsageError);
@@ -66,7 +66,10 @@ const makeServer = () => {
   let exchanges = 0;
   const scopesFor = (request: HttpServerRequest.HttpServerRequest) => {
     const header = request.headers.authorization;
-    if (typeof header !== "string" || !header.startsWith("Bearer ")) return undefined;
+    if (typeof header !== "string" || header.trim().length === 0) {
+      return [AuthOrchestrationReadScope, AuthOrchestrationOperateScope];
+    }
+    if (!header.startsWith("Bearer ")) return undefined;
     return bearers.get(header.slice("Bearer ".length).trim());
   };
   const tokenRoute = Effect.gen(function* () {
@@ -187,23 +190,6 @@ const CATALOG: T3ModelCatalog = {
   serverDefault: null,
 };
 
-const memorySession = (
-  initial?: string,
-): T3SessionStore & { readonly current: () => string | undefined } => {
-  let value = initial;
-  return {
-    current: () => value,
-    load: Effect.sync(() => value),
-    save: (bearer) =>
-      Effect.sync(() => {
-        value = bearer;
-      }),
-    clear: Effect.sync(() => {
-      value = undefined;
-    }),
-  };
-};
-
 const readBoard = (origin: string) =>
   HttpClient.execute(
     HttpClientRequest.post(`${origin}/oauth/token`).pipe(
@@ -245,6 +231,10 @@ it.effect("reads the pairing token from the environment and rejects the flag", (
     const missing = parseLiveDriverArgs(["--project-id", "usba"], {});
     assert.strictEqual(missing.pairingToken, undefined);
     assert.equal(LIVE_DRIVER_HELP.includes("gpt-5.4"), false);
+    assert.equal(isLoopbackDriverOrigin(LIVE_DRIVER_DEFAULT_ORIGIN), true);
+    assert.equal(isLoopbackDriverOrigin("http://[::1]:13773"), true);
+    assert.equal(isLoopbackDriverOrigin("http://127.8.8.8:13773"), true);
+    assert.equal(isLoopbackDriverOrigin("http://10.1.2.3:13773"), false);
 
     const secret = "pair-secret-value";
     let rejected = false;
@@ -276,14 +266,23 @@ it.effect("reads the pairing token from the environment and rejects the flag", (
   }),
 );
 
-it.effect("prints help and a missing token without opening a socket", () =>
+it.effect("prints help and requires a token only for a remote origin", () =>
   Effect.gen(function* () {
     const unusedCommit = () => Promise.resolve(SHA);
     assert.strictEqual(
       yield* Effect.promise(() => runLiveDriverCli(["--help"], {}, unusedCommit)),
       0,
     );
-    assert.strictEqual(yield* Effect.promise(() => runLiveDriverCli([], {}, unusedCommit)), 1);
+    assert.strictEqual(
+      yield* Effect.promise(() =>
+        runLiveDriverCli(
+          ["--origin", "http://10.1.2.3:13773", "--list-projects"],
+          {},
+          unusedCommit,
+        ),
+      ),
+      1,
+    );
   }),
 );
 
@@ -391,15 +390,14 @@ it.effect("lists project ids and publishes the launched task to the server board
   ),
 );
 
-it.effect("reuses a saved session without exchanging the pairing token again", () =>
+it.effect("lists loopback projects without exchanging a pairing token", () =>
   withServer((origin, exchanges) =>
     Effect.gen(function* () {
-      const session = memorySession();
       const lines: string[] = [];
       yield* runLiveDriver(
         {
           origin,
-          pairingToken: PAIR,
+          pairingToken: undefined,
           projectId: undefined,
           model: undefined,
           title: undefined,
@@ -407,7 +405,7 @@ it.effect("reuses a saved session without exchanging the pairing token again", (
           listProjects: true,
         },
         {
-          client: wsT3LocalClient({ origin, pairingToken: PAIR, session }),
+          client: wsT3LocalClient({ origin }),
           clock: () => CLOCK,
           write: (line) => {
             lines.push(line);
@@ -417,33 +415,11 @@ it.effect("reuses a saved session without exchanging the pairing token again", (
         },
       );
       assert.deepStrictEqual(lines, ["usba\tUSBA"]);
-      assert.strictEqual(exchanges(), 1);
-      const saved = session.current();
-      assert.equal(saved !== undefined && saved.startsWith("access-"), true);
-      assert.equal(lines.join("\n").includes(saved ?? "missing-bearer"), false);
-
-      const again = yield* wsT3LocalClient({ origin, session }).listProjectIds();
-      assert.strictEqual(exchanges(), 1);
-      assert.strictEqual(again[0]?.id, "usba");
-      assert.deepStrictEqual(again[0]?.defaultModel, { instanceId: "codex", model: "gpt-5.6-sol" });
-    }),
-  ),
-);
-
-it.effect("drops an expired saved session without printing it", () =>
-  withServer((origin, exchanges) =>
-    Effect.gen(function* () {
-      const stale = "stale-bearer-not-for-logs";
-      const session = memorySession(stale);
-      const failed = yield* Effect.exit(wsT3LocalClient({ origin, session }).listProjectIds());
-      assert.strictEqual(Exit.isFailure(failed), true);
-      if (Exit.isFailure(failed)) {
-        const detail = failed.cause.toString();
-        assert.equal(detail.includes("Saved session expired"), true);
-        assert.equal(detail.includes(stale), false);
-      }
-      assert.strictEqual(session.current(), undefined);
       assert.strictEqual(exchanges(), 0);
+
+      const withToken = yield* wsT3LocalClient({ origin, pairingToken: PAIR }).listProjectIds();
+      assert.strictEqual(exchanges(), 1);
+      assert.strictEqual(withToken[0]?.id, "usba");
     }),
   ),
 );

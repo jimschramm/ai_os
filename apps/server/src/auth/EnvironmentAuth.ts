@@ -45,6 +45,12 @@ import { REUSABLE_DEV_SESSION_EXPIRES_AT, resolveReusableDevAuth } from "./Reusa
 import { verifyRequestDpopProof } from "./dpop.ts";
 import { DESKTOP_RENDERER_ORIGINS } from "../httpCors.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
+import * as SynchronizedRef from "effect/SynchronizedRef";
+import {
+  evaluateLoopbackTrust,
+  loopbackTrustDiagnostic,
+  remoteAddressFromSource,
+} from "./loopbackTrust.ts";
 
 const DEFAULT_SESSION_SUBJECT = "cli-issued-session";
 export const INTERNAL_ADMINISTRATIVE_BOOTSTRAP_SUBJECT = "administrative-bootstrap";
@@ -781,13 +787,67 @@ export const make = Effect.gen(function* () {
     ...config.devAllowedOrigins,
   ]);
 
+  const loopbackOwner = yield* SynchronizedRef.make<AuthenticatedSession | undefined>(undefined);
+  const loopbackOwnerSession = SynchronizedRef.modifyEffect(loopbackOwner, (current) =>
+    Effect.gen(function* () {
+      const now = yield* DateTime.now;
+      if (
+        current?.expiresAt !== undefined &&
+        current.expiresAt.epochMilliseconds > now.epochMilliseconds
+      ) {
+        return [current, current] as const;
+      }
+      const issued = yield* sessions
+        .issue({
+          subject: "owner",
+          method: "bearer-access-token",
+          scopes: AuthStandardClientScopes,
+          client: { label: "Loopback owner", deviceType: "unknown" },
+        })
+        .pipe(Effect.mapError((cause) => new ServerAuthAuthenticatedSessionIssueError({ cause })));
+      const session: AuthenticatedSession = {
+        sessionId: issued.sessionId,
+        subject: "owner",
+        method: issued.method,
+        scopes: issued.scopes,
+        expiresAt: issued.expiresAt,
+      };
+      return [session, session] as const;
+    }),
+  );
+
+  const authenticateUncredentialedRequest = (request: HttpServerRequest.HttpServerRequest) => {
+    const decision = evaluateLoopbackTrust({
+      trustLoopback: config.trustLoopback === true,
+      bindHost: config.host,
+      remoteAddress: remoteAddressFromSource(request.source),
+      forwardedFor: request.headers["x-forwarded-for"],
+      forwarded: request.headers.forwarded,
+      host: request.headers.host,
+      origin: request.headers.origin,
+    });
+    if (decision.ok) return loopbackOwnerSession;
+    if (
+      decision.reason === "forwarded" ||
+      decision.reason === "bad-host" ||
+      decision.reason === "bad-origin"
+    ) {
+      return Effect.fail(
+        new ServerAuthInvalidCredentialError({
+          diagnostic: loopbackTrustDiagnostic(decision.reason),
+        }),
+      );
+    }
+    return Effect.fail(new ServerAuthMissingCredentialError({}));
+  };
+
   const authenticateRequest = (
     request: HttpServerRequest.HttpServerRequest,
   ): Effect.Effect<AuthenticatedSession, ServerAuthCredentialError | ServerAuthInternalError> => {
     const dpopToken = parseDpopToken(request);
     const credential = resolveRequestCredential(request);
     if (!credential?.token) {
-      return Effect.fail(new ServerAuthMissingCredentialError({}));
+      return authenticateUncredentialedRequest(request);
     }
     if (
       isBrowserCookieCredential(credential.source) &&

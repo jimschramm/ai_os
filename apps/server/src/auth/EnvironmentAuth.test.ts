@@ -67,6 +67,30 @@ const makeBearerRequest = (
     EnvironmentAuth.EnvironmentAuth["Service"]["authenticateHttpRequest"]
   >[0];
 
+const loopbackRequest = (input: {
+  readonly remoteAddress?: string;
+  readonly host?: string;
+  readonly origin?: string;
+  readonly forwardedFor?: string;
+  readonly forwarded?: string;
+  readonly authorization?: string;
+}): Parameters<EnvironmentAuth.EnvironmentAuth["Service"]["authenticateHttpRequest"]>[0] =>
+  ({
+    cookies: {},
+    headers: {
+      ...(input.host === undefined ? {} : { host: input.host }),
+      ...(input.origin === undefined ? {} : { origin: input.origin }),
+      ...(input.forwardedFor === undefined ? {} : { "x-forwarded-for": input.forwardedFor }),
+      ...(input.forwarded === undefined ? {} : { forwarded: input.forwarded }),
+      ...(input.authorization === undefined ? {} : { authorization: input.authorization }),
+    },
+    ...(input.remoteAddress === undefined
+      ? {}
+      : { source: { remoteAddress: input.remoteAddress } }),
+  }) as unknown as Parameters<
+    EnvironmentAuth.EnvironmentAuth["Service"]["authenticateHttpRequest"]
+  >[0];
+
 const requestMetadata = {
   deviceType: "desktop" as const,
   os: "macOS",
@@ -699,5 +723,117 @@ it.layer(NodeServices.layer)("EnvironmentAuth.layer", (it) => {
       } as never);
       expect(verified.sessionId).toBe(bearer.sessionId);
     }).pipe(Effect.provide(layerEnvironmentAuth({ mode: "web", host: "192.168.1.50" }))),
+  );
+
+  it.effect("authenticates an unproxied loopback socket as the owner", () =>
+    Effect.gen(function* () {
+      const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;
+      const request = loopbackRequest({ remoteAddress: "127.0.0.1", host: "localhost:13773" });
+      const first = yield* serverAuth.authenticateHttpRequest(request);
+      const second = yield* serverAuth.authenticateHttpRequest(
+        loopbackRequest({
+          remoteAddress: "::ffff:127.8.8.8",
+          host: "localhost:13773",
+          origin: "http://127.0.0.1:5733",
+        }),
+      );
+      const upgraded = yield* serverAuth.authenticateWebSocketUpgrade(
+        loopbackRequest({ remoteAddress: "::1", host: "[::1]:5733", origin: "http://[::1]:5733" }),
+      );
+      const state = yield* serverAuth.getSessionState(request);
+
+      expect(first.subject).toBe("owner");
+      expect(first.scopes).toEqual(AuthStandardClientScopes);
+      expect(second.sessionId).toBe(first.sessionId);
+      expect(upgraded.sessionId).toBe(first.sessionId);
+      expect(state.authenticated).toBe(true);
+      if (state.authenticated) {
+        expect(state.permissions).toEqual(AuthStandardClientScopes);
+      }
+    }).pipe(Effect.provide(layerEnvironmentAuth({ trustLoopback: true, host: "0.0.0.0" }))),
+  );
+
+  it.effect("still requires a credential from a non-loopback client", () =>
+    Effect.gen(function* () {
+      const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;
+      const error = yield* Effect.flip(
+        serverAuth.authenticateHttpRequest(
+          loopbackRequest({ remoteAddress: "192.168.1.10", host: "127.0.0.1:13773" }),
+        ),
+      );
+      expect(error._tag).toBe("ServerAuthMissingCredentialError");
+
+      const bearer = yield* serverAuth.issueSession();
+      const verified = yield* serverAuth.authenticateHttpRequest(
+        loopbackRequest({
+          remoteAddress: "192.168.1.10",
+          host: "192.168.1.10:13773",
+          authorization: `Bearer ${bearer.token}`,
+        }),
+      );
+      expect(verified.sessionId).toBe(bearer.sessionId);
+      expect(verified.subject).not.toBe("owner");
+    }).pipe(Effect.provide(layerEnvironmentAuth({ trustLoopback: true }))),
+  );
+
+  it.effect("rejects forwarded headers and a foreign host or origin on loopback", () =>
+    Effect.gen(function* () {
+      const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;
+      const forwardedFor = yield* Effect.flip(
+        serverAuth.authenticateHttpRequest(
+          loopbackRequest({
+            remoteAddress: "127.0.0.1",
+            host: "127.0.0.1:13773",
+            forwardedFor: "203.0.113.5",
+          }),
+        ),
+      );
+      const forwarded = yield* Effect.flip(
+        serverAuth.authenticateHttpRequest(
+          loopbackRequest({
+            remoteAddress: "127.0.0.1",
+            host: "127.0.0.1:13773",
+            forwarded: "for=203.0.113.5",
+          }),
+        ),
+      );
+      const origin = yield* Effect.flip(
+        serverAuth.authenticateHttpRequest(
+          loopbackRequest({
+            remoteAddress: "127.0.0.1",
+            host: "127.0.0.1:13773",
+            origin: "https://evil.example",
+          }),
+        ),
+      );
+      const host = yield* Effect.flip(
+        serverAuth.authenticateHttpRequest(
+          loopbackRequest({ remoteAddress: "::1", host: "evil.example" }),
+        ),
+      );
+
+      expect(forwardedFor._tag).toBe("ServerAuthInvalidCredentialError");
+      expect(forwarded._tag).toBe("ServerAuthInvalidCredentialError");
+      expect(origin._tag).toBe("ServerAuthInvalidCredentialError");
+      expect(host._tag).toBe("ServerAuthInvalidCredentialError");
+      if (origin._tag === "ServerAuthInvalidCredentialError") {
+        expect(origin.diagnostic).toContain("origin");
+      }
+      if (host._tag === "ServerAuthInvalidCredentialError") {
+        expect(host.diagnostic).toContain("host");
+      }
+    }).pipe(Effect.provide(layerEnvironmentAuth({ trustLoopback: true }))),
+  );
+
+  it.effect("leaves loopback unauthenticated when trust is off", () =>
+    Effect.gen(function* () {
+      const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;
+      const disabled = yield* Effect.flip(
+        serverAuth.authenticateHttpRequest(
+          loopbackRequest({ remoteAddress: "127.0.0.1", host: "127.0.0.1:13773" }),
+        ),
+      );
+      expect(disabled._tag).toBe("ServerAuthMissingCredentialError");
+    }).pipe(Effect.provide(layerEnvironmentAuth())),
   );
 });

@@ -155,13 +155,6 @@ export interface T3ModelCatalog {
   readonly serverDefault: T3ModelSelection | null;
 }
 
-/** Remembers the bearer from one pairing exchange so a later process can reuse it. */
-export interface T3SessionStore {
-  readonly load: Effect.Effect<string | undefined, GrokT3Error>;
-  readonly save: (bearer: string) => Effect.Effect<void, GrokT3Error>;
-  readonly clear: Effect.Effect<void, GrokT3Error>;
-}
-
 export interface T3LocalClient {
   readonly launch: (input: T3LaunchRequest) => Effect.Effect<T3LaunchResult, GrokT3Error>;
   readonly read: (threadId: string) => Effect.Effect<T3ThreadView, GrokT3Error>;
@@ -308,7 +301,6 @@ const withRpc = <A>(
 export interface T3ClientOptions {
   readonly origin: string;
   readonly pairingToken?: string;
-  readonly session?: T3SessionStore;
 }
 
 const modelSelectionOf = (value: unknown): T3ModelSelection | null => {
@@ -379,26 +371,19 @@ export const T3ConfigRpc = RpcGroup.make(
 /**
  * Websocket client for a local T3 server.
  *
- * A pairing token is exchanged for a bearer, and each socket mints its own
- * `wsTicket`, because the upgrade authenticates that ticket and RPC then checks
- * scopes. Launch is `orchestration.launchThread`. Cancel is `run.interrupt`.
+ * A pairing token, when one is set, is exchanged for a bearer. Loopback calls
+ * with no token send no Authorization header and rely on the server's loopback
+ * owner session. Each socket mints its own `wsTicket`, because the upgrade
+ * authenticates that ticket and RPC then checks scopes. Launch is
+ * `orchestration.launchThread`. Cancel is `run.interrupt`.
  * Continue is `message.dispatch` with `manualContinuationOfRunId`. Reads use
  * `orchestration.getThreadProjection`. Nothing here spawns Codex or calls an
  * update endpoint.
  */
 export const wsT3LocalClient = (options: T3ClientOptions): T3LocalClient => {
-  const { origin, pairingToken, session } = options;
+  const { origin, pairingToken } = options;
   const http = usingHttp(origin);
   let cachedBearer: string | undefined;
-  let cachedFromSession = false;
-  const dropSavedSession = Effect.gen(function* () {
-    const fromSession = cachedFromSession;
-    cachedBearer = undefined;
-    cachedFromSession = false;
-    if (fromSession && session !== undefined) {
-      yield* session.clear.pipe(Effect.ignore);
-    }
-  });
   const exchange = Effect.gen(function* () {
     const tokenValue = pairingToken?.trim() ?? "";
     if (tokenValue.length === 0) {
@@ -426,49 +411,25 @@ export const wsT3LocalClient = (options: T3ClientOptions): T3LocalClient => {
       Effect.mapError(() => unavailable("T3 returned an unreadable access token.")),
     );
     cachedBearer = token.access_token;
-    cachedFromSession = false;
-    if (session !== undefined) {
-      yield* session.save(token.access_token);
-    }
     return token.access_token;
   });
   const accessToken = Effect.gen(function* () {
     if (cachedBearer !== undefined) return cachedBearer;
-    if (session !== undefined) {
-      const stored = yield* session.load;
-      const trimmed = stored?.trim() ?? "";
-      if (trimmed.length > 0) {
-        cachedBearer = trimmed;
-        cachedFromSession = true;
-        return trimmed;
-      }
-    }
     return yield* exchange;
   });
-  // A saved bearer that the server rejects is discarded once. A fresh exchange is not retried.
-  const responseFor = (build: (bearer: string) => HttpClientRequest.HttpClientRequest) =>
+  const responseFor = (build: () => HttpClientRequest.HttpClientRequest) =>
     Effect.gen(function* () {
-      const first = yield* accessToken;
-      const fromSession = cachedFromSession;
-      let response = yield* HttpClient.execute(build(first));
-      if (response.status !== 401 || !fromSession) return response;
-      yield* dropSavedSession;
-      const pairing = pairingToken?.trim() ?? "";
-      if (pairing.length === 0) {
-        return yield* new GrokT3Error({
-          reason: "unauthenticated",
-          detail: "Saved session expired. Set T3_PAIRING_TOKEN.",
-        });
-      }
-      const next = yield* exchange;
-      return yield* HttpClient.execute(build(next));
+      const tokenValue = pairingToken?.trim() ?? "";
+      const request =
+        tokenValue.length === 0
+          ? build()
+          : HttpClientRequest.setHeader(build(), "authorization", `Bearer ${yield* accessToken}`);
+      return yield* HttpClient.execute(request);
     });
   const issueTicket = http(
     Effect.gen(function* () {
-      const response = yield* responseFor((bearer) =>
-        HttpClientRequest.post(`${origin}/api/auth/websocket-ticket`).pipe(
-          HttpClientRequest.setHeader("authorization", `Bearer ${bearer}`),
-        ),
+      const response = yield* responseFor(() =>
+        HttpClientRequest.post(`${origin}/api/auth/websocket-ticket`),
       );
       if (response.status !== 200) {
         return yield* statusError(response.status, "issue a websocket ticket");
@@ -553,9 +514,8 @@ export const wsT3LocalClient = (options: T3ClientOptions): T3LocalClient => {
   const publishBoard = (cards: readonly AdapterBoardCard[]) =>
     http(
       Effect.gen(function* () {
-        const response = yield* responseFor((bearer) =>
+        const response = yield* responseFor(() =>
           HttpClientRequest.post(`${origin}${ADAPTER_BOARD_PATH}`).pipe(
-            HttpClientRequest.setHeader("authorization", `Bearer ${bearer}`),
             HttpClientRequest.bodyText(encodeAdapterBoardWire(cards), "application/json"),
           ),
         );
@@ -567,11 +527,7 @@ export const wsT3LocalClient = (options: T3ClientOptions): T3LocalClient => {
   const listProjectIds = () =>
     http(
       Effect.gen(function* () {
-        const response = yield* responseFor((bearer) =>
-          HttpClientRequest.get(`${origin}/api/projects`).pipe(
-            HttpClientRequest.setHeader("authorization", `Bearer ${bearer}`),
-          ),
-        );
+        const response = yield* responseFor(() => HttpClientRequest.get(`${origin}/api/projects`));
         if (response.status !== 200) {
           return yield* statusError(response.status, "list projects");
         }

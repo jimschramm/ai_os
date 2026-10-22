@@ -10,7 +10,6 @@ import {
   type T3LocalClient,
   type T3ModelCatalog,
   type T3ModelSelection,
-  type T3SessionStore,
 } from "./t3Client.ts";
 
 /** Dev-server port. Override with `--origin` when the server picked another one. */
@@ -28,9 +27,9 @@ export const LIVE_DRIVER_COMMAND =
 
 export const LIVE_DRIVER_HELP = `Record one intake on a local T3 server and publish it to /operations.
 
-Set ${LIVE_DRIVER_PAIRING_ENV} to the pairing token from the server startup URL
-for the first run. The driver saves that session under the T3 home and later
-runs reuse it. A pairing token is not accepted as an argument.
+A loopback origin (localhost, 127.0.0.1, or ::1) needs no pairing token.
+For any other origin, set ${LIVE_DRIVER_PAIRING_ENV} to that run's pairing token.
+A pairing token is not accepted as an argument.
 Run this from the repository root. Do not wrap it in a package-manager runner.
 
 ${LIVE_DRIVER_COMMAND} --list-projects
@@ -372,11 +371,23 @@ export const runLiveDriver = (
     deps.write("still executing");
   });
 
+export const isLoopbackDriverOrigin = (origin: string): boolean => {
+  let hostname: string;
+  try {
+    hostname = new URL(origin).hostname.replace(/^\[|\]$/g, "").toLowerCase();
+  } catch {
+    return false;
+  }
+  if (hostname === "localhost" || hostname === "::1") return true;
+  const parts = hostname.split(".");
+  if (parts.length !== 4 || parts[0] !== "127") return false;
+  return parts.every((part) => /^(0|[1-9]\d{0,2})$/.test(part) && Number(part) <= 255);
+};
+
 export const runLiveDriverCli = (
   argv: readonly string[],
   env: Readonly<Record<string, string | undefined>>,
   readRepoCommit: (workspaceRoot: string) => Promise<string>,
-  session?: T3SessionStore,
 ): Promise<number> => {
   let request: LiveDriverRequest;
   try {
@@ -391,7 +402,7 @@ export const runLiveDriverCli = (
     throw error;
   }
 
-  if (request.pairingToken === undefined && session === undefined) {
+  if (request.pairingToken === undefined && !isLoopbackDriverOrigin(request.origin)) {
     process.stderr.write(`Set ${LIVE_DRIVER_PAIRING_ENV}.\n\n${LIVE_DRIVER_HELP}\n`);
     return Promise.resolve(1);
   }
@@ -401,7 +412,6 @@ export const runLiveDriverCli = (
       client: wsT3LocalClient({
         origin: request.origin,
         ...(request.pairingToken === undefined ? {} : { pairingToken: request.pairingToken }),
-        ...(session === undefined ? {} : { session }),
       }),
       clock: () => DateTime.formatIso(DateTime.nowUnsafe()),
       write: (line) => {

@@ -10,8 +10,10 @@ vp i
 vp run dev
 ```
 
-Open the pairing URL printed by the dev runner. The bare origin does not authenticate
-a new browser.
+A browser opened at `localhost` or `127.0.0.1` loads without pairing while
+`T3CODE_TRUST_LOOPBACK` is on, which is the default. Any other origin, including
+the tailnet URL from `vp run dev --share`, still needs the pairing URL printed
+by the dev runner.
 
 Prefer a container? See [Dev container](../internals/devcontainer.md) for VS Code and Codespaces setup.
 

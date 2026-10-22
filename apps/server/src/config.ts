@@ -71,6 +71,11 @@ export class ServerConfig extends Context.Service<
     readonly devUrl: URL | undefined;
     readonly devAuthToken?: Redacted.Redacted<string> | undefined;
     readonly devAllowedOrigins: ReadonlyArray<string>;
+    /**
+     * Authenticate an unproxied loopback socket as the owner. Unset is off so
+     * test layers stay credentialed; `resolveServerConfig` defaults it on.
+     */
+    readonly trustLoopback?: boolean;
     readonly noBrowser: boolean;
     readonly startupPresentation: StartupPresentation;
     readonly desktopBootstrapToken: string | undefined;
