@@ -1,4 +1,4 @@
-import { SequenceState } from "@t3tools/ai-os-contracts";
+import { ContractId, ContractText, IsoDateTime, SequenceState } from "@t3tools/ai-os-contracts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import type * as Scope from "effect/Scope";
@@ -10,11 +10,11 @@ import { encodeAdapterBoard, type AdapterBoardCard } from "./board.ts";
 
 const WireCards = Schema.Array(
   Schema.Struct({
-    taskId: Schema.String,
-    title: Schema.String,
+    taskId: ContractId,
+    title: ContractText,
     state: SequenceState,
-    threadId: Schema.NullOr(Schema.String),
-    updatedAt: Schema.String,
+    threadId: Schema.NullOr(ContractId),
+    updatedAt: IsoDateTime,
   }),
 );
 

@@ -175,4 +175,93 @@ describe("ai-os board route", () => {
       ["task-b", "Second"],
     ]);
   });
+
+  it("rejects an empty id, a blank title, and a non-Z timestamp", async () => {
+    const { handler } = handlerFor();
+    const post = (body: string) =>
+      handler(
+        new Request(boardUrl(ADAPTER_BOARD_PATH), {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${AuthOrchestrationOperateScope}`,
+            "content-type": "application/json",
+          },
+          body,
+        }),
+      );
+    const valid = encodeAdapterBoard([idleCard("task-a", "First")]);
+    expect((await post(valid)).status).toBe(204);
+    for (const body of [
+      encodeAdapterBoard([{ ...idleCard("task-a", "First"), taskId: "" }]),
+      encodeAdapterBoard([{ ...idleCard("task-a", "First"), title: " " }]),
+      encodeAdapterBoard([
+        { ...idleCard("task-a", "First"), updatedAt: "2026-10-21T18:00:00+00:00" },
+      ]),
+    ]) {
+      expect((await post(body)).status).toBe(400);
+    }
+    const kept = decodeAdapterBoard(
+      await (
+        await handler(
+          new Request(boardUrl(ADAPTER_BOARD_PATH), {
+            headers: { authorization: `Bearer ${AuthOrchestrationReadScope}` },
+          }),
+        )
+      ).text(),
+    );
+    expect(kept?.map((card) => card.title)).toEqual(["First"]);
+  });
+
+  it("keeps every card when publishes run together", async () => {
+    const { handler } = handlerFor();
+    const ids = Array.from({ length: 12 }, (_, index) => `task-${index}`);
+    const statuses = await Promise.all(
+      ids.map((id) =>
+        handler(
+          new Request(boardUrl(ADAPTER_BOARD_PATH), {
+            method: "POST",
+            headers: {
+              authorization: `Bearer ${AuthOrchestrationOperateScope}`,
+              "content-type": "application/json",
+            },
+            body: encodeAdapterBoard([idleCard(id, `Title ${id}`)]),
+          }),
+        ).then((response) => response.status),
+      ),
+    );
+    expect(statuses).toEqual(ids.map(() => 204));
+    const reader = await handler(
+      new Request(boardUrl(ADAPTER_BOARD_PATH), {
+        headers: { authorization: `Bearer ${AuthOrchestrationReadScope}` },
+      }),
+    );
+    const cards = decodeAdapterBoard(await reader.text());
+    expect(cards?.map((card) => card.taskId).sort()).toEqual([...ids].sort());
+  });
+
+  it("returns 500 when the snapshot cannot be written", async () => {
+    const { handler, stateDir } = handlerFor();
+    NodeFS.chmodSync(stateDir, 0o555);
+    try {
+      const denied = await handler(
+        new Request(boardUrl(ADAPTER_BOARD_PATH), {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${AuthOrchestrationOperateScope}`,
+            "content-type": "application/json",
+          },
+          body: encodeAdapterBoard([idleCard("task-a", "First")]),
+        }),
+      );
+      expect(denied.status).toBe(500);
+    } finally {
+      NodeFS.chmodSync(stateDir, 0o755);
+    }
+    const reader = await handler(
+      new Request(boardUrl(ADAPTER_BOARD_PATH), {
+        headers: { authorization: `Bearer ${AuthOrchestrationReadScope}` },
+      }),
+    );
+    expect(decodeAdapterBoard(await reader.text())).toEqual([]);
+  });
 });
