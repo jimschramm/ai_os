@@ -1,9 +1,12 @@
 import { createFileRoute, redirect } from "@tanstack/react-router";
 
-import { OperationsDashboard } from "../components/operations/OperationsDashboard";
+import {
+  OperationsDashboard,
+  OperationsProjectNamesFromServer,
+} from "../components/operations/OperationsDashboard";
 import { SidebarInset } from "../components/ui/sidebar";
 
-// Fixture tasks stay until this environment's board feed sends a snapshot.
+// Fixture tasks stay until this environment's board feed sends a live card.
 export const Route = createFileRoute("/operations")({
   beforeLoad: async ({ context }) => {
     if (
@@ -19,7 +22,9 @@ export const Route = createFileRoute("/operations")({
 function OperationsRoute() {
   return (
     <SidebarInset className="h-dvh min-h-0 overflow-hidden overscroll-y-none">
-      <OperationsDashboard />
+      <OperationsProjectNamesFromServer>
+        <OperationsDashboard />
+      </OperationsProjectNamesFromServer>
     </SidebarInset>
   );
 }

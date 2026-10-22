@@ -165,8 +165,13 @@ export const createGrokT3Adapter = (input: {
 }): GrokT3Adapter => {
   const store = input.store ?? memorySessionStore();
   const workerId = input.workerId ?? "codex-t3";
-  const model = input.model ?? "gpt-5.4";
+  // A hardcoded slug is rejected by a pinned provider. Callers pass a model the server offers.
+  const model = input.model?.trim() ?? "";
   const resolvedInstanceId = input.instanceId ?? T3_LAUNCH_DEFAULTS.instanceId;
+  const requireModel =
+    model.length > 0
+      ? Effect.void
+      : fail("invalid_task", "No model was selected. Use a model the server offers.");
 
   const load = (taskId: string) => {
     const session = store.get(taskId);
@@ -206,6 +211,7 @@ export const createGrokT3Adapter = (input: {
     readonly context: unknown;
   }) =>
     Effect.gen(function* () {
+      yield* requireModel;
       if (request.title.trim().length === 0) {
         return yield* fail("invalid_task", "A recorded task needs a title.");
       }
@@ -269,6 +275,7 @@ export const createGrokT3Adapter = (input: {
 
   const launch = (taskId: string) =>
     Effect.gen(function* () {
+      yield* requireModel;
       let session = yield* load(taskId);
       if (session.state.phase !== "assigned" && session.state.phase !== "executing") {
         return yield* fail("contract", `Cannot launch from ${session.state.phase}.`);

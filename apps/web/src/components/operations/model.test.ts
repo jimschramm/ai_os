@@ -50,13 +50,23 @@ describe("operations mockup", () => {
     expect(tasksForProject("ai_os").some((task) => task.projectId === "usba")).toBe(false);
   });
 
-  it("derives project chips from the tasks and labels unknown ids as themselves", () => {
+  it("derives project choices from the tasks and labels unknown ids as themselves", () => {
     const choices = projectChoices(OPERATIONS_TASKS);
     expect(choices.map((choice) => choice.id)).toEqual(["personal", "usba", "ai_os"]);
     expect(choices.map((choice) => choice.label)).toEqual(["Personal", "USBA", "ai_os"]);
     expect(projectLabel("local-repo")).toBe("local-repo");
     expect(projectLabel("usba")).toBe("USBA");
     expect(projectChoices([])).toEqual([]);
+    const liveId = "13fdd883-1111-4111-8111-111111111111";
+    const names = new Map([[liveId, "aios-test"]]);
+    expect(projectLabel(liveId, names)).toBe("aios-test");
+    expect(projectLabel("usba", names)).toBe("USBA");
+    const live = OPERATIONS_TASKS[0];
+    expect(live).toBeDefined();
+    if (live === undefined) return;
+    expect(projectChoices([{ ...live, projectId: liveId }], names)).toEqual([
+      { id: liveId, label: "aios-test" },
+    ]);
   });
 
   it("keeps reported tokens, estimated cost, subscription, and unknown distinct", () => {

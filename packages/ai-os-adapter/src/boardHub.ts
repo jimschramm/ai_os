@@ -1,4 +1,4 @@
-import { SequenceState } from "@t3tools/ai-os-contracts";
+import { ContractId, ContractText, IsoDateTime, SequenceState } from "@t3tools/ai-os-contracts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import type * as Scope from "effect/Scope";
@@ -10,11 +10,11 @@ import { encodeAdapterBoard, type AdapterBoardCard } from "./board.ts";
 
 const WireCards = Schema.Array(
   Schema.Struct({
-    taskId: Schema.String,
-    title: Schema.String,
+    taskId: ContractId,
+    title: ContractText,
     state: SequenceState,
-    threadId: Schema.NullOr(Schema.String),
-    updatedAt: Schema.String,
+    threadId: Schema.NullOr(ContractId),
+    updatedAt: IsoDateTime,
   }),
 );
 
@@ -27,13 +27,26 @@ export const encodeAdapterBoardWire = (cards: readonly AdapterBoardCard[]): stri
 
 export interface AdapterBoardHub {
   readonly snapshot: () => string;
+  /** Replace the snapshot. Used when a saved file is loaded. */
   readonly replace: (text: string) => boolean;
+  /** Insert or update each card by task id. Cards not in the payload stay. */
+  readonly upsert: (text: string) => boolean;
   readonly events: Effect.Effect<HttpServerResponse.HttpServerResponse, never, Scope.Scope>;
 }
 
 const encoder = new TextEncoder();
 
 const frame = (json: string) => encoder.encode(`data: ${json}\n\n`);
+
+type WireCard = (typeof WireCards.Type)[number];
+
+const decodeCards = (text: string): readonly WireCard[] | null => {
+  try {
+    return decodeWire(text);
+  } catch {
+    return null;
+  }
+};
 
 /** In-memory snapshot and server-sent-event fanout. Callers authenticate first. */
 export const makeAdapterBoardHub = (): AdapterBoardHub => {
@@ -44,15 +57,41 @@ export const makeAdapterBoardHub = (): AdapterBoardHub => {
     const next = frame(json);
     for (const listener of listeners) listener(next);
   };
+  const write = (cards: readonly WireCard[]) => {
+    publish(encodeWire(cards));
+  };
   return {
     snapshot: () => snapshot,
     replace: (text) => {
-      try {
-        publish(encodeWire(decodeWire(text)));
-        return true;
-      } catch {
-        return false;
+      const cards = decodeCards(text);
+      if (cards === null) return false;
+      write(cards);
+      return true;
+    },
+    upsert: (text) => {
+      const incoming = decodeCards(text);
+      if (incoming === null) return false;
+      const current = decodeCards(snapshot) ?? [];
+      const merged = new Map<string, WireCard>();
+      for (const card of current) merged.set(card.taskId, card);
+      for (const card of incoming) merged.set(card.taskId, card);
+      const order: WireCard[] = [];
+      const seen = new Set<string>();
+      for (const card of current) {
+        const next = merged.get(card.taskId);
+        if (next === undefined) continue;
+        order.push(next);
+        seen.add(card.taskId);
       }
+      for (const card of incoming) {
+        if (seen.has(card.taskId)) continue;
+        const next = merged.get(card.taskId);
+        if (next === undefined) continue;
+        order.push(next);
+        seen.add(card.taskId);
+      }
+      write(order);
+      return true;
     },
     events: Effect.gen(function* () {
       const queue = yield* Queue.unbounded<Uint8Array>();

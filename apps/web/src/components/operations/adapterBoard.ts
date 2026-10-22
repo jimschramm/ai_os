@@ -88,21 +88,32 @@ const taskFromAdapterCard = (card: AdapterBoardCard): OperationsTask | null => {
   };
 };
 
+const liveTasks = (cards: readonly AdapterBoardCard[]): readonly OperationsTask[] =>
+  cards.flatMap((card) => {
+    const task = taskFromAdapterCard(card);
+    return task === null ? [] : [task];
+  });
+
+/** True when the feed has at least one card the board can show. */
+export const hasLiveBoard = (cards: readonly AdapterBoardCard[]): boolean =>
+  liveTasks(cards).length > 0;
+
 /**
- * Live adapter cards replace a fixture with the same id.
- * Omit `projectId` to keep every project. An empty live list leaves the fixtures.
+ * Live cards stand alone. Fixtures show only when the feed has no live card,
+ * or when `includeFixtures` is set for the dev demo toggle.
+ * Omit `projectId` to keep every project.
  */
 export const tasksForBoard = (
   projectId: string | undefined,
   cards: readonly AdapterBoardCard[],
+  includeFixtures = false,
 ): readonly OperationsTask[] => {
   const fixtures = projectId === undefined ? OPERATIONS_TASKS : tasksForProject(projectId);
-  const live = cards.flatMap((card) => {
-    const task = taskFromAdapterCard(card);
-    if (task === null) return [];
-    return projectId === undefined || task.projectId === projectId ? [task] : [];
-  });
-  if (live.length === 0) return fixtures;
-  const liveIds = new Set(live.map((task) => task.id));
+  const allLive = liveTasks(cards);
+  if (allLive.length === 0) return fixtures;
+  const live =
+    projectId === undefined ? allLive : allLive.filter((task) => task.projectId === projectId);
+  if (!includeFixtures) return live;
+  const liveIds = new Set(allLive.map((task) => task.id));
   return [...live, ...fixtures.filter((task) => !liveIds.has(task.id))];
 };

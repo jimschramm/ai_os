@@ -148,7 +148,7 @@ const makeServer = () => {
       return HttpServerResponse.text("Unauthorized", { status: 401 });
     }
     const text = yield* request.text.pipe(Effect.orElseSucceed(() => ""));
-    if (!hub.replace(text)) return HttpServerResponse.text("Invalid board.", { status: 400 });
+    if (!hub.upsert(text)) return HttpServerResponse.text("Invalid board.", { status: 400 });
     return HttpServerResponse.empty({ status: 204 });
   });
   const layer = HttpRouter.serve(
@@ -486,6 +486,65 @@ it.effect("lists projects and launches in one run", () =>
   }),
 );
 
+it.effect("launches the offered default when the configured model is gpt-5.4", () =>
+  Effect.gen(function* () {
+    let launched = "";
+    const client: T3LocalClient = {
+      listProjectIds: () =>
+        Effect.succeed([
+          {
+            id: "usba",
+            title: "USBA",
+            workspaceRoot: "/work/usba",
+            defaultModel: { instanceId: "codex", model: "gpt-5.4" },
+          },
+        ]),
+      listProviderModels: () =>
+        Effect.succeed({
+          ...CATALOG,
+          serverDefault: { instanceId: "codex", model: "gpt-5.4" },
+        }),
+      publishBoard: () => Effect.void,
+      interrupt: () => Effect.die("interrupt is unused"),
+      continueRun: () => Effect.die("continue is unused"),
+      launch: (input) => {
+        launched = `${input.instanceId ?? ""} ${input.model}`;
+        return Effect.succeed({ threadId: "t3-thread-1", runId: "run-1", resumed: false });
+      },
+      read: () =>
+        Effect.succeed({
+          threadId: "t3-thread-1",
+          runId: "run-1",
+          status: "completed",
+          text: "done",
+          revision: null,
+        }),
+    };
+    yield* runLiveDriver(
+      {
+        origin: LIVE_DRIVER_DEFAULT_ORIGIN,
+        pairingToken: PAIR,
+        projectId: "usba",
+        model: undefined,
+        title: "Tournament page",
+        prompt: "Update the tournament page schedule.",
+        listProjects: false,
+      },
+      {
+        client,
+        clock: () => CLOCK,
+        write: () => undefined,
+        sleep: () => Effect.void,
+        readRepoCommit: () => Promise.resolve(SHA),
+        pollIntervalMs: 0,
+        maxPolls: 3,
+      },
+    );
+    assert.strictEqual(launched, "codex gpt-6-sol");
+    assert.equal(launched.includes("gpt-5.4"), false);
+  }),
+);
+
 it.effect("rejects a model the provider does not offer and lists the valid ones", () =>
   Effect.gen(function* () {
     let launches = 0;
@@ -577,9 +636,14 @@ it.effect("resolves an omitted model from the server catalog", () =>
         serverDefault: null,
       },
     });
-    assert.deepStrictEqual(missing, {
-      error: "Pass --model. Valid models: codex: gpt-5.6-sol.",
+    assert.deepStrictEqual(missing, { instanceId: "codex", model: "gpt-5.6-sol" });
+
+    const stale = resolveDriverModel({
+      requested: undefined,
+      projectDefault: { instanceId: "codex", model: "gpt-5.4" },
+      catalog: { ...CATALOG, serverDefault: { instanceId: "codex", model: "gpt-5.4" } },
     });
+    assert.deepStrictEqual(stale, { instanceId: "codex", model: "gpt-6-sol" });
 
     const empty = resolveDriverModel({
       requested: "gpt-6-sol",

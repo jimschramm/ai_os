@@ -41,8 +41,10 @@ ${LIVE_DRIVER_COMMAND} \\
 
 Omit --project-id to print the ids from GET /api/projects.
 Pass --list-projects together with --project-id, --title, and --prompt to list
-and launch in one run. Omit --model to use the project's configured model, then
-the server default. If that model is not offered, the error lists the valid models.`;
+and launch in one run. Omit --model to use the project's configured model when
+the provider offers it, then the server default, then the provider's default or
+the first available model. An explicit --model that is not offered is an error
+listing the valid models.`;
 
 export class LiveDriverUsageError extends Schema.TaggedError<LiveDriverUsageError>()(
   "LiveDriverUsageError",
@@ -173,7 +175,9 @@ const canonicalModel = (
 
 /**
  * Use an explicit `--model` when it is offered. Otherwise the project default,
- * then the server default, then a model the provider marks as default.
+ * then the server default, when those slugs are actually offered. A configured
+ * slug the provider does not list is skipped. Then a model marked default, then
+ * the first offered model.
  */
 export const resolveDriverModel = (input: {
   readonly requested: string | undefined;
@@ -219,11 +223,9 @@ export const resolveDriverModel = (input: {
     const marked = provider.models.find((model) => model.isDefault);
     if (marked !== undefined) return { instanceId: provider.instanceId, model: marked.slug };
   }
-  const configured = input.projectDefault ?? input.catalog.serverDefault;
-  if (configured !== null) {
-    return {
-      error: `Configured model ${configured.model} is not available. Valid models: ${listed}.`,
-    };
+  for (const provider of providers) {
+    const first = provider.models[0];
+    if (first !== undefined) return { instanceId: provider.instanceId, model: first.slug };
   }
   return { error: `Pass --model. Valid models: ${listed}.` };
 };

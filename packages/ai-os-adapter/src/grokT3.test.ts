@@ -434,7 +434,7 @@ const makeFake = () => {
       yield* boardGate(AuthOrchestrationOperateScope);
       const request = yield* HttpServerRequest.HttpServerRequest;
       const text = yield* request.text.pipe(Effect.orElseSucceed(() => ""));
-      if (!hub.replace(text)) return HttpServerResponse.text("Invalid board.", { status: 400 });
+      if (!hub.upsert(text)) return HttpServerResponse.text("Invalid board.", { status: 400 });
       return HttpServerResponse.empty({ status: 204 });
     }),
   );
@@ -571,6 +571,7 @@ const accessTokenFor = (origin: string, pairingToken: string) =>
   );
 
 const context = assignmentExample.contextPackage;
+const TEST_MODEL = "gpt-5.6-sol";
 
 const record = (
   adapter: ReturnType<typeof createGrokT3Adapter>,
@@ -613,12 +614,28 @@ it.effect("fingerprints the provider launch will use", () =>
   ),
 );
 
+it.effect("does not invent gpt-5.4 when no model is selected", () =>
+  withFake((fake) =>
+    Effect.gen(function* () {
+      const adapter = createGrokT3Adapter({
+        client: t3Client(fake.origin),
+        clock: () => CLOCK,
+      });
+      const failed = yield* record(adapter).pipe(Effect.flip);
+      assert.strictEqual(failed.reason, "invalid_task");
+      assert.equal(failed.detail.includes("gpt-5.4"), false);
+      assert.strictEqual(fake.launchCount(), 0);
+    }),
+  ),
+);
+
 it.effect("launches one T3 thread and reads the completion back", () =>
   withFake((fake) =>
     Effect.gen(function* () {
       const adapter = createGrokT3Adapter({
         client: t3Client(fake.origin),
         clock: () => CLOCK,
+        model: TEST_MODEL,
       });
       const recorded = yield* record(adapter);
       assert.strictEqual(recorded.state.phase, "assigned");
@@ -633,7 +650,7 @@ it.effect("launches one T3 thread and reads the completion back", () =>
       assert.equal(fake.prompt("t3-thread-1").includes(intakeV2Example.request), true);
       assert.strictEqual(fake.requirements("t3-thread-1"), context.requirements);
       assert.strictEqual(fake.hasContext("t3-thread-1"), true);
-      assert.strictEqual(fake.model("t3-thread-1"), "gpt-5.4");
+      assert.strictEqual(fake.model("t3-thread-1"), TEST_MODEL);
       assert.strictEqual(fake.workspace("t3-thread-1"), "root");
 
       yield* adapter.launch(recorded.taskId);
@@ -697,7 +714,12 @@ it.effect("continues an interrupted run on the same thread", () =>
     Effect.gen(function* () {
       const store = memorySessionStore();
       const client = t3Client(fake.origin);
-      const adapter = createGrokT3Adapter({ client, clock: () => CLOCK, store });
+      const adapter = createGrokT3Adapter({
+        client,
+        clock: () => CLOCK,
+        store,
+        model: TEST_MODEL,
+      });
       const recorded = yield* record(adapter);
       const started = yield* adapter.launch(recorded.taskId);
       assert.strictEqual(started.threadId, "t3-thread-1");
@@ -742,7 +764,12 @@ it.effect("reuses the server thread when the local record lost the id", () =>
     Effect.gen(function* () {
       const store = memorySessionStore();
       const client = t3Client(fake.origin);
-      const adapter = createGrokT3Adapter({ client, clock: () => CLOCK, store });
+      const adapter = createGrokT3Adapter({
+        client,
+        clock: () => CLOCK,
+        store,
+        model: TEST_MODEL,
+      });
       const recorded = yield* record(adapter);
       const request = {
         idempotencyKey: recorded.launchKey,
@@ -771,6 +798,7 @@ it.effect("interrupts the run once when cancel is repeated", () =>
       const adapter = createGrokT3Adapter({
         client: t3Client(fake.origin),
         clock: () => CLOCK,
+        model: TEST_MODEL,
       });
       const recorded = yield* record(adapter);
       const started = yield* adapter.launch(recorded.taskId);
@@ -790,6 +818,7 @@ it.effect("refuses a changed title and an undeclared capability", () =>
       const adapter = createGrokT3Adapter({
         client: t3Client(fake.origin),
         clock: () => CLOCK,
+        model: TEST_MODEL,
       });
       yield* record(adapter);
       const conflict = yield* record(
@@ -868,12 +897,14 @@ it.effect("rejects an unauthenticated socket and a read-only launch", () =>
         client: t3Client(fake.origin),
         clock: () => CLOCK,
         store,
+        model: TEST_MODEL,
       });
       const recorded = yield* record(adapter);
       const readOnly = createGrokT3Adapter({
         client: t3Client(fake.origin, PAIR_READ),
         clock: () => CLOCK,
         store,
+        model: TEST_MODEL,
       });
       const denied = yield* readOnly.launch(recorded.taskId).pipe(Effect.flip);
       assert.strictEqual(denied.reason, "t3_rejected");
@@ -889,6 +920,7 @@ it.effect("invokes every advertised capability", () =>
       const adapter = createGrokT3Adapter({
         client: t3Client(fake.origin),
         clock: () => CLOCK,
+        model: TEST_MODEL,
       });
       const recorded = yield* record(adapter);
       const receiveContext = adapter.operations.receive_context;
@@ -955,6 +987,7 @@ it.effect("publishes board cards on the T3 origin", () =>
       const adapter = createGrokT3Adapter({
         client: t3Client(fake.origin),
         clock: () => CLOCK,
+        model: TEST_MODEL,
       });
       yield* record(adapter);
       const token = yield* accessTokenFor(fake.origin, PAIR_OPERATE);
