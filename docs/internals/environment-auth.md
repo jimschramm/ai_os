@@ -94,12 +94,15 @@ address still needs a pairing credential. A loopback bind also covers a socket
 that did not report a peer. Listening on every interface does not extend that
 trust past a loopback peer.
 
-Trust stops when `X-Forwarded-For` or `Forwarded` is present, so a proxy cannot
-present a public client as loopback. `Host`, and `Origin` when the browser sends
-one, must be `localhost`, `127.0.0.1`, or `::1`. The dev proxy rewrites `Host`
-on `/api` to the backend target and leaves `Origin` as the page origin, so those
-names do not have to be identical. A real bearer or cookie is checked first and
-keeps its own scopes.
+Trust stops when `X-Forwarded-For` or `Forwarded` names a client that is not
+loopback. The Vite dev server binds to `127.0.0.1` and appends the peer it
+accepted, so a remote client proxied as loopback does not become the owner. A
+chain that is only loopback is the local browser. `Host`, and `Origin` when the
+browser sends one, must be `localhost`, `127.0.0.1`, or `::1`. The dev proxy
+rewrites `Host` on `/api` to the backend target and leaves `Origin` as the page
+origin, so those names do not have to be identical. A websocket ticket for that
+owner session is checked again on upgrade. A real bearer or cookie is checked
+first and keeps its own scopes.
 
 ### Reusable dev credential
 

@@ -166,7 +166,7 @@ export const createGrokT3Adapter = (input: {
   const store = input.store ?? memorySessionStore();
   const workerId = input.workerId ?? "codex-t3";
   const model = input.model ?? "gpt-5.4";
-  const instanceId = input.instanceId;
+  const resolvedInstanceId = input.instanceId ?? T3_LAUNCH_DEFAULTS.instanceId;
 
   const load = (taskId: string) => {
     const session = store.get(taskId);
@@ -224,7 +224,7 @@ export const createGrokT3Adapter = (input: {
       const launchKey = fingerprintOf({
         projectId: intake.projectId,
         title,
-        modelSelection: { instanceId: T3_LAUNCH_DEFAULTS.instanceId, model },
+        modelSelection: { instanceId: resolvedInstanceId, model },
         runtimeMode: T3_LAUNCH_DEFAULTS.runtimeMode,
         interactionMode: T3_LAUNCH_DEFAULTS.interactionMode,
         workspaceStrategy: T3_LAUNCH_DEFAULTS.workspaceStrategy,
@@ -280,7 +280,7 @@ export const createGrokT3Adapter = (input: {
           projectId: intake.projectId,
           title: session.title,
           model,
-          ...(instanceId === undefined ? {} : { instanceId }),
+          instanceId: resolvedInstanceId,
           prompt: renderPrompt(intake, session.state.assignment.contextPackage),
           contextPackage: session.state.assignment.contextPackage,
         });

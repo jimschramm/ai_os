@@ -6,8 +6,13 @@
  *
  * The dev proxy rewrites `/api` Host to the backend (`localhost:<port>`) and
  * leaves Origin as the page (`http://127.0.0.1:5733`). Both names are
- * loopback, and they do not have to be the same string.
+ * loopback, and they do not have to be the same string. The proxy also stamps
+ * the peer it accepted onto `X-Forwarded-For`. A non-loopback address in that
+ * chain is a remote client, and it does not become the owner.
  */
+
+/** Client label of the session minted for an unproxied loopback socket. */
+export const LOOPBACK_OWNER_CLIENT_LABEL = "Loopback owner";
 
 export type LoopbackTrustRejection =
   | "disabled"
@@ -65,8 +70,16 @@ export function evaluateLoopbackTrust(input: {
     return { ok: false, reason: "not-loopback" };
   }
 
+  // A local browser through the dev proxy is still loopback. Any other
+  // forwarded client was accepted by that proxy from somewhere else.
   if (headerPresent(input.forwardedFor) || headerPresent(input.forwarded)) {
-    return { ok: false, reason: "forwarded" };
+    const clients = [
+      ...forwardedForAddresses(input.forwardedFor),
+      ...forwardedHeaderAddresses(input.forwarded),
+    ];
+    if (clients.length === 0 || clients.some((address) => !isLoopbackAddress(address))) {
+      return { ok: false, reason: "forwarded" };
+    }
   }
 
   if (!isLoopbackHostname(hostnameFromHostHeader(input.host))) {
@@ -102,6 +115,41 @@ export function remoteAddressFromSource(source: unknown): string | undefined {
 
 function headerPresent(value: string | undefined): boolean {
   return value !== undefined && value.trim().length > 0;
+}
+
+function forwardedForAddresses(value: string | undefined): readonly string[] {
+  if (value === undefined || value.trim().length === 0) return [];
+  return value
+    .split(",")
+    .map((entry) => addressHost(entry))
+    .filter((entry): entry is string => entry !== undefined);
+}
+
+function forwardedHeaderAddresses(value: string | undefined): readonly string[] {
+  if (value === undefined || value.trim().length === 0) return [];
+  const addresses: string[] = [];
+  for (const match of value.matchAll(/(?:^|[;,])\s*for\s*=\s*(?:"([^"]+)"|([^;,\s"]+))/gi)) {
+    const token = match[1] ?? match[2];
+    const host = token === undefined ? undefined : addressHost(token);
+    if (host !== undefined) addresses.push(host);
+  }
+  return addresses;
+}
+
+function addressHost(token: string): string | undefined {
+  const value = token.trim().toLowerCase();
+  if (value.length === 0 || value === "unknown" || value === "hidden" || value === "_hidden") {
+    return undefined;
+  }
+  if (value.startsWith("[")) {
+    const end = value.indexOf("]");
+    return end > 1 ? value.slice(1, end) : undefined;
+  }
+  const colon = value.indexOf(":");
+  if (colon > 0 && value.indexOf(":", colon + 1) === -1 && /^\d+$/.test(value.slice(colon + 1))) {
+    return value.slice(0, colon);
+  }
+  return value;
 }
 
 function normalizeIpAddress(value: string | null | undefined): string | undefined {

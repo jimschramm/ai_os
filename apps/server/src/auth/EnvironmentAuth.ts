@@ -48,8 +48,10 @@ import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as SynchronizedRef from "effect/SynchronizedRef";
 import {
   evaluateLoopbackTrust,
+  LOOPBACK_OWNER_CLIENT_LABEL,
   loopbackTrustDiagnostic,
   remoteAddressFromSource,
+  type LoopbackTrustDecision,
 } from "./loopbackTrust.ts";
 
 const DEFAULT_SESSION_SUBJECT = "cli-issued-session";
@@ -802,7 +804,7 @@ export const make = Effect.gen(function* () {
           subject: "owner",
           method: "bearer-access-token",
           scopes: AuthStandardClientScopes,
-          client: { label: "Loopback owner", deviceType: "unknown" },
+          client: { label: LOOPBACK_OWNER_CLIENT_LABEL, deviceType: "unknown" },
         })
         .pipe(Effect.mapError((cause) => new ServerAuthAuthenticatedSessionIssueError({ cause })));
       const session: AuthenticatedSession = {
@@ -816,8 +818,10 @@ export const make = Effect.gen(function* () {
     }),
   );
 
-  const authenticateUncredentialedRequest = (request: HttpServerRequest.HttpServerRequest) => {
-    const decision = evaluateLoopbackTrust({
+  const loopbackTrustDecision = (
+    request: HttpServerRequest.HttpServerRequest,
+  ): LoopbackTrustDecision =>
+    evaluateLoopbackTrust({
       trustLoopback: config.trustLoopback === true,
       bindHost: config.host,
       remoteAddress: remoteAddressFromSource(request.source),
@@ -826,6 +830,9 @@ export const make = Effect.gen(function* () {
       host: request.headers.host,
       origin: request.headers.origin,
     });
+
+  const authenticateUncredentialedRequest = (request: HttpServerRequest.HttpServerRequest) => {
+    const decision = loopbackTrustDecision(request);
     if (decision.ok) return loopbackOwnerSession;
     if (
       decision.reason === "forwarded" ||
@@ -1303,6 +1310,20 @@ export const make = Effect.gen(function* () {
           return yield* sessions.verifyWebSocketToken(websocketTicket).pipe(
             mapSessionVerificationErrors,
             Effect.flatMap(rejectMcpClientAudience),
+            Effect.flatMap((session) => {
+              if (session.client.label !== LOOPBACK_OWNER_CLIENT_LABEL) {
+                return Effect.succeed(session);
+              }
+              const decision = loopbackTrustDecision(request);
+              if (decision.ok) return Effect.succeed(session);
+              const diagnostic =
+                decision.reason === "forwarded" ||
+                decision.reason === "bad-host" ||
+                decision.reason === "bad-origin"
+                  ? loopbackTrustDiagnostic(decision.reason)
+                  : "A loopback owner ticket is only accepted from a loopback client.";
+              return Effect.fail(new ServerAuthInvalidCredentialError({ diagnostic }));
+            }),
             Effect.map((session) => ({
               sessionId: session.sessionId,
               subject: session.subject,

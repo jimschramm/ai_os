@@ -60,6 +60,13 @@ describe("evaluateLoopbackTrust", () => {
       ok: false,
       reason: "forwarded",
     });
+    expect(evaluateLoopbackTrust({ ...trusted, forwardedFor: "127.0.0.1, 203.0.113.5" })).toEqual({
+      ok: false,
+      reason: "forwarded",
+    });
+    expect(evaluateLoopbackTrust({ ...trusted, forwardedFor: "127.0.0.1" })).toEqual({
+      ok: true,
+    });
     expect(evaluateLoopbackTrust({ ...trusted, forwarded: "for=1.2.3.4" })).toEqual({
       ok: false,
       reason: "forwarded",

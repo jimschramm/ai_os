@@ -74,8 +74,10 @@ const loopbackRequest = (input: {
   readonly forwardedFor?: string;
   readonly forwarded?: string;
   readonly authorization?: string;
+  readonly url?: string;
 }): Parameters<EnvironmentAuth.EnvironmentAuth["Service"]["authenticateHttpRequest"]>[0] =>
   ({
+    ...(input.url === undefined ? {} : { url: input.url }),
     cookies: {},
     headers: {
       ...(input.host === undefined ? {} : { host: input.host }),
@@ -823,6 +825,60 @@ it.layer(NodeServices.layer)("EnvironmentAuth.layer", (it) => {
         expect(host.diagnostic).toContain("host");
       }
     }).pipe(Effect.provide(layerEnvironmentAuth({ trustLoopback: true }))),
+  );
+
+  it.effect("does not grant owner access to a remote client through the dev proxy", () =>
+    Effect.gen(function* () {
+      const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;
+      const proxiedRemote = loopbackRequest({
+        remoteAddress: "127.0.0.1",
+        host: "localhost:13773",
+        forwardedFor: "203.0.113.5",
+      });
+      const denied = yield* Effect.flip(serverAuth.authenticateHttpRequest(proxiedRemote));
+      expect(denied._tag).toBe("ServerAuthInvalidCredentialError");
+      const state = yield* serverAuth.getSessionState(proxiedRemote);
+      expect(state.authenticated).toBe(false);
+
+      const owner = yield* serverAuth.authenticateHttpRequest(
+        loopbackRequest({ remoteAddress: "127.0.0.1", host: "localhost:13773" }),
+      );
+      const ticket = yield* serverAuth.issueWebSocketTicket(owner);
+      const replayed = yield* Effect.flip(
+        serverAuth.authenticateWebSocketUpgrade(
+          loopbackRequest({
+            remoteAddress: "127.0.0.1",
+            host: "localhost:13773",
+            forwardedFor: "127.0.0.1, 203.0.113.5",
+            url: `/ws?wsTicket=${encodeURIComponent(ticket.ticket)}`,
+          }),
+        ),
+      );
+      expect(replayed._tag).toBe("ServerAuthInvalidCredentialError");
+
+      const localProxy = yield* serverAuth.authenticateWebSocketUpgrade(
+        loopbackRequest({
+          remoteAddress: "127.0.0.1",
+          host: "localhost:13773",
+          forwardedFor: "127.0.0.1",
+          url: `/ws?wsTicket=${encodeURIComponent(ticket.ticket)}`,
+        }),
+      );
+      expect(localProxy.sessionId).toBe(owner.sessionId);
+      expect(localProxy.scopes).toEqual(AuthStandardClientScopes);
+
+      const paired = yield* serverAuth.issueSession();
+      const pairedTicket = yield* serverAuth.issueWebSocketTicket(paired);
+      const remotePaired = yield* serverAuth.authenticateWebSocketUpgrade(
+        loopbackRequest({
+          remoteAddress: "203.0.113.5",
+          host: "203.0.113.5:13773",
+          url: `/ws?wsTicket=${encodeURIComponent(pairedTicket.ticket)}`,
+        }),
+      );
+      expect(remotePaired.sessionId).toBe(paired.sessionId);
+      expect(remotePaired.subject).not.toBe("owner");
+    }).pipe(Effect.provide(layerEnvironmentAuth({ trustLoopback: true, host: "0.0.0.0" }))),
   );
 
   it.effect("leaves loopback unauthenticated when trust is off", () =>

@@ -80,6 +80,7 @@ interface StoredThread {
   requirements: string;
   hasContext: boolean;
   model: string;
+  instanceId: string;
   workspace: string;
   status: "running" | "completed" | "interrupted";
   text: string | null;
@@ -99,6 +100,7 @@ interface FakeT3 {
   readonly requirements: (threadId: string) => string;
   readonly hasContext: (threadId: string) => boolean;
   readonly model: (threadId: string) => string;
+  readonly instanceId: (threadId: string) => string;
   readonly workspace: (threadId: string) => string;
   readonly runId: (threadId: string) => string;
   readonly continuedRunId: (threadId: string) => string | undefined;
@@ -298,6 +300,7 @@ const makeFake = () => {
                 ),
           hasContext: context?.records.some((record) => record.kind === "context-package") === true,
           model: input.modelSelection.model,
+          instanceId: input.modelSelection.instanceId,
           workspace: input.workspaceStrategy.type,
           status: "running",
           text: null,
@@ -494,6 +497,7 @@ const makeFake = () => {
     requirements: (threadId) => threads.get(threadId)?.requirements ?? "",
     hasContext: (threadId) => threads.get(threadId)?.hasContext === true,
     model: (threadId) => threads.get(threadId)?.model ?? "",
+    instanceId: (threadId) => threads.get(threadId)?.instanceId ?? "",
     workspace: (threadId) => threads.get(threadId)?.workspace ?? "",
     runId: (threadId) => threads.get(threadId)?.runId ?? "",
     continuedRunId: (threadId) => continues.get(threadId),
@@ -580,6 +584,34 @@ const record = (
     intake,
     context,
   });
+
+it.effect("fingerprints the provider launch will use", () =>
+  withFake((fake) =>
+    Effect.gen(function* () {
+      const client = t3Client(fake.origin);
+      const grok = createGrokT3Adapter({
+        client,
+        clock: () => CLOCK,
+        instanceId: "grok",
+        model: "gpt-5.4",
+      });
+      const codex = createGrokT3Adapter({
+        client,
+        clock: () => CLOCK,
+        instanceId: "codex",
+        model: "gpt-5.4",
+      });
+      const grokRecorded = yield* record(grok, "task-grok-page");
+      const codexRecorded = yield* record(codex, "task-codex-page");
+      assert.notStrictEqual(grokRecorded.launchKey, codexRecorded.launchKey);
+
+      const started = yield* grok.launch(grokRecorded.taskId);
+      assert.strictEqual(started.threadId, "t3-thread-1");
+      assert.strictEqual(fake.instanceId("t3-thread-1"), "grok");
+      assert.strictEqual(fake.model("t3-thread-1"), "gpt-5.4");
+    }),
+  ),
+);
 
 it.effect("launches one T3 thread and reads the completion back", () =>
   withFake((fake) =>
