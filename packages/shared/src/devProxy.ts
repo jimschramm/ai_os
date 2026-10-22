@@ -26,3 +26,59 @@ export function isDevProxiedPath(pathname: string): boolean {
     (prefix) => pathname === prefix || pathname.startsWith(`${prefix}/`),
   );
 }
+
+/**
+ * Default Vite bind. `localhost` can follow DNS; an unset host listens on
+ * every interface. Remote clients must not reach the dev proxy, because the
+ * backend would otherwise see only the proxy's loopback socket.
+ */
+export const DEV_SERVER_BIND_HOST = "127.0.0.1";
+
+/** Keep any client-supplied chain, then append the peer this proxy accepted. */
+export function appendObservedClientAddress(
+  existing: string | readonly string[] | undefined,
+  socketAddress: string | undefined,
+): string | undefined {
+  const prior = forwardedForText(existing);
+  const observed = socketAddress?.trim() ?? "";
+  if (observed.length === 0) return prior.length > 0 ? prior : undefined;
+  return prior.length === 0 ? observed : `${prior}, ${observed}`;
+}
+
+export function bindDevProxyClientAddress(proxy: {
+  on(
+    event: "proxyReq" | "proxyReqWs",
+    listener: (
+      proxyReq: { setHeader(name: string, value: string): void },
+      req: {
+        readonly headers: { readonly [name: string]: string | readonly string[] | undefined };
+        readonly socket: { readonly remoteAddress?: string | undefined };
+      },
+    ) => void,
+  ): void;
+}): void {
+  const forward = (
+    proxyReq: { setHeader(name: string, value: string): void },
+    req: {
+      readonly headers: { readonly [name: string]: string | readonly string[] | undefined };
+      readonly socket: { readonly remoteAddress?: string | undefined };
+    },
+  ) => {
+    const value = appendObservedClientAddress(
+      req.headers["x-forwarded-for"],
+      req.socket.remoteAddress,
+    );
+    if (value !== undefined) proxyReq.setHeader("x-forwarded-for", value);
+  };
+  proxy.on("proxyReq", forward);
+  proxy.on("proxyReqWs", forward);
+}
+
+function forwardedForText(existing: string | readonly string[] | undefined): string {
+  if (typeof existing === "string") return existing.trim();
+  if (existing === undefined) return "";
+  return existing
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0)
+    .join(", ");
+}

@@ -4,22 +4,29 @@
 
 The driver records one intake, launches it on a local T3 server, prints progress, and publishes the task to that server's `/api/ai-os/board`. `/operations` reads the same hub.
 
-The server prints a pairing URL at startup. Export that token as `T3_PAIRING_TOKEN` in the environment before running the driver. Run the commands below from the repository root. A package-manager runner prints its child command, so this Node entry is the only invocation.
+A loopback server (`localhost`, `127.0.0.1`, or `::1`) needs no pairing token. The server treats that connection as the owner. For any other origin, set `T3_PAIRING_TOKEN` for that run. The token is not saved. A package-manager runner prints its child command, so this Node entry is the only invocation, and the token is never an argument.
 
 List project ids:
 
 ```sh
-T3_PAIRING_TOKEN="<token>" node --experimental-strip-types packages/ai-os-adapter/scripts/live-driver.ts \
+node --experimental-strip-types packages/ai-os-adapter/scripts/live-driver.ts \
   --list-projects
 ```
 
-Launch one task. `--origin` defaults to `http://127.0.0.1:13773`. `--model` defaults to `gpt-5.4`. Omit `--project-id` to print the same list and stop.
+Launch one task. `--origin` defaults to `http://127.0.0.1:13773`. Omit `--model` to use the project's configured model, then the server default. If the model is not one the provider offers, the error lists the valid models. The same command can list and launch when `--project-id`, `--title`, and `--prompt` are all present. Omit `T3_PAIRING_TOKEN` on loopback. Set it when `--origin` is not loopback.
+
+```sh
+node --experimental-strip-types packages/ai-os-adapter/scripts/live-driver.ts \
+  --origin http://127.0.0.1:13773 \
+  --project-id <id> \
+  --title "Tournament page" \
+  --prompt "Update the tournament page schedule."
+```
 
 ```sh
 T3_PAIRING_TOKEN="<token>" node --experimental-strip-types packages/ai-os-adapter/scripts/live-driver.ts \
-  --origin http://127.0.0.1:13773 \
+  --origin http://host.example:13773 \
   --project-id <id> \
-  --model gpt-5.4 \
   --title "Tournament page" \
   --prompt "Update the tournament page schedule."
 ```

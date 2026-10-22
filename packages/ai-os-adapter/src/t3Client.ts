@@ -22,6 +22,7 @@ import {
   ProjectId,
   ProviderInstanceId,
   RpcScopeAuthorization,
+  WS_METHODS,
   RunId,
   ThreadId,
   type OrchestrationV2ThreadProjection,
@@ -81,6 +82,7 @@ const decodeProjectList = Schema.decodeUnknownEffect(
           title: Schema.String,
           workspaceRoot: Schema.String,
           deletedAt: Schema.NullOr(Schema.String),
+          defaultModelSelection: Schema.optional(Schema.Unknown),
         }),
       ),
     }),
@@ -98,6 +100,7 @@ export interface T3LaunchRequest {
   readonly prompt: string;
   readonly contextPackage: ContextPackageSnapshotV1;
   readonly model: string;
+  readonly instanceId?: string;
 }
 
 export interface T3LaunchResult {
@@ -128,6 +131,28 @@ export interface T3ProjectSummary {
   readonly id: string;
   readonly title: string;
   readonly workspaceRoot: string;
+  readonly defaultModel: T3ModelSelection | null;
+}
+
+export interface T3ModelSelection {
+  readonly instanceId: string;
+  readonly model: string;
+}
+
+export interface T3ModelOffer {
+  readonly slug: string;
+  readonly aliases: readonly string[];
+  readonly isDefault: boolean;
+}
+
+export interface T3ProviderModels {
+  readonly instanceId: string;
+  readonly models: readonly T3ModelOffer[];
+}
+
+export interface T3ModelCatalog {
+  readonly providers: readonly T3ProviderModels[];
+  readonly serverDefault: T3ModelSelection | null;
 }
 
 export interface T3LocalClient {
@@ -137,6 +162,7 @@ export interface T3LocalClient {
   readonly continueRun: (input: T3ContinueRequest) => Effect.Effect<void, GrokT3Error>;
   readonly publishBoard: (cards: readonly AdapterBoardCard[]) => Effect.Effect<void, GrokT3Error>;
   readonly listProjectIds: () => Effect.Effect<readonly T3ProjectSummary[], GrokT3Error>;
+  readonly listProviderModels: () => Effect.Effect<T3ModelCatalog, GrokT3Error>;
 }
 
 const unavailable = (detail: string) => new GrokT3Error({ reason: "t3_unavailable", detail });
@@ -274,15 +300,82 @@ const withRpc = <A>(
 
 export interface T3ClientOptions {
   readonly origin: string;
-  readonly pairingToken: string;
+  readonly pairingToken?: string;
 }
+
+const modelSelectionOf = (value: unknown): T3ModelSelection | null => {
+  if (typeof value !== "object" || value === null) return null;
+  const record = value as Record<string, unknown>;
+  const instanceId =
+    typeof record.instanceId === "string"
+      ? record.instanceId
+      : typeof record.provider === "string"
+        ? record.provider
+        : "";
+  const model = typeof record.model === "string" ? record.model.trim() : "";
+  if (instanceId.length === 0 || model.length === 0) return null;
+  return { instanceId, model };
+};
+
+/** Pull provider models and the server default out of a `server.getConfig` payload. */
+export const readProviderCatalog = (value: unknown): T3ModelCatalog | null => {
+  if (typeof value !== "object" || value === null || !("providers" in value)) return null;
+  const providersValue = (value as { readonly providers?: unknown }).providers;
+  if (!Array.isArray(providersValue)) return null;
+  const providers: T3ProviderModels[] = [];
+  for (const entry of providersValue) {
+    if (typeof entry !== "object" || entry === null) continue;
+    const record = entry as Record<string, unknown>;
+    if (record.enabled === false) continue;
+    if (typeof record.instanceId !== "string" || record.instanceId.length === 0) continue;
+    if (!Array.isArray(record.models)) continue;
+    const models: T3ModelOffer[] = [];
+    for (const model of record.models) {
+      if (typeof model !== "object" || model === null) continue;
+      const item = model as Record<string, unknown>;
+      if (item.isLegacy === true) continue;
+      if (typeof item.slug !== "string" || item.slug.trim().length === 0) continue;
+      const aliases = Array.isArray(item.aliases)
+        ? item.aliases.flatMap((alias) =>
+            typeof alias === "string" && alias.length > 0 ? [alias] : [],
+          )
+        : [];
+      models.push({
+        slug: item.slug.trim(),
+        aliases,
+        isDefault: item.isDefault === true,
+      });
+    }
+    providers.push({ instanceId: record.instanceId, models });
+  }
+  const settings = (value as { readonly settings?: unknown }).settings;
+  const serverDefault =
+    typeof settings === "object" && settings !== null
+      ? modelSelectionOf(
+          (settings as { readonly defaultModelSelection?: unknown }).defaultModelSelection,
+        )
+      : null;
+  return { providers, serverDefault };
+};
+
+const RpcCallFailure = Schema.Struct({});
+
+export const T3ConfigRpc = RpcGroup.make(
+  Rpc.make(WS_METHODS.serverGetConfig, {
+    payload: Schema.Struct({}),
+    success: Schema.Unknown,
+    error: RpcCallFailure,
+  }),
+).middleware(RpcScopeAuthorization);
 
 /**
  * Websocket client for a local T3 server.
  *
- * A pairing token is exchanged for a bearer, and each socket mints its own
- * `wsTicket`, because the upgrade authenticates that ticket and RPC then checks
- * scopes. Launch is `orchestration.launchThread`. Cancel is `run.interrupt`.
+ * A pairing token, when one is set, is exchanged for a bearer. Loopback calls
+ * with no token send no Authorization header and rely on the server's loopback
+ * owner session. Each socket mints its own `wsTicket`, because the upgrade
+ * authenticates that ticket and RPC then checks scopes. Launch is
+ * `orchestration.launchThread`. Cancel is `run.interrupt`.
  * Continue is `message.dispatch` with `manualContinuationOfRunId`. Reads use
  * `orchestration.getThreadProjection`. Nothing here spawns Codex or calls an
  * update endpoint.
@@ -291,38 +384,52 @@ export const wsT3LocalClient = (options: T3ClientOptions): T3LocalClient => {
   const { origin, pairingToken } = options;
   const http = usingHttp(origin);
   let cachedBearer: string | undefined;
-  const accessToken = http(
+  const exchange = Effect.gen(function* () {
+    const tokenValue = pairingToken?.trim() ?? "";
+    if (tokenValue.length === 0) {
+      return yield* new GrokT3Error({
+        reason: "unauthenticated",
+        detail: "Set T3_PAIRING_TOKEN.",
+      });
+    }
+    const body = new URLSearchParams({
+      grant_type: AuthTokenExchangeGrantType,
+      subject_token: tokenValue,
+      subject_token_type: AuthEnvironmentBootstrapTokenType,
+      requested_token_type: AuthAccessTokenType,
+      scope: requestedScopes,
+    }).toString();
+    const response = yield* HttpClient.execute(
+      HttpClientRequest.post(`${origin}/oauth/token`).pipe(
+        HttpClientRequest.bodyText(body, "application/x-www-form-urlencoded"),
+      ),
+    );
+    if (response.status !== 200) {
+      return yield* statusError(response.status, "exchange the pairing token");
+    }
+    const token = yield* decodeAccessToken(yield* response.text).pipe(
+      Effect.mapError(() => unavailable("T3 returned an unreadable access token.")),
+    );
+    cachedBearer = token.access_token;
+    return token.access_token;
+  });
+  const accessToken = Effect.gen(function* () {
+    if (cachedBearer !== undefined) return cachedBearer;
+    return yield* exchange;
+  });
+  const responseFor = (build: () => HttpClientRequest.HttpClientRequest) =>
     Effect.gen(function* () {
-      if (cachedBearer !== undefined) return cachedBearer;
-      const body = new URLSearchParams({
-        grant_type: AuthTokenExchangeGrantType,
-        subject_token: pairingToken,
-        subject_token_type: AuthEnvironmentBootstrapTokenType,
-        requested_token_type: AuthAccessTokenType,
-        scope: requestedScopes,
-      }).toString();
-      const response = yield* HttpClient.execute(
-        HttpClientRequest.post(`${origin}/oauth/token`).pipe(
-          HttpClientRequest.bodyText(body, "application/x-www-form-urlencoded"),
-        ),
-      );
-      if (response.status !== 200) {
-        return yield* statusError(response.status, "exchange the pairing token");
-      }
-      const token = yield* decodeAccessToken(yield* response.text).pipe(
-        Effect.mapError(() => unavailable("T3 returned an unreadable access token.")),
-      );
-      cachedBearer = token.access_token;
-      return token.access_token;
-    }),
-  );
+      const tokenValue = pairingToken?.trim() ?? "";
+      const request =
+        tokenValue.length === 0
+          ? build()
+          : HttpClientRequest.setHeader(build(), "authorization", `Bearer ${yield* accessToken}`);
+      return yield* HttpClient.execute(request);
+    });
   const issueTicket = http(
     Effect.gen(function* () {
-      const bearer = yield* accessToken;
-      const response = yield* HttpClient.execute(
-        HttpClientRequest.post(`${origin}/api/auth/websocket-ticket`).pipe(
-          HttpClientRequest.setHeader("authorization", `Bearer ${bearer}`),
-        ),
+      const response = yield* responseFor(() =>
+        HttpClientRequest.post(`${origin}/api/auth/websocket-ticket`),
       );
       if (response.status !== 200) {
         return yield* statusError(response.status, "issue a websocket ticket");
@@ -346,7 +453,7 @@ export const wsT3LocalClient = (options: T3ClientOptions): T3LocalClient => {
           projectId: ProjectId.make(input.projectId),
           title: input.title,
           modelSelection: {
-            instanceId: ProviderInstanceId.make(T3_LAUNCH_DEFAULTS.instanceId),
+            instanceId: ProviderInstanceId.make(input.instanceId ?? T3_LAUNCH_DEFAULTS.instanceId),
             model: input.model,
           },
           runtimeMode: T3_LAUNCH_DEFAULTS.runtimeMode,
@@ -407,10 +514,8 @@ export const wsT3LocalClient = (options: T3ClientOptions): T3LocalClient => {
   const publishBoard = (cards: readonly AdapterBoardCard[]) =>
     http(
       Effect.gen(function* () {
-        const bearer = yield* accessToken;
-        const response = yield* HttpClient.execute(
+        const response = yield* responseFor(() =>
           HttpClientRequest.post(`${origin}${ADAPTER_BOARD_PATH}`).pipe(
-            HttpClientRequest.setHeader("authorization", `Bearer ${bearer}`),
             HttpClientRequest.bodyText(encodeAdapterBoardWire(cards), "application/json"),
           ),
         );
@@ -422,12 +527,7 @@ export const wsT3LocalClient = (options: T3ClientOptions): T3LocalClient => {
   const listProjectIds = () =>
     http(
       Effect.gen(function* () {
-        const bearer = yield* accessToken;
-        const response = yield* HttpClient.execute(
-          HttpClientRequest.get(`${origin}/api/projects`).pipe(
-            HttpClientRequest.setHeader("authorization", `Bearer ${bearer}`),
-          ),
-        );
+        const response = yield* responseFor(() => HttpClientRequest.get(`${origin}/api/projects`));
         if (response.status !== 200) {
           return yield* statusError(response.status, "list projects");
         }
@@ -436,10 +536,50 @@ export const wsT3LocalClient = (options: T3ClientOptions): T3LocalClient => {
         );
         return body.projects.flatMap((project) =>
           project.deletedAt === null
-            ? [{ id: project.id, title: project.title, workspaceRoot: project.workspaceRoot }]
+            ? [
+                {
+                  id: project.id,
+                  title: project.title,
+                  workspaceRoot: project.workspaceRoot,
+                  defaultModel: modelSelectionOf(project.defaultModelSelection),
+                },
+              ]
             : [],
         );
       }),
     );
-  return { launch, read, interrupt, continueRun, publishBoard, listProjectIds };
+  const listProviderModels = () =>
+    Effect.gen(function* () {
+      const wsTicket = yield* issueTicket;
+      const config = yield* Effect.scoped(
+        Effect.gen(function* () {
+          const protocol = yield* RpcClient.makeProtocolSocket({
+            retryTransientErrors: false,
+            retryPolicy: Schedule.recurs(0),
+          });
+          const client = yield* RpcClient.make(T3ConfigRpc).pipe(
+            Effect.provideService(RpcClient.Protocol, protocol),
+          );
+          return yield* client[WS_METHODS.serverGetConfig]({}).pipe(
+            Effect.mapError(() => unavailable("T3 did not answer with its model list.")),
+          );
+        }),
+      ).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            NodeSocket.layerWebSocket(socketUrl(origin, wsTicket), { openTimeout: "5 seconds" }),
+            RpcSerialization.layerJson,
+          ),
+        ),
+        Effect.mapError((error) =>
+          isGrokT3Error(error) ? error : unavailable("T3 did not answer with its model list."),
+        ),
+      );
+      const catalog = readProviderCatalog(config);
+      if (catalog === null) {
+        return yield* unavailable("T3 returned an unreadable model list.");
+      }
+      return catalog;
+    });
+  return { launch, read, interrupt, continueRun, publishBoard, listProjectIds, listProviderModels };
 };

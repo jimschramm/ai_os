@@ -7,6 +7,8 @@ import {
   columnFor,
   contextFactIds,
   needsYou,
+  projectChoices,
+  projectLabel,
   qaStatusLabel,
   tasksForProject,
   tasksInColumn,
@@ -46,6 +48,15 @@ describe("operations mockup", () => {
   it("filters tasks to the selected workspace", () => {
     expect(tasksForProject("personal").every((task) => task.projectId === "personal")).toBe(true);
     expect(tasksForProject("ai_os").some((task) => task.projectId === "usba")).toBe(false);
+  });
+
+  it("derives project chips from the tasks and labels unknown ids as themselves", () => {
+    const choices = projectChoices(OPERATIONS_TASKS);
+    expect(choices.map((choice) => choice.id)).toEqual(["personal", "usba", "ai_os"]);
+    expect(choices.map((choice) => choice.label)).toEqual(["Personal", "USBA", "ai_os"]);
+    expect(projectLabel("local-repo")).toBe("local-repo");
+    expect(projectLabel("usba")).toBe("USBA");
+    expect(projectChoices([])).toEqual([]);
   });
 
   it("keeps reported tokens, estimated cost, subscription, and unknown distinct", () => {

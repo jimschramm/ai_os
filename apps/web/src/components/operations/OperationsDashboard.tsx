@@ -20,20 +20,24 @@ import { MemoryBrowser } from "./MemoryBrowser";
 import { UsageGauges } from "./UsageGauges";
 import { tasksForBoard } from "./adapterBoard";
 import { useAdapterBoard } from "./adapterFeed";
-import type { NeedsYouItem, OperationsProjectId, OperationsTask } from "./fixtures";
+import type { NeedsYouItem, OperationsAgent, OperationsTask } from "./fixtures";
 import { INITIAL_MEMORY_REVIEW, type MemoryReviewState } from "./memoryModel";
 import {
   BOARD_COLUMNS,
   activeAgentCount,
+  findProject,
   needsYou,
   projectById,
-  projects,
+  projectChoices,
+  projectLabel,
   qaBadgeTone,
   qaStatusLabel,
   shortRevision,
   tasksInColumn,
   usageFor,
 } from "./model";
+
+const ALL_PROJECTS = "all";
 
 const COLUMN_ACCENT: Record<(typeof BOARD_COLUMNS)[number]["id"], string> = {
   Ready: "border-l-info",
@@ -44,7 +48,7 @@ const COLUMN_ACCENT: Record<(typeof BOARD_COLUMNS)[number]["id"], string> = {
 };
 
 export function OperationsDashboard() {
-  const [projectId, setProjectId] = useState<OperationsProjectId>("usba");
+  const [projectFilter, setProjectFilter] = useState(ALL_PROJECTS);
   const [surface, setSurface] = useState<"board" | "memory">("board");
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [currentTaskId, setCurrentTaskId] = useState<string | null>(null);
@@ -54,8 +58,23 @@ export function OperationsDashboard() {
   const [highlightId, setHighlightId] = useState<string | null>("fact-friday-7");
   const [review, setReview] = useState<MemoryReviewState>(INITIAL_MEMORY_REVIEW);
   const [memoryNotes, setMemoryNotes] = useState<Readonly<Record<string, string>>>({});
-  const project = projectById(projectId);
-  const tasks = tasksForBoard(projectId, useAdapterBoard());
+  const cards = useAdapterBoard();
+  const allTasks = tasksForBoard(undefined, cards);
+  const choices = projectChoices(allTasks);
+  const workspace =
+    projectFilter !== ALL_PROJECTS && choices.some((choice) => choice.id === projectFilter)
+      ? projectFilter
+      : ALL_PROJECTS;
+  const tasks = workspace === ALL_PROJECTS ? allTasks : tasksForBoard(workspace, cards);
+  const memoryProject =
+    (workspace === ALL_PROJECTS ? undefined : findProject(workspace)) ??
+    choices.map((choice) => findProject(choice.id)).find((project) => project !== undefined) ??
+    projectById("personal");
+  const agents =
+    workspace === ALL_PROJECTS ? agentsForChoices(choices) : (findProject(workspace)?.agents ?? []);
+  const heading = workspace === ALL_PROJECTS ? "All projects" : projectLabel(workspace);
+  const detail =
+    workspace === ALL_PROJECTS ? "All projects" : (findProject(workspace)?.detail ?? heading);
   const selected = tasks.find((task) => task.id === selectedId) ?? null;
   const currentTask = tasks.find((task) => task.id === currentTaskId) ?? null;
   const openMemory = (factId: string | null) => {
@@ -70,16 +89,14 @@ export function OperationsDashboard() {
   };
   const attention = needsYou(tasks);
   const usage = usageFor(tasks);
-  const active = activeAgentCount(project.agents);
+  const active = activeAgentCount(agents);
 
   return (
     <div className="relative flex h-full min-h-0 flex-col bg-background text-foreground">
       <header className="shrink-0 border-b border-border px-4 py-4 sm:px-6">
         <div className="flex flex-wrap items-end justify-between gap-4">
           <div className="min-w-0">
-            <p className="text-xs font-medium tracking-wide text-muted-foreground">
-              {project.detail}
-            </p>
+            <p className="text-xs font-medium tracking-wide text-muted-foreground">{detail}</p>
             <h1 className="mt-1 text-xl font-semibold tracking-tight">Operations</h1>
             <div role="tablist" aria-label="Views" className="mt-3 flex flex-wrap gap-2">
               <Button
@@ -103,7 +120,7 @@ export function OperationsDashboard() {
             </div>
           </div>
           <div className="flex flex-col items-stretch gap-2 sm:items-end">
-            <ProjectPicker projectId={projectId} onChange={setProjectId} />
+            <ProjectPicker selected={workspace} choices={choices} onChange={setProjectFilter} />
             <Button size="sm" variant="outline" onClick={() => openMemory(null)}>
               Browse memory
             </Button>
@@ -114,8 +131,8 @@ export function OperationsDashboard() {
         {surface === "memory" ? (
           <div className="p-4 sm:p-6">
             <CortexView
-              projectId={projectId}
-              projectLabel={project.label}
+              projectId={memoryProject.id}
+              projectLabel={memoryProject.label}
               review={review}
               highlightId={highlightId}
               currentTaskId={currentTaskId}
@@ -124,7 +141,7 @@ export function OperationsDashboard() {
           </div>
         ) : (
           <div className="ops-visual flex flex-col gap-4 p-4 sm:p-6">
-            <AgentRail agents={project.agents} active={active} />
+            <AgentRail agents={agents} active={active} />
             <div className="grid grid-cols-1 gap-3 lg:grid-cols-3">
               <ThroughputCard tasks={tasks} />
               <QaCard tasks={tasks} />
@@ -139,7 +156,7 @@ export function OperationsDashboard() {
                 <h2 id="board-heading" className="text-sm font-semibold tracking-tight">
                   Board
                 </h2>
-                <p className="text-xs text-muted-foreground">{project.label}</p>
+                <p className="text-xs text-muted-foreground">{heading}</p>
               </div>
               <div className="grid grid-cols-1 gap-3 md:grid-cols-2 lg:grid-cols-5">
                 {BOARD_COLUMNS.map((column) => {
@@ -194,8 +211,8 @@ export function OperationsDashboard() {
       />
       <MemoryBrowser
         open={memoryOpen}
-        projectId={projectId}
-        projectLabel={project.label}
+        projectId={memoryProject.id}
+        projectLabel={memoryProject.label}
         currentTaskId={currentTaskId}
         currentTaskTitle={currentTask?.title ?? null}
         review={review}
@@ -237,25 +254,36 @@ export function OperationsDashboard() {
 }
 
 function ProjectPicker({
-  projectId,
+  selected,
+  choices,
   onChange,
 }: {
-  projectId: OperationsProjectId;
-  onChange: (id: OperationsProjectId) => void;
+  selected: string;
+  choices: readonly { readonly id: string; readonly label: string }[];
+  onChange: (id: string) => void;
 }) {
+  const allSelected = selected === ALL_PROJECTS;
   return (
     <div aria-label="Workspace" className="flex flex-wrap gap-2" role="group">
-      {projects().map((project) => {
-        const selected = project.id === projectId;
+      <Button
+        aria-pressed={allSelected}
+        size="sm"
+        variant={allSelected ? "secondary" : "outline"}
+        onClick={() => onChange(ALL_PROJECTS)}
+      >
+        All
+      </Button>
+      {choices.map((choice) => {
+        const pressed = choice.id === selected;
         return (
           <Button
-            key={project.id}
-            aria-pressed={selected}
+            key={choice.id}
+            aria-pressed={pressed}
             size="sm"
-            variant={selected ? "secondary" : "outline"}
-            onClick={() => onChange(project.id)}
+            variant={pressed ? "secondary" : "outline"}
+            onClick={() => onChange(choice.id)}
           >
-            {project.label}
+            {choice.label}
           </Button>
         );
       })}
@@ -263,13 +291,22 @@ function ProjectPicker({
   );
 }
 
-function AgentRail({
-  active,
-  agents,
-}: {
-  active: number;
-  agents: ReturnType<typeof projectById>["agents"];
-}) {
+function agentsForChoices(choices: readonly { readonly id: string }[]): readonly OperationsAgent[] {
+  const seen = new Set<string>();
+  const agents: OperationsAgent[] = [];
+  for (const choice of choices) {
+    const project = findProject(choice.id);
+    if (project === undefined) continue;
+    for (const agent of project.agents) {
+      if (seen.has(agent.id)) continue;
+      seen.add(agent.id);
+      agents.push(agent);
+    }
+  }
+  return agents;
+}
+
+function AgentRail({ active, agents }: { active: number; agents: readonly OperationsAgent[] }) {
   return (
     <section
       aria-labelledby="agents-heading"
@@ -480,7 +517,12 @@ function TaskCard({
         >
           {agentMark(task.agent)}
         </span>
-        <span className="line-clamp-2 text-sm font-medium">{task.title}</span>
+        <span className="min-w-0">
+          <span className="line-clamp-2 block text-sm font-medium">{task.title}</span>
+          <span className="mt-0.5 block text-xs text-muted-foreground">
+            {projectLabel(task.projectId)}
+          </span>
+        </span>
       </span>
       <span className="mt-2 block h-1 overflow-hidden rounded-full bg-muted">
         <span
@@ -735,8 +777,4 @@ function ProgressStepper({ phase }: { phase: OperationsTask["phase"] }) {
       })}
     </ol>
   );
-}
-
-function projectLabel(id: OperationsProjectId): string {
-  return projectById(id).label;
 }
