@@ -3,7 +3,13 @@ import * as Effect from "effect/Effect";
 
 import { leaseIdFor } from "./canonical.ts";
 import { assignmentExample, happyPathEvents, intakeExample, revisionOne } from "./examples.ts";
-import { applyBoardWorkflowEvent, requestKanbanMove, type KanbanMoveLedger } from "./kanbanMove.ts";
+import {
+  applyBoardWorkflowEvent,
+  commitInterruptedMove,
+  requestKanbanMove,
+  type KanbanMoveLedger,
+  type KanbanMoveResult,
+} from "./kanbanMove.ts";
 import { applySequence, kanbanColumn, type KanbanColumn, type SequenceState } from "./sequence.ts";
 
 const at = "2026-10-22T12:00:00Z";
@@ -31,6 +37,13 @@ const move = (
     at,
     ledger,
   });
+
+const applied = (result: KanbanMoveResult): Extract<KanbanMoveResult, { _tag: "Applied" }> => {
+  if (result._tag !== "Applied") {
+    throw new Error("detail" in result ? result.detail : "not applied");
+  }
+  return result;
+};
 
 const generation = (state: SequenceState): number | null => {
   if (state.phase === "executing" || state.phase === "recovery_pending")
@@ -130,7 +143,26 @@ it.effect("rejects the other illegal column moves and leaves the phase alone", (
     const awaiting = phase(yield* applySequence(happyPathEvents.slice(0, 5)), "awaiting_qa");
     const rework = phase(yield* applySequence(happyPathEvents.slice(0, 7)), "rework");
     const blocked = phase(
-      (yield* move(executing, "Blocked", "pause-setup", true)).state,
+      yield* applyBoardWorkflowEvent(
+        executing,
+        {
+          type: "lease_expired",
+          lease: {
+            taskId: assignmentExample.taskId,
+            attemptId: assignmentExample.attemptId,
+            generation: 1,
+            leaseId: leaseIdFor(1),
+          },
+        },
+        "lease-blocked",
+        "task-usba-page",
+        empty,
+      ).pipe(
+        Effect.map((result) => {
+          if (result._tag !== "Applied") throw new Error(result.detail);
+          return result.state;
+        }),
+      ),
       "recovery_pending",
     );
     const forbidden: ReadonlyArray<readonly [SequenceState, KanbanColumn]> = [
@@ -170,30 +202,36 @@ it.effect("rejects the other illegal column moves and leaves the phase alone", (
 it.effect("does not start a second run when the same drop is repeated", () =>
   Effect.gen(function* () {
     const assigned = phase(yield* applySequence(happyPathEvents.slice(0, 3)), "assigned");
-    const first = yield* move(assigned, "Running", "start-1");
-    assert.strictEqual(first._tag, "Applied");
+    const fromBoard = yield* move(assigned, "Running", "start-1");
+    assert.strictEqual(fromBoard._tag, "Rejected");
+    assert.strictEqual(fromBoard.state.phase, "assigned");
+    if (fromBoard._tag === "Rejected") assert.match(fromBoard.detail, /adapter launches the run/);
+
+    const first = applied(
+      yield* applyBoardWorkflowEvent(
+        assigned,
+        { type: "start_execution" },
+        "start-event",
+        "task-usba-page",
+        empty,
+      ),
+    );
     assert.strictEqual(first.state.phase, "executing");
     assert.strictEqual(generation(first.state), 1);
 
-    const again = yield* move(first.state, "Running", "start-2", false, first.ledger);
-    assert.strictEqual(again._tag, "Applied");
+    const again = applied(yield* move(first.state, "Running", "start-2", false, first.ledger));
     assert.strictEqual(again.changed, false);
     assert.strictEqual(generation(again.state), 1);
 
-    const replay = yield* move(assigned, "Running", "start-1", false, first.ledger);
-    assert.strictEqual(replay._tag, "Applied");
-    assert.strictEqual(replay.changed, false);
-    assert.strictEqual(replay.state.phase, "executing");
-    assert.strictEqual(generation(replay.state), 1);
-
-    const duplicateEvent = yield* applyBoardWorkflowEvent(
-      first.state,
-      { type: "start_execution" },
-      "start-event-2",
-      "task-usba-page",
-      empty,
+    const duplicateEvent = applied(
+      yield* applyBoardWorkflowEvent(
+        first.state,
+        { type: "start_execution" },
+        "start-event-2",
+        "task-usba-page",
+        empty,
+      ),
     );
-    assert.strictEqual(duplicateEvent._tag, "Applied");
     assert.strictEqual(duplicateEvent.changed, false);
     assert.strictEqual(generation(duplicateEvent.state), 1);
   }),
@@ -212,18 +250,33 @@ it.effect("refuses a silent cancel and uses the cancel path only after confirmat
     assert.strictEqual(silentPause.state.phase, "executing");
 
     const confirmed = yield* move(executing, "Ready", "cancel-1", true);
-    assert.strictEqual(confirmed._tag, "Applied");
-    assert.strictEqual(confirmed.state.phase, "assigned");
-    assert.strictEqual(kanbanColumn(confirmed.state.phase), "Ready");
-    assert.strictEqual(generation(confirmed.state), 1);
-    if (confirmed.state.phase === "assigned") {
+    assert.strictEqual(confirmed._tag, "NeedsInterrupt");
+    assert.strictEqual(confirmed.state.phase, "executing");
+    if (confirmed._tag === "NeedsInterrupt") assert.strictEqual(confirmed.action, "cancel");
+    assert.deepStrictEqual(confirmed.ledger, empty);
+
+    const request = {
+      taskId: "task-usba-page",
+      column: "Ready" as const,
+      idempotencyKey: "cancel-1",
+      confirmed: true,
+      at,
+      ledger: confirmed.ledger,
+    };
+    const landed = applied(yield* commitInterruptedMove(executing, request));
+    assert.strictEqual(landed.state.phase, "assigned");
+    assert.strictEqual(kanbanColumn(landed.state.phase), "Ready");
+    assert.strictEqual(generation(landed.state), 1);
+    if (landed.state.phase === "assigned") {
       assert.strictEqual(
-        confirmed.state.commands.some((command) => command.idempotencyKey === "cancel-1-c"),
+        landed.state.commands.some((command) => command.idempotencyKey === "cancel-1-c"),
         true,
       );
     }
 
-    const repeated = yield* move(executing, "Ready", "cancel-1", true, confirmed.ledger);
+    const repeated = applied(
+      yield* commitInterruptedMove(executing, { ...request, ledger: landed.ledger }),
+    );
     assert.strictEqual(repeated.changed, false);
     assert.strictEqual(repeated.state.phase, "assigned");
   }),
@@ -242,8 +295,20 @@ it.effect("queues a backlog card through acknowledge and pauses only through the
 
     const executing = phase(yield* applySequence(happyPathEvents.slice(0, 4)), "executing");
     const paused = yield* move(executing, "Blocked", "pause-2", true);
-    assert.strictEqual(paused.state.phase, "recovery_pending");
-    assert.strictEqual(kanbanColumn(paused.state.phase), "Blocked");
+    assert.strictEqual(paused._tag, "NeedsInterrupt");
+    assert.strictEqual(paused.state.phase, "executing");
+    const landed = applied(
+      yield* commitInterruptedMove(executing, {
+        taskId: "task-usba-page",
+        column: "Blocked",
+        idempotencyKey: "pause-2",
+        confirmed: true,
+        at,
+        ledger: paused.ledger,
+      }),
+    );
+    assert.strictEqual(landed.state.phase, "recovery_pending");
+    assert.strictEqual(kanbanColumn(landed.state.phase), "Blocked");
   }),
 );
 
@@ -270,8 +335,8 @@ it.effect("keeps a completion claim from counting as acceptance", () =>
       empty,
     );
     assert.strictEqual(submitted._tag, "Applied");
-    assert.strictEqual(submitted.state.phase, "awaiting_qa");
-    const jumped = yield* move(submitted.state, "Done", "skip-qa", true);
+    assert.strictEqual(applied(submitted).state.phase, "awaiting_qa");
+    const jumped = yield* move(applied(submitted).state, "Done", "skip-qa", true);
     assert.strictEqual(jumped._tag, "Rejected");
     assert.strictEqual(jumped.state.phase, "awaiting_qa");
   }),

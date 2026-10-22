@@ -8,6 +8,7 @@ import {
   decodeSequenceState,
   intakeV2Example,
   leaseIdFor,
+  type KanbanMoveLedger,
 } from "@t3tools/ai-os-contracts";
 import {
   AuthAccessTokenResult,
@@ -53,11 +54,16 @@ import {
 import * as UrlParams from "effect/http/UrlParams";
 import { RpcSerialization, RpcServer } from "effect/rpc";
 
-import { ADAPTER_BOARD_EVENTS_PATH, ADAPTER_BOARD_PATH } from "./board.ts";
-import { makeAdapterBoardHub } from "./boardHub.ts";
+import {
+  ADAPTER_BOARD_EVENT_PATH,
+  ADAPTER_BOARD_EVENTS_PATH,
+  ADAPTER_BOARD_PATH,
+} from "./board.ts";
+import { acceptBoardEvent, makeAdapterBoardHub } from "./boardHub.ts";
 import {
   clearAdapterBoard,
   createGrokT3Adapter,
+  GrokT3Error,
   decodeAdapterBoard,
   memorySessionStore,
   readAdapterBoard,
@@ -353,6 +359,7 @@ const makeFake = () => {
   const tickets = new Map<string, readonly string[]>();
   let issued = 0;
   const hub = makeAdapterBoardHub();
+  let ledger: KanbanMoveLedger = {};
   const handlersLayer = T3OrchestrationRpc.toLayer(handlers);
   const expiresAt = DateTime.toUtc(NOW);
   const bearerScopes = (request: HttpServerRequest.HttpServerRequest) => {
@@ -434,8 +441,18 @@ const makeFake = () => {
       yield* boardGate(AuthOrchestrationOperateScope);
       const request = yield* HttpServerRequest.HttpServerRequest;
       const text = yield* request.text.pipe(Effect.orElseSucceed(() => ""));
-      if (!hub.upsert(text)) return HttpServerResponse.text("Invalid board.", { status: 400 });
-      return HttpServerResponse.empty({ status: 204 });
+      const written = hub.upsert(text);
+      if (written === "invalid") return HttpServerResponse.text("Invalid board.", { status: 400 });
+      if (written !== "ok") {
+        return HttpServerResponse.text(JSON.stringify({ detail: written }), {
+          status: 409,
+          contentType: "application/json",
+        });
+      }
+      return HttpServerResponse.text(hub.snapshot(), {
+        status: 200,
+        contentType: "application/json",
+      });
     }),
   );
   const boardEvents = boardResponse(
@@ -480,6 +497,23 @@ const makeFake = () => {
       HttpRouter.add("GET", "/ws", wsRoute),
       HttpRouter.add("GET", ADAPTER_BOARD_PATH, boardGet),
       HttpRouter.add("POST", ADAPTER_BOARD_PATH, boardPost),
+      HttpRouter.add(
+        "POST",
+        ADAPTER_BOARD_EVENT_PATH,
+        boardResponse(
+          Effect.gen(function* () {
+            yield* boardGate(AuthOrchestrationOperateScope);
+            const request = yield* HttpServerRequest.HttpServerRequest;
+            const text = yield* request.text.pipe(Effect.orElseSucceed(() => ""));
+            const result = yield* acceptBoardEvent(hub, ledger, text, CLOCK);
+            ledger = result.ledger;
+            return HttpServerResponse.text(result.body, {
+              status: result.status,
+              contentType: "application/json",
+            });
+          }),
+        ),
+      ),
       HttpRouter.add("GET", ADAPTER_BOARD_EVENTS_PATH, boardEvents),
     ),
     { disableListenLog: true, disableLogger: true },
@@ -808,6 +842,67 @@ it.effect("interrupts the run once when cancel is repeated", () =>
       yield* adapter.cancel(recorded.taskId);
       assert.strictEqual(fake.interruptCount(), 1);
       assert.strictEqual(fake.launchCount(), 1);
+    }),
+  ),
+);
+
+it.effect("does not mark the task cancelled when the interrupt fails", () =>
+  withFake((fake) =>
+    Effect.gen(function* () {
+      const base = t3Client(fake.origin);
+      const adapter = createGrokT3Adapter({
+        client: {
+          ...base,
+          interrupt: () =>
+            Effect.fail(new GrokT3Error({ reason: "t3_rejected", detail: "The run stayed up." })),
+        },
+        clock: () => CLOCK,
+        model: TEST_MODEL,
+      });
+      const recorded = yield* record(adapter);
+      const started = yield* adapter.launch(recorded.taskId);
+      assert.strictEqual(started.state.phase, "executing");
+      const failed = yield* adapter.cancel(recorded.taskId).pipe(Effect.flip);
+      assert.strictEqual(failed.reason, "t3_rejected");
+      assert.strictEqual(adapter.result(recorded.taskId)?.state.phase, "executing");
+      const paused = yield* adapter.pause(recorded.taskId).pipe(Effect.flip);
+      assert.strictEqual(paused.reason, "t3_rejected");
+      assert.strictEqual(adapter.result(recorded.taskId)?.state.phase, "executing");
+    }),
+  ),
+);
+
+it.effect("pauses only after the interrupt and does not start when launch fails", () =>
+  withFake((fake) =>
+    Effect.gen(function* () {
+      const adapter = createGrokT3Adapter({
+        client: t3Client(fake.origin),
+        clock: () => CLOCK,
+        model: TEST_MODEL,
+      });
+      const recorded = yield* record(adapter);
+      const early = yield* adapter.cancel(recorded.taskId).pipe(Effect.flip);
+      assert.strictEqual(early.reason, "not_started");
+      assert.strictEqual(adapter.result(recorded.taskId)?.state.phase, "assigned");
+
+      const started = yield* adapter.launch(recorded.taskId);
+      const paused = yield* adapter.pause(started.taskId);
+      assert.strictEqual(paused.state.phase, "recovery_pending");
+      assert.strictEqual(fake.interruptCount(), 1);
+
+      const blockedLaunch = createGrokT3Adapter({
+        client: {
+          ...t3Client(fake.origin),
+          launch: () =>
+            Effect.fail(new GrokT3Error({ reason: "t3_rejected", detail: "No thread." })),
+        },
+        clock: () => CLOCK,
+        model: TEST_MODEL,
+      });
+      const held = yield* record(blockedLaunch, "task-held");
+      const missed = yield* blockedLaunch.launch(held.taskId).pipe(Effect.flip);
+      assert.strictEqual(missed.reason, "t3_rejected");
+      assert.strictEqual(blockedLaunch.result(held.taskId)?.state.phase, "assigned");
     }),
   ),
 );

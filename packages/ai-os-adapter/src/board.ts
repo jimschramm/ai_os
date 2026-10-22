@@ -15,6 +15,8 @@ export interface AdapterBoardCard {
   readonly title: string;
   readonly state: SequenceState;
   readonly threadId: string | null;
+  readonly runId?: string | null;
+  readonly revision?: number;
   readonly updatedAt: string;
 }
 
@@ -26,6 +28,8 @@ const BoardCards = Schema.Array(
     title: Schema.String,
     state: Schema.Unknown,
     threadId: Schema.NullOr(Schema.String),
+    runId: Schema.optional(Schema.NullOr(Schema.String)),
+    revision: Schema.optional(Schema.Number),
     updatedAt: Schema.String,
   }),
 );

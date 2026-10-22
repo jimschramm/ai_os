@@ -1,5 +1,6 @@
 import * as NodeHttpServer from "@effect/platform-node/NodeHttpServer";
 import { assert, it } from "@effect/vitest";
+import type { KanbanMoveLedger } from "@t3tools/ai-os-contracts";
 import {
   AuthAccessTokenResult,
   AuthAccessTokenType,
@@ -24,8 +25,8 @@ import {
 } from "effect/http";
 import * as UrlParams from "effect/http/UrlParams";
 
-import { ADAPTER_BOARD_PATH, decodeAdapterBoard } from "./board.ts";
-import { makeAdapterBoardHub } from "./boardHub.ts";
+import { ADAPTER_BOARD_EVENT_PATH, ADAPTER_BOARD_PATH, decodeAdapterBoard } from "./board.ts";
+import { acceptBoardEvent, makeAdapterBoardHub } from "./boardHub.ts";
 import {
   LIVE_DRIVER_COMMAND,
   LIVE_DRIVER_DEFAULT_ORIGIN,
@@ -61,6 +62,7 @@ const formField = (params: UrlParams.UrlParams, key: string) => {
 
 const makeServer = () => {
   const hub = makeAdapterBoardHub();
+  let ledger: KanbanMoveLedger = {};
   const bearers = new Map<string, readonly string[]>();
   let issued = 0;
   let exchanges = 0;
@@ -148,8 +150,18 @@ const makeServer = () => {
       return HttpServerResponse.text("Unauthorized", { status: 401 });
     }
     const text = yield* request.text.pipe(Effect.orElseSucceed(() => ""));
-    if (!hub.upsert(text)) return HttpServerResponse.text("Invalid board.", { status: 400 });
-    return HttpServerResponse.empty({ status: 204 });
+    const written = hub.upsert(text);
+    if (written === "invalid") return HttpServerResponse.text("Invalid board.", { status: 400 });
+    if (written !== "ok") {
+      return HttpServerResponse.text(JSON.stringify({ detail: written }), {
+        status: 409,
+        contentType: "application/json",
+      });
+    }
+    return HttpServerResponse.text(hub.snapshot(), {
+      status: 200,
+      contentType: "application/json",
+    });
   });
   const layer = HttpRouter.serve(
     Layer.mergeAll(
@@ -157,6 +169,24 @@ const makeServer = () => {
       HttpRouter.add("GET", "/api/projects", projectsRoute),
       HttpRouter.add("GET", ADAPTER_BOARD_PATH, boardGet),
       HttpRouter.add("POST", ADAPTER_BOARD_PATH, boardPost),
+      HttpRouter.add(
+        "POST",
+        ADAPTER_BOARD_EVENT_PATH,
+        Effect.gen(function* () {
+          const request = yield* HttpServerRequest.HttpServerRequest;
+          const scopes = scopesFor(request);
+          if (scopes === undefined || !scopes.includes(AuthOrchestrationOperateScope)) {
+            return HttpServerResponse.text("Unauthorized", { status: 401 });
+          }
+          const text = yield* request.text.pipe(Effect.orElseSucceed(() => ""));
+          const result = yield* acceptBoardEvent(hub, ledger, text, CLOCK);
+          ledger = result.ledger;
+          return HttpServerResponse.text(result.body, {
+            status: result.status,
+            contentType: "application/json",
+          });
+        }),
+      ),
     ),
     { disableListenLog: true, disableLogger: true },
   ).pipe(Layer.provideMerge(NodeHttpServer.layerTest));
@@ -321,6 +351,7 @@ it.effect("lists project ids and publishes the launched task to the server board
         listProjectIds: real.listProjectIds,
         listProviderModels: () => Effect.succeed(CATALOG),
         publishBoard: real.publishBoard,
+        publishEvent: real.publishEvent,
         interrupt: () => Effect.die("interrupt is unused"),
         continueRun: () => Effect.die("continue is unused"),
         launch: (input) => {
@@ -439,7 +470,9 @@ it.effect("lists projects and launches in one run", () =>
           },
         ]),
       listProviderModels: () => Effect.succeed(CATALOG),
-      publishBoard: () => Effect.void,
+      publishBoard: (cards) =>
+        Effect.succeed(cards.map((card) => ({ ...card, revision: (card.revision ?? 0) + 1 }))),
+      publishEvent: () => Effect.succeed({ revision: 1 }),
       interrupt: () => Effect.die("interrupt is unused"),
       continueRun: () => Effect.die("continue is unused"),
       launch: () => {
@@ -504,7 +537,9 @@ it.effect("launches the offered default when the configured model is gpt-5.4", (
           ...CATALOG,
           serverDefault: { instanceId: "codex", model: "gpt-5.4" },
         }),
-      publishBoard: () => Effect.void,
+      publishBoard: (cards) =>
+        Effect.succeed(cards.map((card) => ({ ...card, revision: (card.revision ?? 0) + 1 }))),
+      publishEvent: () => Effect.succeed({ revision: 1 }),
       interrupt: () => Effect.die("interrupt is unused"),
       continueRun: () => Effect.die("continue is unused"),
       launch: (input) => {
@@ -559,7 +594,9 @@ it.effect("rejects a model the provider does not offer and lists the valid ones"
           },
         ]),
       listProviderModels: () => Effect.succeed(CATALOG),
-      publishBoard: () => Effect.void,
+      publishBoard: (cards) =>
+        Effect.succeed(cards.map((card) => ({ ...card, revision: (card.revision ?? 0) + 1 }))),
+      publishEvent: () => Effect.succeed({ revision: 1 }),
       interrupt: () => Effect.die("interrupt is unused"),
       continueRun: () => Effect.die("continue is unused"),
       launch: () => {

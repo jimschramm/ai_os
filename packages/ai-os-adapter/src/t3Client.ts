@@ -1,6 +1,6 @@
 import * as NodeHttpClient from "@effect/platform-node/NodeHttpClient";
 import * as NodeSocket from "@effect/platform-node/NodeSocket";
-import { ContextPackageSnapshotV1 } from "@t3tools/ai-os-contracts";
+import { ContextPackageSnapshotV1, type SequenceEvent } from "@t3tools/ai-os-contracts";
 import {
   AuthAccessTokenResult,
   AuthAccessTokenType,
@@ -35,7 +35,12 @@ import { HttpClient, HttpClientRequest } from "effect/http";
 import { Rpc, RpcClient, RpcGroup, RpcSerialization } from "effect/rpc";
 import { RpcClientError } from "effect/rpc/RpcClientError";
 
-import { ADAPTER_BOARD_PATH, type AdapterBoardCard } from "./board.ts";
+import {
+  ADAPTER_BOARD_EVENT_PATH,
+  ADAPTER_BOARD_PATH,
+  decodeAdapterBoard,
+  type AdapterBoardCard,
+} from "./board.ts";
 import { encodeAdapterBoardWire } from "./boardHub.ts";
 import { GrokT3Error } from "./errors.ts";
 
@@ -155,12 +160,26 @@ export interface T3ModelCatalog {
   readonly serverDefault: T3ModelSelection | null;
 }
 
+export interface T3BoardEvent {
+  readonly taskId: string;
+  readonly title: string;
+  readonly idempotencyKey: string;
+  readonly threadId: string | null;
+  readonly runId: string | null;
+  readonly event: SequenceEvent;
+}
+
 export interface T3LocalClient {
   readonly launch: (input: T3LaunchRequest) => Effect.Effect<T3LaunchResult, GrokT3Error>;
   readonly read: (threadId: string) => Effect.Effect<T3ThreadView, GrokT3Error>;
   readonly interrupt: (threadId: string, runId: string) => Effect.Effect<void, GrokT3Error>;
   readonly continueRun: (input: T3ContinueRequest) => Effect.Effect<void, GrokT3Error>;
-  readonly publishBoard: (cards: readonly AdapterBoardCard[]) => Effect.Effect<void, GrokT3Error>;
+  readonly publishBoard: (
+    cards: readonly AdapterBoardCard[],
+  ) => Effect.Effect<readonly AdapterBoardCard[], GrokT3Error>;
+  readonly publishEvent: (
+    input: T3BoardEvent,
+  ) => Effect.Effect<{ readonly revision: number }, GrokT3Error>;
   readonly listProjectIds: () => Effect.Effect<readonly T3ProjectSummary[], GrokT3Error>;
   readonly listProviderModels: () => Effect.Effect<T3ModelCatalog, GrokT3Error>;
 }
@@ -511,17 +530,87 @@ export const wsT3LocalClient = (options: T3ClientOptions): T3LocalClient => {
         Effect.asVoid,
       ),
     );
+  const phaseOf = (state: unknown): string | null =>
+    typeof state === "object" &&
+    state !== null &&
+    "phase" in state &&
+    typeof state.phase === "string"
+      ? state.phase
+      : null;
+  const readCards = (text: string) => {
+    const cards = decodeAdapterBoard(text);
+    return cards === null
+      ? Effect.fail(
+          new GrokT3Error({ reason: "t3_rejected", detail: "T3 returned an unreadable board." }),
+        )
+      : Effect.succeed(
+          cards.map((card) => ({
+            ...card,
+            runId: card.runId ?? null,
+            revision: card.revision ?? 0,
+          })),
+        );
+  };
+  const postCards = (cards: readonly AdapterBoardCard[]) =>
+    responseFor(() =>
+      HttpClientRequest.post(`${origin}${ADAPTER_BOARD_PATH}`).pipe(
+        HttpClientRequest.bodyText(encodeAdapterBoardWire(cards), "application/json"),
+      ),
+    );
   const publishBoard = (cards: readonly AdapterBoardCard[]) =>
     http(
       Effect.gen(function* () {
+        const finish = <E>(response: {
+          readonly status: number;
+          readonly text: Effect.Effect<string, E>;
+        }) =>
+          Effect.gen(function* () {
+            if (response.status >= 400)
+              return yield* statusError(response.status, "publish the board");
+            return yield* readCards(yield* response.text);
+          });
+        const first = yield* postCards(cards);
+        if (first.status !== 409) return yield* finish(first);
+        const current = yield* responseFor(() =>
+          HttpClientRequest.get(`${origin}${ADAPTER_BOARD_PATH}`),
+        );
+        if (current.status >= 400) return yield* statusError(current.status, "read the board");
+        const server = yield* readCards(yield* current.text);
+        const refreshed = cards.map((card) => {
+          const stored = server.find((item) => item.taskId === card.taskId);
+          if (stored === undefined || phaseOf(stored.state) !== phaseOf(card.state)) return card;
+          return { ...card, revision: stored.revision };
+        });
+        return yield* finish(yield* postCards(refreshed));
+      }),
+    );
+  const publishEvent = (input: T3BoardEvent) =>
+    http(
+      Effect.gen(function* () {
         const response = yield* responseFor(() =>
-          HttpClientRequest.post(`${origin}${ADAPTER_BOARD_PATH}`).pipe(
-            HttpClientRequest.bodyText(encodeAdapterBoardWire(cards), "application/json"),
+          HttpClientRequest.post(`${origin}${ADAPTER_BOARD_EVENT_PATH}`).pipe(
+            HttpClientRequest.bodyText(
+              Schema.encodeSync(Schema.fromJsonString(Schema.Unknown))(input),
+              "application/json",
+            ),
           ),
         );
         if (response.status >= 400) {
-          return yield* statusError(response.status, "publish the board");
+          return yield* statusError(response.status, "publish the workflow event");
         }
+        const text = yield* response.text;
+        const parsed = yield* Schema.decodeEffect(
+          Schema.fromJsonString(Schema.Struct({ revision: Schema.Number })),
+        )(text).pipe(
+          Effect.mapError(
+            () =>
+              new GrokT3Error({
+                reason: "t3_rejected",
+                detail: "T3 returned an unreadable workflow result.",
+              }),
+          ),
+        );
+        return { revision: parsed.revision };
       }),
     );
   const listProjectIds = () =>
@@ -581,5 +670,14 @@ export const wsT3LocalClient = (options: T3ClientOptions): T3LocalClient => {
       }
       return catalog;
     });
-  return { launch, read, interrupt, continueRun, publishBoard, listProjectIds, listProviderModels };
+  return {
+    launch,
+    read,
+    interrupt,
+    continueRun,
+    publishBoard,
+    publishEvent,
+    listProjectIds,
+    listProviderModels,
+  };
 };

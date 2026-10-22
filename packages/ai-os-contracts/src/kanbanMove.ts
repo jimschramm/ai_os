@@ -14,6 +14,9 @@ import {
 const DONE_REQUIRES_QA =
   "Done requires a passed independent QA from a different model than the builder. Moving a card here does not accept it.";
 
+const RUNNING_FROM_BOARD =
+  "In Progress starts when the adapter launches the run. The board does not mark it started.";
+
 const KEY = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
 
 export interface KanbanMoveRecord {
@@ -51,6 +54,13 @@ export type KanbanMoveResult =
       readonly detail: string;
       readonly state: SequenceState;
       readonly ledger: KanbanMoveLedger;
+    }
+  | {
+      readonly _tag: "NeedsInterrupt";
+      readonly action: "cancel" | "pause";
+      readonly detail: string;
+      readonly state: SequenceState;
+      readonly ledger: KanbanMoveLedger;
     };
 
 const applied = (
@@ -70,6 +80,13 @@ const needsConfirmation = (
   state: SequenceState,
   ledger: KanbanMoveLedger,
 ): KanbanMoveResult => ({ _tag: "NeedsConfirmation", detail, state, ledger });
+
+const needsInterrupt = (
+  action: "cancel" | "pause",
+  detail: string,
+  state: SequenceState,
+  ledger: KanbanMoveLedger,
+): KanbanMoveResult => ({ _tag: "NeedsInterrupt", action, detail, state, ledger });
 
 const remember = (
   ledger: KanbanMoveLedger,
@@ -192,34 +209,17 @@ export const requestKanbanMove = (
             : "Pause this run? The workflow records the open lease as expired and blocks the card until someone resolves it.";
         return Effect.succeed(needsConfirmation(detail, state, request.ledger));
       }
-      const ids = workIds(state);
-      if (request.column === "Blocked") {
-        return commit(request, state, [
-          {
-            type: "lease_expired",
-            lease: {
-              ...ids,
-              generation: state.run.generation,
-              leaseId: state.run.leaseId,
-            },
-          },
-        ]);
-      }
-      const command = {
-        ...ids,
-        idempotencyKey: `${request.idempotencyKey}-c`,
-      };
-      return commit(request, state, [
-        { type: "cancel", command: { command: "cancel", ...command } },
-        {
-          type: "continue",
-          command: {
-            command: "continue",
-            ...ids,
-            idempotencyKey: `${request.idempotencyKey}-k`,
-          },
-        },
-      ]);
+      // The ledger stays untouched until the caller has interrupted the run.
+      return Effect.succeed(
+        needsInterrupt(
+          request.column === "Ready" ? "cancel" : "pause",
+          request.column === "Ready"
+            ? "Cancel waits until the run confirms the interrupt."
+            : "Pause waits until the run confirms the interrupt.",
+          state,
+          request.ledger,
+        ),
+      );
     }
   }
 
@@ -228,34 +228,7 @@ export const requestKanbanMove = (
   }
 
   if (request.column === "Running") {
-    if (state.phase === "assigned" || state.phase === "rework" || state.phase === "accepted") {
-      return commit(request, state, [{ type: "start_execution" }]);
-    }
-    if (state.phase === "acknowledged") {
-      return Effect.succeed(
-        rejected("Assign a worker before starting this task.", state, request.ledger),
-      );
-    }
-    if (state.phase === "requested") {
-      return Effect.succeed(rejected("Queue the task before starting it.", state, request.ledger));
-    }
-    if (state.phase === "awaiting_qa") {
-      return Effect.succeed(
-        rejected("QA has to finish before another run can start.", state, request.ledger),
-      );
-    }
-    if (state.phase === "recovery_pending") {
-      return Effect.succeed(
-        rejected(
-          "Execution status unknown. Resolve the block before starting again.",
-          state,
-          request.ledger,
-        ),
-      );
-    }
-    return Effect.succeed(
-      rejected(`The workflow cannot start ${state.phase} work.`, state, request.ledger),
-    );
+    return Effect.succeed(rejected(RUNNING_FROM_BOARD, state, request.ledger));
   }
 
   if (request.column === "Ready" && state.phase === "requested") {
@@ -283,6 +256,68 @@ export const requestKanbanMove = (
       state,
       request.ledger,
     ),
+  );
+};
+
+/**
+ * Record cancel or pause only after the caller has interrupted the live run.
+ * A repeat of the same key returns the recorded state and does not append again.
+ */
+export const commitInterruptedMove = (
+  state: SequenceState,
+  request: KanbanMoveRequest,
+): Effect.Effect<KanbanMoveResult> => {
+  if (!validKey(request.idempotencyKey) || !KEY.test(request.taskId)) {
+    return Effect.succeed(
+      rejected("The task id or idempotency key is not a contract id.", state, request.ledger),
+    );
+  }
+  const seen = replay(request, state);
+  if (seen !== null) return Effect.succeed(seen);
+  if (state.phase !== "executing") {
+    return Effect.succeed(
+      rejected(
+        "The run is no longer active, so the card was left as it is.",
+        state,
+        request.ledger,
+      ),
+    );
+  }
+  const ids = workIds(state);
+  if (request.column === "Blocked") {
+    return commit(request, state, [
+      {
+        type: "lease_expired",
+        lease: {
+          ...ids,
+          generation: state.run.generation,
+          leaseId: state.run.leaseId,
+        },
+      },
+    ]);
+  }
+  if (request.column === "Ready") {
+    return commit(request, state, [
+      {
+        type: "cancel",
+        command: {
+          command: "cancel",
+          ...ids,
+          idempotencyKey: `${request.idempotencyKey}-c`,
+        },
+      },
+      {
+        type: "continue",
+        command: {
+          command: "continue",
+          ...ids,
+          idempotencyKey: `${request.idempotencyKey}-k`,
+        },
+      },
+    ]);
+  }
+  return Effect.succeed(
+    rejected("This confirmation is not a cancel or a pause.", state, request.ledger),
   );
 };
 

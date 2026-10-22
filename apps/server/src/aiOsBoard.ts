@@ -9,21 +9,33 @@ import {
 import { encodeAdapterBoardWire, makeAdapterBoardHub } from "@t3tools/ai-os-adapter/board-hub";
 import {
   applyBoardWorkflowEvent,
+  commitInterruptedMove,
   decodeSequenceEvent,
   decodeSequenceState,
   openBoardTask,
   requestKanbanMove,
+  SequenceState,
   type KanbanColumn,
   type KanbanMoveLedger,
   type KanbanMoveResult,
 } from "@t3tools/ai-os-contracts";
-import { AuthOrchestrationOperateScope, AuthOrchestrationReadScope } from "@t3tools/contracts";
+import {
+  AuthOrchestrationOperateScope,
+  AuthOrchestrationReadScope,
+  CommandId,
+  ProjectId,
+  RunId,
+  ThreadId,
+} from "@t3tools/contracts";
+import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
+import * as Data from "effect/Data";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
+import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
 import {
   HttpRouter,
@@ -39,9 +51,98 @@ import {
   failEnvironmentScopeRequired,
 } from "./auth/http.ts";
 import * as ServerConfig from "./config.ts";
+import * as ThreadManagement from "./orchestration-v2/ThreadManagementService.ts";
 
 const BOARD_FILE = "ai-os-board.json";
 const COLUMNS = ["Backlog", "Ready", "Running", "Review", "Blocked", "Done"] as const;
+
+type BoardSequence = SequenceState;
+
+const LedgerSchema = Schema.Record(
+  Schema.String,
+  Schema.Struct({
+    column: Schema.Literals(["Backlog", "Ready", "Running", "Review", "Blocked", "Done"]),
+    taskId: Schema.String,
+    state: SequenceState,
+  }),
+);
+const decodeLedger = Schema.decodeUnknownSync(LedgerSchema);
+
+export class BoardRunError extends Data.TaggedError("BoardRunError")<{
+  readonly detail: string;
+}> {}
+
+export type BoardInterruptConfirmation = "requested" | "already_stopped";
+
+/**
+ * The board asks the orchestration runtime before it records a run phase.
+ * Tests substitute this. Production uses the live thread service.
+ */
+export class BoardRuns extends Context.Service<
+  BoardRuns,
+  {
+    readonly interrupt: (input: {
+      readonly projectId: string;
+      readonly threadId: string;
+      readonly runId: string;
+      readonly commandId: string;
+    }) => Effect.Effect<BoardInterruptConfirmation, BoardRunError>;
+    readonly confirmLaunch: (input: {
+      readonly projectId: string;
+      readonly threadId: string;
+      readonly runId: string;
+    }) => Effect.Effect<void, BoardRunError>;
+  }
+>()("t3/aiOsBoard/BoardRuns") {}
+
+const runError = (detail: string) => new BoardRunError({ detail });
+
+const INTERRUPT_UNCONFIRMED = "The run did not confirm the interrupt.";
+
+export const liveRuns = Layer.effect(
+  BoardRuns,
+  Effect.gen(function* () {
+    const threads = yield* ThreadManagement.ThreadManagementService;
+    const interrupt: BoardRuns["Service"]["interrupt"] = (input) =>
+      threads
+        .interruptThread({
+          projectId: ProjectId.make(input.projectId),
+          commandId: CommandId.make(input.commandId),
+          threadId: ThreadId.make(input.threadId),
+          runId: RunId.make(input.runId),
+          reason: "Operations board",
+        })
+        .pipe(
+          Effect.flatMap((result) => {
+            if (result.type === "interrupt_requested") return Effect.succeed("requested" as const);
+            if (result.type === "already_terminal") {
+              return Effect.succeed("already_stopped" as const);
+            }
+            return Effect.fail(runError(INTERRUPT_UNCONFIRMED));
+          }),
+          Effect.mapError((error) =>
+            error instanceof BoardRunError ? error : runError(INTERRUPT_UNCONFIRMED),
+          ),
+        );
+    const confirmLaunch: BoardRuns["Service"]["confirmLaunch"] = (input) =>
+      threads.getThreadShell(ThreadId.make(input.threadId)).pipe(
+        Effect.mapError(() =>
+          runError("That run is not active, so the board will not mark it in progress."),
+        ),
+        Effect.flatMap((shell) => {
+          const detail = "That run is not active, so the board will not mark it in progress.";
+          if (shell === null || shell.activeRunId !== RunId.make(input.runId)) {
+            return Effect.fail(runError(detail));
+          }
+          if (shell.projectId !== ProjectId.make(input.projectId)) {
+            return Effect.fail(runError("The run belongs to a different project."));
+          }
+          return Effect.void;
+        }),
+      );
+    return { interrupt, confirmLaunch };
+  }),
+);
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
@@ -49,23 +150,28 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
 const isColumn = (value: unknown): value is KanbanColumn =>
   typeof value === "string" && (COLUMNS as readonly string[]).includes(value);
 
-const json = (
-  status: number,
-  body:
-    | { readonly _tag: "Applied"; readonly changed: boolean }
-    | { readonly _tag: "Rejected" | "NeedsConfirmation"; readonly detail: string }
-    | { readonly detail: string },
-) =>
-  HttpServerResponse.text(JSON.stringify(body), {
+const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
+const decodeJson = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
+
+const json = (status: number, body: Record<string, unknown>) =>
+  HttpServerResponse.text(encodeJson(body), {
     status,
     contentType: "application/json",
   });
 
 const readJson = (text: string): unknown => {
   try {
-    return JSON.parse(text) as unknown;
+    return decodeJson(text);
   } catch {
     return null;
+  }
+};
+
+const ledgerFrom = (value: unknown): KanbanMoveLedger => {
+  try {
+    return decodeLedger(value);
+  } catch {
+    return {};
   }
 };
 
@@ -74,13 +180,8 @@ const stringField = (record: Record<string, unknown>, key: string): string | nul
 
 const stamped = Effect.map(DateTime.now, DateTime.formatIso);
 
-const encodeOne = (card: AdapterBoardCard): string | null => {
-  try {
-    return encodeAdapterBoardWire([card]);
-  } catch {
-    return null;
-  }
-};
+const projectIdOf = (state: BoardSequence): string | null =>
+  "intake" in state ? state.intake.projectId : null;
 
 const publicMove = (result: KanbanMoveResult) =>
   result._tag === "Applied"
@@ -131,6 +232,14 @@ const authResponse = {
   EnvironmentScopeRequiredError: HttpServerRespondable.toResponse,
 } as const;
 
+const asRun = <A>(effect: Effect.Effect<A, BoardRunError>) =>
+  effect.pipe(
+    Effect.map((value) => ({ _tag: "Ok" as const, value })),
+    Effect.catchTags({
+      BoardRunError: (error) => Effect.succeed({ _tag: "No" as const, detail: error.detail }),
+    }),
+  );
+
 /**
  * Board snapshot on the T3 HTTP server, so the web app uses the same origin and
  * the same session as every other API call.
@@ -141,14 +250,28 @@ export const layer = Layer.unwrap(
     const crypto = yield* Crypto.Crypto;
     const fs = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
+    const runs = yield* BoardRuns;
     const filePath = path.join(config.stateDir, BOARD_FILE);
     yield* fs.makeDirectory(path.dirname(filePath), { recursive: true }).pipe(Effect.ignore);
     const hub = makeAdapterBoardHub();
     const existing = yield* fs.readFileString(filePath).pipe(Effect.orElseSucceed(() => ""));
-    if (existing.length > 0) hub.replace(existing);
     let ledger: KanbanMoveLedger = {};
-    // One permit so two publishes cannot read the same snapshot and rename over each other.
+    if (existing.length > 0) {
+      const parsed = readJson(existing);
+      if (Array.isArray(parsed)) {
+        hub.replace(existing);
+      } else if (
+        isRecord(parsed) &&
+        Array.isArray(parsed.cards) &&
+        hub.replace(encodeJson(parsed.cards))
+      ) {
+        if (isRecord(parsed.ledger)) {
+          ledger = ledgerFrom(parsed.ledger);
+        }
+      }
+    }
     const writes = yield* Semaphore.make(1);
+    const envelope = () => encodeJson({ cards: readJson(hub.snapshot()), ledger });
     const persist = (body: string) =>
       Effect.gen(function* () {
         const temporary = `${filePath}.${yield* crypto.randomUUIDv4()}.tmp`;
@@ -170,17 +293,30 @@ export const layer = Layer.unwrap(
       return yield* writes.withPermits(1)(
         Effect.gen(function* () {
           const previous = hub.snapshot();
-          if (!hub.upsert(text)) {
+          const written = hub.upsert(text);
+          if (written === "invalid")
             return HttpServerResponse.text("Invalid board.", { status: 400 });
+          if (written === "stale") {
+            return json(409, {
+              detail: "The board changed since this snapshot. The server kept its copy.",
+            });
           }
-          yield* persist(hub.snapshot()).pipe(
+          if (written === "forbidden") {
+            return json(409, {
+              detail: "State changes go through the workflow. The snapshot was not stored.",
+            });
+          }
+          yield* persist(envelope()).pipe(
             Effect.tapError(() =>
               Effect.sync(() => {
                 hub.replace(previous);
               }),
             ),
           );
-          return HttpServerResponse.empty({ status: 204 });
+          return HttpServerResponse.text(hub.snapshot(), {
+            status: 200,
+            contentType: "application/json",
+          });
         }),
       );
     }).pipe(
@@ -198,24 +334,51 @@ export const layer = Layer.unwrap(
       return yield* hub.events;
     }).pipe(Effect.catchTags(authResponse));
     const cardsNow = () => decodeAdapterBoard(hub.snapshot()) ?? [];
-    const storeCard = (card: AdapterBoardCard) =>
+    const commitCard = (card: AdapterBoardCard) => {
+      const current = cardsNow();
+      const next = current.some((item) => item.taskId === card.taskId)
+        ? current.map((item) => (item.taskId === card.taskId ? card : item))
+        : [...current, card];
+      return hub.replace(encodeAdapterBoardWire(next));
+    };
+    const persistApplied = (
+      outcome: KanbanMoveResult & { readonly _tag: "Applied" },
+      card: AdapterBoardCard | undefined,
+      fields: {
+        readonly taskId: string;
+        readonly title: string | null;
+        readonly threadId: string | null;
+        readonly runId: string | null;
+      },
+    ) =>
       Effect.gen(function* () {
-        const encoded = encodeOne(card);
-        if (encoded === null) return "rejected" as const;
         const previous = hub.snapshot();
-        if (!hub.upsert(encoded)) return "rejected" as const;
-        yield* persist(hub.snapshot()).pipe(
+        const previousLedger = ledger;
+        if (outcome.changed) {
+          const title = card?.title ?? fields.title;
+          if (title === null) return "needs-title" as const;
+          const stored = commitCard({
+            taskId: fields.taskId,
+            title,
+            state: outcome.state,
+            threadId: fields.threadId,
+            runId: fields.runId,
+            revision: (card?.revision ?? 0) + 1,
+            updatedAt: yield* stamped,
+          });
+          if (!stored) return "rejected" as const;
+        }
+        ledger = outcome.ledger;
+        yield* persist(envelope()).pipe(
           Effect.tapError(() =>
             Effect.sync(() => {
               hub.replace(previous);
+              ledger = previousLedger;
             }),
           ),
         );
         return "stored" as const;
       });
-    const remember = (outcome: KanbanMoveResult & { readonly _tag: "Applied" }) => {
-      ledger = outcome.ledger;
-    };
     const move = Effect.gen(function* () {
       yield* authorize(AuthOrchestrationOperateScope);
       const request = yield* HttpServerRequest.HttpServerRequest;
@@ -235,27 +398,73 @@ export const layer = Layer.unwrap(
           if (decoded._tag === "Bad") {
             return json(500, { detail: "The stored task state is invalid." });
           }
-          const outcome = yield* requestKanbanMove(decoded.state, {
+          const requestInput = {
             taskId,
             column: body.column,
             idempotencyKey,
             confirmed: body.confirmed === true,
             at: yield* stamped,
             ledger,
-          });
+          };
+          const asked = yield* requestKanbanMove(decoded.state, requestInput);
+          const outcome =
+            asked._tag === "NeedsInterrupt"
+              ? yield* Effect.gen(function* () {
+                  const threadId = card.threadId;
+                  const runId = card.runId ?? null;
+                  if (threadId === null || runId === null) {
+                    return {
+                      _tag: "Rejected" as const,
+                      detail: "This card has no T3 run to interrupt.",
+                      state: decoded.state,
+                      ledger,
+                    };
+                  }
+                  const projectId = projectIdOf(decoded.state);
+                  if (projectId === null) {
+                    return {
+                      _tag: "Rejected" as const,
+                      detail: "This card has no project, so the run cannot be interrupted.",
+                      state: decoded.state,
+                      ledger,
+                    };
+                  }
+                  const interrupted = yield* asRun(
+                    runs.interrupt({
+                      projectId,
+                      threadId,
+                      runId,
+                      commandId: `board-interrupt-${idempotencyKey}`,
+                    }),
+                  );
+                  if (interrupted._tag === "No" || interrupted.value !== "requested") {
+                    return {
+                      _tag: "Rejected" as const,
+                      detail:
+                        interrupted._tag === "No"
+                          ? interrupted.detail
+                          : "The run did not confirm the interrupt, so the card stays here.",
+                      state: decoded.state,
+                      ledger,
+                    };
+                  }
+                  return yield* commitInterruptedMove(decoded.state, requestInput);
+                })
+              : asked;
           if (outcome._tag !== "Applied") return json(409, publicMove(outcome));
-          if (outcome.changed) {
-            const saved = yield* storeCard({
-              ...card,
-              state: outcome.state,
-              updatedAt: yield* stamped,
-            });
-            if (saved === "rejected") {
-              return json(500, { detail: "The workflow state could not be stored." });
-            }
+          const saved = yield* persistApplied(outcome, card, {
+            taskId,
+            title: card.title,
+            threadId: card.threadId,
+            runId: card.runId ?? null,
+          });
+          if (saved !== "stored") {
+            return json(500, { detail: "The workflow state could not be stored." });
           }
-          remember(outcome);
-          return json(200, publicMove(outcome));
+          return json(200, {
+            ...publicMove(outcome),
+            revision: (card.revision ?? 0) + (outcome.changed ? 1 : 0),
+          });
         }),
       );
     }).pipe(
@@ -284,56 +493,95 @@ export const layer = Layer.unwrap(
           const decoded = yield* decodeEvent(body.event);
           if (decoded._tag === "Bad") return json(400, { detail: "The event is not valid." });
           const card = cardsNow().find((item) => item.taskId === taskId);
-          const outcome =
+          const stored =
             card === undefined
-              ? yield* openBoardTask(decoded.event, idempotencyKey, taskId, ledger)
+              ? { _tag: "Missing" as const }
               : yield* decodeState(card.state).pipe(
-                  Effect.flatMap((stored) =>
-                    stored._tag === "Bad"
-                      ? Effect.succeed({
-                          _tag: "Rejected" as const,
-                          detail: "The stored task state is invalid.",
-                          state: card.state,
-                          ledger,
-                        })
-                      : applyBoardWorkflowEvent(
-                          stored.state,
-                          decoded.event,
-                          idempotencyKey,
-                          taskId,
-                          ledger,
-                        ),
+                  Effect.map((result) =>
+                    result._tag === "Bad"
+                      ? { _tag: "Bad" as const }
+                      : { _tag: "Ok" as const, state: result.state },
                   ),
                 );
-          if (outcome._tag !== "Applied") return json(409, publicMove(outcome));
-          if (outcome.changed) {
-            const title = card?.title ?? stringField(body, "title");
-            if (title === null) return json(400, { detail: "A new task needs a title." });
-            const threadValue = body.threadId;
-            const threadId =
-              card?.threadId ??
-              (typeof threadValue === "string" ? threadValue : threadValue === null ? null : null);
-            if (
-              card === undefined &&
-              threadValue !== undefined &&
-              threadValue !== null &&
-              typeof threadValue !== "string"
-            ) {
-              return json(400, { detail: "threadId must be a string or null." });
+          if (stored._tag === "Bad") {
+            return json(500, { detail: "The stored task state is invalid." });
+          }
+          const replay = ledger[idempotencyKey] !== undefined;
+          const threadId =
+            typeof body.threadId === "string" ? body.threadId : (card?.threadId ?? null);
+          const runId = typeof body.runId === "string" ? body.runId : (card?.runId ?? null);
+          if (!replay && stored._tag === "Ok" && decoded.event.type === "start_execution") {
+            if (threadId === null || runId === null) {
+              return json(409, {
+                _tag: "Rejected",
+                detail: "In Progress is recorded only after the adapter launches a run.",
+              });
             }
-            const saved = yield* storeCard({
-              taskId,
-              title,
-              state: outcome.state,
-              threadId,
-              updatedAt: yield* stamped,
-            });
-            if (saved === "rejected") {
-              return json(400, { detail: "The task could not be stored." });
+            const projectId = projectIdOf(stored.state);
+            if (projectId === null) {
+              return json(409, {
+                _tag: "Rejected",
+                detail: "This card has no project, so the run cannot be checked.",
+              });
+            }
+            const confirmed = yield* asRun(runs.confirmLaunch({ projectId, threadId, runId }));
+            if (confirmed._tag === "No") {
+              return json(409, { _tag: "Rejected", detail: confirmed.detail });
             }
           }
-          remember(outcome);
-          return json(200, publicMove(outcome));
+          if (
+            !replay &&
+            stored._tag === "Ok" &&
+            (decoded.event.type === "cancel" || decoded.event.type === "lease_expired")
+          ) {
+            if (threadId === null || runId === null) {
+              return json(409, {
+                _tag: "Rejected",
+                detail: "This card has no T3 run to interrupt.",
+              });
+            }
+            const projectId = projectIdOf(stored.state);
+            if (projectId === null) {
+              return json(409, {
+                _tag: "Rejected",
+                detail: "This card has no project, so the run cannot be interrupted.",
+              });
+            }
+            const interrupted = yield* asRun(
+              runs.interrupt({
+                projectId,
+                threadId,
+                runId,
+                commandId: `board-interrupt-${idempotencyKey}`,
+              }),
+            );
+            if (interrupted._tag === "No") {
+              return json(409, { _tag: "Rejected", detail: interrupted.detail });
+            }
+          }
+          const outcome =
+            stored._tag === "Missing"
+              ? yield* openBoardTask(decoded.event, idempotencyKey, taskId, ledger)
+              : yield* applyBoardWorkflowEvent(
+                  stored.state,
+                  decoded.event,
+                  idempotencyKey,
+                  taskId,
+                  ledger,
+                );
+          if (outcome._tag !== "Applied") return json(409, publicMove(outcome));
+          const saved = yield* persistApplied(outcome, card, {
+            taskId,
+            title: stringField(body, "title"),
+            threadId,
+            runId,
+          });
+          if (saved === "needs-title") return json(400, { detail: "A new task needs a title." });
+          if (saved !== "stored") return json(400, { detail: "The task could not be stored." });
+          return json(200, {
+            ...publicMove(outcome),
+            revision: (card?.revision ?? 0) + (outcome.changed ? 1 : 0),
+          });
         }),
       );
     }).pipe(

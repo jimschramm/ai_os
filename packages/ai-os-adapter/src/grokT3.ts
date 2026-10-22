@@ -30,6 +30,7 @@ export interface AttemptSession {
   readonly threadId: string | null;
   readonly runId: string | null;
   readonly launchKey: string;
+  readonly revision: number;
   readonly updatedAt: string;
 }
 
@@ -46,6 +47,8 @@ export const boardCard = (session: AttemptSession): AdapterBoardCard => ({
   title: session.title,
   state: session.state,
   threadId: session.threadId,
+  runId: session.runId,
+  revision: session.revision,
   updatedAt: session.updatedAt,
 });
 
@@ -140,6 +143,7 @@ export interface GrokT3Adapter extends WorkerAdapter<AttemptSession, AdapterBoar
     report: ProgressReportV1,
   ) => Effect.Effect<AttemptSession, GrokT3Error>;
   readonly list: () => readonly AttemptSession[];
+  readonly pause: (taskId: string) => Effect.Effect<AttemptSession, GrokT3Error>;
 }
 
 /** Capabilities this adapter actually implements. Retrieval of foreign assignments is not one of them. */
@@ -180,18 +184,62 @@ export const createGrokT3Adapter = (input: {
       : Effect.succeed(session);
   };
 
-  const save = (session: AttemptSession) =>
+  let publishedEvents = 0;
+  const uniqueEventKey = (name: string, taskId: string) => {
+    publishedEvents += 1;
+    return `${name}-${taskId}-${publishedEvents}`;
+  };
+  const cardsReplacing = (session: AttemptSession): readonly AdapterBoardCard[] => {
+    const next = boardCard(session);
+    return [...readAdapterBoard().filter((card) => card.taskId !== session.taskId), next];
+  };
+  const remember = (session: AttemptSession, accepted: readonly AdapterBoardCard[]) => {
+    for (const card of accepted) {
+      if (card.taskId === session.taskId) continue;
+      const existing = store.get(card.taskId);
+      if (
+        existing !== undefined &&
+        card.revision !== undefined &&
+        existing.revision !== card.revision
+      ) {
+        store.put({ ...existing, revision: card.revision });
+      }
+    }
+    const match = accepted.find((card) => card.taskId === session.taskId);
+    if (match === undefined) return null;
+    const stored = { ...session, revision: match.revision ?? session.revision };
+    store.put(stored);
+    return stored;
+  };
+  const saveSnapshot = (session: AttemptSession) =>
     Effect.gen(function* () {
-      store.put(session);
-      yield* input.client.publishBoard(readAdapterBoard());
-      return session;
+      const accepted = yield* input.client.publishBoard(cardsReplacing(session));
+      const stored = remember(session, accepted);
+      if (stored === null) {
+        return yield* fail("t3_rejected", "The board server did not accept this task.");
+      }
+      return stored;
     });
-
   const step = (session: AttemptSession, event: SequenceEvent) =>
     applySequenceEvent(session.state, event).pipe(
       Effect.mapError(contractError),
       Effect.map((state) => ({ ...session, state, updatedAt: input.clock() })),
     );
+  const saveEvent = (session: AttemptSession, event: SequenceEvent, idempotencyKey: string) =>
+    Effect.gen(function* () {
+      const next = yield* step(session, event);
+      const published = yield* input.client.publishEvent({
+        taskId: next.taskId,
+        title: next.title,
+        idempotencyKey,
+        threadId: next.threadId,
+        runId: next.runId,
+        event,
+      });
+      const stored = { ...next, revision: published.revision };
+      store.put(stored);
+      return stored;
+    });
 
   const assignmentFor = (taskId: string, context: ContextPackageSnapshotV1) => ({
     version: "v1" as const,
@@ -262,13 +310,14 @@ export const createGrokT3Adapter = (input: {
         },
         { type: "assign", assignment: assignmentFor(taskId, context) },
       ]).pipe(Effect.mapError(contractError));
-      return yield* save({
+      return yield* saveSnapshot({
         taskId,
         title,
         state,
         threadId: null,
         runId: null,
         launchKey,
+        revision: 0,
         updatedAt: at,
       });
     });
@@ -291,7 +340,7 @@ export const createGrokT3Adapter = (input: {
           prompt: renderPrompt(intake, session.state.assignment.contextPackage),
           contextPackage: session.state.assignment.contextPackage,
         });
-        session = yield* save({
+        session = yield* saveSnapshot({
           ...session,
           threadId: launched.threadId,
           runId: launched.runId,
@@ -299,7 +348,12 @@ export const createGrokT3Adapter = (input: {
         });
       }
       if (session.state.phase === "assigned") {
-        session = yield* save(yield* step(session, { type: "start_execution" }));
+        const generation = session.state.nextGeneration;
+        session = yield* saveEvent(
+          session,
+          { type: "start_execution" },
+          `start-${taskId}-${generation}`,
+        );
       }
       return session;
     });
@@ -307,7 +361,11 @@ export const createGrokT3Adapter = (input: {
   const reportProgress = (taskId: string, report: ProgressReportV1) =>
     Effect.gen(function* () {
       const session = yield* load(taskId);
-      return yield* save(yield* step(session, { type: "report_progress", report }));
+      return yield* saveEvent(
+        session,
+        { type: "report_progress", report },
+        uniqueEventKey("progress", taskId),
+      );
     });
 
   const observe = (taskId: string) =>
@@ -325,13 +383,14 @@ export const createGrokT3Adapter = (input: {
           ),
         );
       if (view !== null && view.runId !== null && view.runId !== session.runId) {
-        session = yield* save({ ...session, runId: view.runId, updatedAt: input.clock() });
+        session = yield* saveSnapshot({ ...session, runId: view.runId, updatedAt: input.clock() });
       }
       if (view === null || view.status === "interrupted") {
         if (session.state.phase !== "executing") return session;
         const run = session.state.run;
-        return yield* save(
-          yield* step(session, {
+        return yield* saveEvent(
+          session,
+          {
             type: "heartbeat_lapsed",
             lapse: {
               version: "v1",
@@ -340,7 +399,8 @@ export const createGrokT3Adapter = (input: {
               generation: run.generation,
               leaseId: run.leaseId,
             },
-          }),
+          },
+          `lapse-${taskId}-${run.generation}`,
         );
       }
       if (session.state.phase !== "executing") return session;
@@ -348,8 +408,9 @@ export const createGrokT3Adapter = (input: {
       const attemptId = session.state.assignment.attemptId;
       if (view.status === "running") {
         if (run.progress?.status !== "working") {
-          session = yield* save(
-            yield* step(session, {
+          session = yield* saveEvent(
+            session,
+            {
               type: "report_progress",
               report: {
                 version: "v1",
@@ -361,7 +422,8 @@ export const createGrokT3Adapter = (input: {
                 blockers: [],
                 partialArtifacts: [],
               },
-            }),
+            },
+            uniqueEventKey("progress", taskId),
           );
         }
         if (
@@ -370,8 +432,9 @@ export const createGrokT3Adapter = (input: {
           view.inputTokens !== undefined &&
           view.outputTokens !== undefined
         ) {
-          session = yield* save(
-            yield* step(session, {
+          session = yield* saveEvent(
+            session,
+            {
               type: "report_usage",
               generation: session.state.run.generation,
               leaseId: session.state.run.leaseId,
@@ -389,7 +452,8 @@ export const createGrokT3Adapter = (input: {
                   model: { model },
                 },
               },
-            }),
+            },
+            uniqueEventKey("usage", taskId),
           );
         }
         return session;
@@ -397,8 +461,9 @@ export const createGrokT3Adapter = (input: {
       if (view.status !== "completed") return session;
       const outcome =
         view.text !== null && view.text.length > 0 ? view.text : "T3 thread completed.";
-      return yield* save(
-        yield* step(session, {
+      return yield* saveEvent(
+        session,
+        {
           type: "submit_completion",
           completion: {
             version: "v1",
@@ -410,7 +475,8 @@ export const createGrokT3Adapter = (input: {
             artifactRevision: artifactRevision(view),
             evidence: [{ kind: "readback", ref: evidenceRefFor(threadId) }],
           },
-        }),
+        },
+        `complete-${taskId}-${run.generation}`,
       );
     });
 
@@ -421,8 +487,9 @@ export const createGrokT3Adapter = (input: {
         if (session.threadId === null || session.runId === null) {
           return yield* fail("not_started", "The interrupted task has no T3 run to continue.");
         }
-        session = yield* save(
-          yield* step(session, {
+        session = yield* saveEvent(
+          session,
+          {
             type: "resolve_recovery",
             command: {
               command: "resolve_recovery",
@@ -431,7 +498,8 @@ export const createGrokT3Adapter = (input: {
               taskId,
               attemptId: session.state.assignment.attemptId,
             },
-          }),
+          },
+          `resume-${taskId}`,
         );
       }
       if (
@@ -455,7 +523,11 @@ export const createGrokT3Adapter = (input: {
       if (continued?.runId != null) {
         session = { ...session, runId: continued.runId };
       }
-      return yield* save(yield* step(session, { type: "start_execution" }));
+      return yield* saveEvent(
+        session,
+        { type: "start_execution" },
+        `start-${taskId}-${generation}`,
+      );
     });
 
   const cancel = (taskId: string) =>
@@ -466,22 +538,50 @@ export const createGrokT3Adapter = (input: {
       }
       const idempotencyKey = `cancel-${taskId}`;
       const seen = session.state.commands.some((entry) => entry.idempotencyKey === idempotencyKey);
-      const next = yield* step(session, {
-        type: "cancel",
-        command: {
-          command: "cancel",
-          idempotencyKey,
-          taskId,
-          attemptId: session.state.assignment.attemptId,
-        },
-      });
-      if (!seen && session.threadId !== null) {
-        if (session.runId === null) {
-          return yield* fail("not_started", "The task has no T3 run to interrupt.");
-        }
-        yield* input.client.interrupt(session.threadId, session.runId);
+      if (seen) return session;
+      if (session.threadId === null || session.runId === null) {
+        return yield* fail("not_started", "The task has no T3 run to interrupt.");
       }
-      return yield* save(next);
+      yield* input.client.interrupt(session.threadId, session.runId);
+      return yield* saveEvent(
+        session,
+        {
+          type: "cancel",
+          command: {
+            command: "cancel",
+            idempotencyKey,
+            taskId,
+            attemptId: session.state.assignment.attemptId,
+          },
+        },
+        idempotencyKey,
+      );
+    });
+
+  const pause = (taskId: string) =>
+    Effect.gen(function* () {
+      const session = yield* load(taskId);
+      if (session.state.phase !== "executing") {
+        return yield* fail("contract", `Cannot pause from ${session.state.phase}.`);
+      }
+      if (session.threadId === null || session.runId === null) {
+        return yield* fail("not_started", "The task has no T3 run to interrupt.");
+      }
+      yield* input.client.interrupt(session.threadId, session.runId);
+      const run = session.state.run;
+      return yield* saveEvent(
+        session,
+        {
+          type: "lease_expired",
+          lease: {
+            taskId,
+            attemptId: session.state.assignment.attemptId,
+            generation: run.generation,
+            leaseId: run.leaseId,
+          },
+        },
+        `pause-${taskId}`,
+      );
     });
 
   const reportUsage = (taskId: string, measurement: UsageMeasurementV1) =>
@@ -490,13 +590,15 @@ export const createGrokT3Adapter = (input: {
       if (session.state.phase !== "executing") {
         return yield* fail("contract", `Cannot report_usage from ${session.state.phase}.`);
       }
-      return yield* save(
-        yield* step(session, {
+      return yield* saveEvent(
+        session,
+        {
           type: "report_usage",
           generation: session.state.run.generation,
           leaseId: session.state.run.leaseId,
           measurement,
-        }),
+        },
+        uniqueEventKey("usage", taskId),
       );
     });
 
@@ -532,8 +634,9 @@ export const createGrokT3Adapter = (input: {
       if (session.state.phase !== "executing") {
         return yield* fail("contract", `Cannot heartbeat from ${session.state.phase}.`);
       }
-      return yield* save(
-        yield* step(session, {
+      return yield* saveEvent(
+        session,
+        {
           type: "heartbeat",
           heartbeat: {
             version: "v1",
@@ -544,7 +647,8 @@ export const createGrokT3Adapter = (input: {
             observedAt,
             leaseExpiresAt,
           },
-        }),
+        },
+        `heartbeat-${taskId}-${observedAt}`,
       );
     });
 
@@ -567,6 +671,7 @@ export const createGrokT3Adapter = (input: {
     observe,
     recover,
     cancel,
+    pause,
     heartbeat,
     reportProgress,
     list: () => store.list(),

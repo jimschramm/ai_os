@@ -1,4 +1,13 @@
-import { ContractId, ContractText, IsoDateTime, SequenceState } from "@t3tools/ai-os-contracts";
+import {
+  applyBoardWorkflowEvent,
+  ContractId,
+  ContractText,
+  IsoDateTime,
+  openBoardTask,
+  SequenceEvent,
+  SequenceState,
+  type KanbanMoveLedger,
+} from "@t3tools/ai-os-contracts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import type * as Scope from "effect/Scope";
@@ -14,23 +23,47 @@ const WireCards = Schema.Array(
     title: ContractText,
     state: SequenceState,
     threadId: Schema.NullOr(ContractId),
+    runId: Schema.NullOr(ContractId).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
+    revision: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)).pipe(
+      Schema.withDecodingDefault(Effect.succeed(0)),
+    ),
     updatedAt: IsoDateTime,
   }),
 );
+
+const SNAPSHOT_PHASES = new Set(["idle", "requested", "acknowledged", "assigned"]);
+
+export type AdapterBoardWrite = "ok" | "invalid" | "stale" | "forbidden";
+
+const sameState = (left: unknown, right: unknown): boolean =>
+  JSON.stringify(left) === JSON.stringify(right);
 
 const encodeWire = Schema.encodeSync(Schema.fromJsonString(WireCards));
 const decodeWire = Schema.decodeUnknownSync(Schema.fromJsonString(WireCards));
 
 /** Strict snapshot the T3 server stores. The browser decodes a looser copy. */
 export const encodeAdapterBoardWire = (cards: readonly AdapterBoardCard[]): string =>
-  encodeWire(cards);
+  encodeWire(
+    cards.map((card) => ({
+      taskId: card.taskId,
+      title: card.title,
+      state: card.state,
+      threadId: card.threadId,
+      runId: card.runId ?? null,
+      revision: card.revision ?? 0,
+      updatedAt: card.updatedAt,
+    })),
+  );
 
 export interface AdapterBoardHub {
   readonly snapshot: () => string;
   /** Replace the snapshot. Used when a saved file is loaded. */
   readonly replace: (text: string) => boolean;
-  /** Insert or update each card by task id. Cards not in the payload stay. */
-  readonly upsert: (text: string) => boolean;
+  /**
+   * Insert or update each card by task id. A stale revision or a phase change
+   * writes nothing. Cards missing from the payload stay.
+   */
+  readonly upsert: (text: string) => AdapterBoardWrite;
   readonly events: Effect.Effect<HttpServerResponse.HttpServerResponse, never, Scope.Scope>;
 }
 
@@ -70,28 +103,43 @@ export const makeAdapterBoardHub = (): AdapterBoardHub => {
     },
     upsert: (text) => {
       const incoming = decodeCards(text);
-      if (incoming === null) return false;
+      if (incoming === null) return "invalid";
+      if (incoming.length === 0) return "ok";
       const current = decodeCards(snapshot) ?? [];
-      const merged = new Map<string, WireCard>();
-      for (const card of current) merged.set(card.taskId, card);
-      for (const card of incoming) merged.set(card.taskId, card);
+      const stored = new Map(current.map((card) => [card.taskId, card]));
+      const planned = new Map<string, WireCard>();
+      for (const card of incoming) {
+        const previous = stored.get(card.taskId);
+        if (previous === undefined) {
+          if (!SNAPSHOT_PHASES.has(card.state.phase)) return "forbidden";
+          if (card.revision !== 0) return "stale";
+          planned.set(card.taskId, { ...card, revision: 1 });
+          continue;
+        }
+        if (card.revision !== previous.revision) return "stale";
+        if (!sameState(card.state, previous.state)) return "forbidden";
+        const changed =
+          card.title !== previous.title ||
+          card.threadId !== previous.threadId ||
+          card.runId !== previous.runId ||
+          card.updatedAt !== previous.updatedAt;
+        planned.set(card.taskId, changed ? { ...card, revision: previous.revision + 1 } : previous);
+      }
       const order: WireCard[] = [];
       const seen = new Set<string>();
       for (const card of current) {
-        const next = merged.get(card.taskId);
-        if (next === undefined) continue;
-        order.push(next);
+        order.push(planned.get(card.taskId) ?? card);
         seen.add(card.taskId);
       }
       for (const card of incoming) {
         if (seen.has(card.taskId)) continue;
-        const next = merged.get(card.taskId);
+        const next = planned.get(card.taskId);
         if (next === undefined) continue;
         order.push(next);
         seen.add(card.taskId);
       }
       write(order);
-      return true;
+      return "ok";
     },
     events: Effect.gen(function* () {
       const queue = yield* Queue.unbounded<Uint8Array>();
@@ -115,3 +163,129 @@ export const makeAdapterBoardHub = (): AdapterBoardHub => {
     }),
   };
 };
+
+const decodeEvent = Schema.decodeUnknownSync(SequenceEvent);
+const decodeJson = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
+const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
+
+const readJson = (text: string): unknown => {
+  try {
+    return decodeJson(text);
+  } catch {
+    return null;
+  }
+};
+
+const eventBody = (body: Record<string, unknown>): string => encodeJson(body);
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+
+export interface BoardEventReceipt {
+  readonly ledger: KanbanMoveLedger;
+  readonly status: number;
+  readonly body: string;
+}
+
+/** Apply one workflow event onto the hub. Snapshots cannot do this. */
+export const acceptBoardEvent = (
+  hub: AdapterBoardHub,
+  ledger: KanbanMoveLedger,
+  text: string,
+  updatedAt: string,
+): Effect.Effect<BoardEventReceipt> =>
+  Effect.gen(function* () {
+    const parsed = readJson(text);
+    if (parsed === null) {
+      return {
+        ledger,
+        status: 400,
+        body: eventBody({ detail: "Expected a JSON object." }),
+      };
+    }
+    if (
+      !isRecord(parsed) ||
+      typeof parsed.taskId !== "string" ||
+      typeof parsed.idempotencyKey !== "string"
+    ) {
+      return {
+        ledger,
+        status: 400,
+        body: eventBody({ detail: "Expected taskId, idempotencyKey, and event." }),
+      };
+    }
+    const event = yield* Effect.try({
+      try: () => decodeEvent(parsed.event),
+      catch: () => "invalid" as const,
+    }).pipe(Effect.orElseSucceed(() => null));
+    if (event === null) {
+      return { ledger, status: 400, body: eventBody({ detail: "The event is not valid." }) };
+    }
+    const taskId = parsed.taskId;
+    const idempotencyKey = parsed.idempotencyKey;
+    const current = decodeCards(hub.snapshot()) ?? [];
+    const existing = current.find((card) => card.taskId === taskId);
+    const outcome =
+      existing === undefined
+        ? yield* openBoardTask(event, idempotencyKey, taskId, ledger)
+        : yield* applyBoardWorkflowEvent(existing.state, event, idempotencyKey, taskId, ledger);
+    if (outcome._tag !== "Applied") {
+      return {
+        ledger,
+        status: 409,
+        body: eventBody({ _tag: "Rejected", detail: outcome.detail }),
+      };
+    }
+    const revision = (existing?.revision ?? 0) + (outcome.changed ? 1 : 0);
+    if (outcome.changed) {
+      const title = existing?.title ?? (typeof parsed.title === "string" ? parsed.title : null);
+      if (title === null) {
+        return {
+          ledger,
+          status: 400,
+          body: eventBody({ detail: "A new task needs a title." }),
+        };
+      }
+      const threadId =
+        typeof parsed.threadId === "string"
+          ? parsed.threadId
+          : parsed.threadId === null
+            ? null
+            : (existing?.threadId ?? null);
+      const runId =
+        typeof parsed.runId === "string"
+          ? parsed.runId
+          : parsed.runId === null
+            ? null
+            : (existing?.runId ?? null);
+      const nextCard: WireCard = {
+        taskId,
+        title,
+        state: outcome.state,
+        threadId,
+        runId,
+        revision,
+        updatedAt,
+      };
+      const order =
+        existing === undefined
+          ? [...current, nextCard]
+          : current.map((card) => (card.taskId === taskId ? nextCard : card));
+      const stored = yield* Effect.try({
+        try: () => hub.replace(encodeWire(order)),
+        catch: () => false,
+      }).pipe(Effect.orElseSucceed(() => false));
+      if (!stored) {
+        return {
+          ledger,
+          status: 400,
+          body: eventBody({ detail: "The task could not be stored." }),
+        };
+      }
+    }
+    return {
+      ledger: outcome.ledger,
+      status: 200,
+      body: eventBody({ _tag: "Applied", changed: outcome.changed, revision }),
+    };
+  });

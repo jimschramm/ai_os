@@ -1,12 +1,13 @@
 import { ADAPTER_BOARD_MOVE_PATH } from "@t3tools/ai-os-adapter/board";
 import type { KanbanColumn } from "@t3tools/ai-os-contracts";
-import { useState } from "react";
+import { useRef, useState } from "react";
 
 import { primaryFetchInit } from "../../environments/primary/primaryRequest";
 import { resolvePrimaryEnvironmentHttpUrl } from "../../environments/primary/target";
 import { Badge } from "~/components/ui/badge";
 import { Button } from "~/components/ui/button";
 
+import { useDialogCycle } from "./dialogFocus";
 import type { OperationsTask } from "./fixtures";
 import {
   BOARD_COLUMNS,
@@ -99,6 +100,14 @@ export function KanbanBoard({
   const [alert, setAlert] = useState<string | null>(null);
   const [pending, setPending] = useState<PendingMove | null>(null);
   const [dragging, setDragging] = useState<string | null>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
+  const confirmRef = useRef<HTMLButtonElement>(null);
+  const inFlight = useRef(false);
+  const dismiss = () => {
+    setPending(null);
+    setAlert(null);
+  };
+  useDialogCycle(pending?.key ?? null, panelRef, confirmRef, dismiss);
 
   const requestMove = async (
     task: OperationsTask,
@@ -106,26 +115,32 @@ export function KanbanBoard({
     key: string,
     confirmed: boolean,
   ) => {
-    if (!liveIds.has(task.id)) {
-      setAlert("Demo cards stay put. Live tasks move only through the workflow.");
+    if (inFlight.current) return;
+    inFlight.current = true;
+    try {
+      if (!liveIds.has(task.id)) {
+        setAlert("Demo cards stay put. Live tasks move only through the workflow.");
+        setPending(null);
+        return;
+      }
+      const result = await postMove(task.id, column, key, confirmed);
+      if (result._tag === "NeedsConfirmation") {
+        setAlert(null);
+        setPending({
+          taskId: task.id,
+          column,
+          key,
+          detail: result.detail ?? "Confirm this move.",
+        });
+        return;
+      }
       setPending(null);
-      return;
+      setAlert(
+        result._tag === "Rejected" ? (result.detail ?? "The workflow rejected that move.") : null,
+      );
+    } finally {
+      inFlight.current = false;
     }
-    const result = await postMove(task.id, column, key, confirmed);
-    if (result._tag === "NeedsConfirmation") {
-      setAlert(null);
-      setPending({
-        taskId: task.id,
-        column,
-        key,
-        detail: result.detail ?? "Confirm this move.",
-      });
-      return;
-    }
-    setPending(null);
-    setAlert(
-      result._tag === "Rejected" ? (result.detail ?? "The workflow rejected that move.") : null,
-    );
   };
 
   const dropOn = (column: KanbanColumn, taskId: string) => {
@@ -146,7 +161,9 @@ export function KanbanBoard({
       )}
       {pending === null ? null : (
         <div
+          ref={panelRef}
           role="alertdialog"
+          aria-modal="true"
           aria-labelledby="kanban-confirm-title"
           className="flex flex-col gap-3 rounded-lg border border-border bg-card px-3 py-3"
         >
@@ -155,8 +172,8 @@ export function KanbanBoard({
           </p>
           <div className="flex flex-wrap gap-2">
             <Button
+              ref={confirmRef}
               size="sm"
-              autoFocus
               onClick={() => {
                 const task = tasks.find((item) => item.id === pending.taskId);
                 if (task === undefined) {
@@ -168,14 +185,7 @@ export function KanbanBoard({
             >
               Confirm
             </Button>
-            <Button
-              size="sm"
-              variant="outline"
-              onClick={() => {
-                setPending(null);
-                setAlert(null);
-              }}
-            >
+            <Button size="sm" variant="outline" onClick={dismiss}>
               Keep it here
             </Button>
           </div>
