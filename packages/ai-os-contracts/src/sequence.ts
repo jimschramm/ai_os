@@ -49,7 +49,14 @@ import {
 import { QaAcceptV1, QaReworkV1, QaUnavailableV1, QaVerdictV1 } from "./qa.ts";
 import { UsageMeasurementV1 } from "./usage.ts";
 
-export const KanbanColumn = Schema.Literals(["Ready", "Running", "Blocked", "Review", "Done"]);
+export const KanbanColumn = Schema.Literals([
+  "Backlog",
+  "Ready",
+  "Running",
+  "Blocked",
+  "Review",
+  "Done",
+]);
 export type KanbanColumn = typeof KanbanColumn.Type;
 
 export const SequenceEvent = Schema.Union([
@@ -421,8 +428,10 @@ export const initialSequenceState: SequenceState = { phase: "idle" };
 export const kanbanColumn = (phase: SequencePhase): KanbanColumn | null => {
   switch (phase) {
     case "idle":
-    case "requested":
+    case "cancelled":
       return null;
+    case "requested":
+      return "Backlog";
     case "acknowledged":
     case "assigned":
     case "rework":
@@ -430,14 +439,12 @@ export const kanbanColumn = (phase: SequencePhase): KanbanColumn | null => {
     case "executing":
       return "Running";
     case "recovery_pending":
+    case "failed":
       return "Blocked";
     case "awaiting_qa":
       return "Review";
     case "accepted":
       return "Done";
-    case "failed":
-    case "cancelled":
-      return null;
   }
 };
 

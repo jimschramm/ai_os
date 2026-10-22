@@ -18,11 +18,12 @@ import {
 } from "./fixtures";
 
 export const BOARD_COLUMNS = [
-  { id: "Ready", label: "Ready", hint: "Assigned or back for another pass" },
-  { id: "Running", label: "Running", hint: "Someone is in the work" },
+  { id: "Backlog", label: "Backlog", hint: "Requested, not queued yet" },
+  { id: "Ready", label: "Ready/Queued", hint: "Assigned or back for another pass" },
+  { id: "Running", label: "In Progress", hint: "Someone is in the work" },
+  { id: "Review", label: "In QA", hint: "Waiting on an independent review" },
   { id: "Blocked", label: "Blocked", hint: "Includes execution status unknown" },
-  { id: "Review", label: "Review", hint: "Waiting on QA" },
-  { id: "Done", label: "Done", hint: "Accepted" },
+  { id: "Done", label: "Done", hint: "Accepted by a different model" },
 ] as const satisfies readonly {
   readonly id: KanbanColumn;
   readonly label: string;
@@ -75,6 +76,32 @@ export function tasksForProject(id: string): readonly OperationsTask[] {
 
 export function columnFor(task: OperationsTask): KanbanColumn | null {
   return kanbanColumn(task.phase);
+}
+
+export function assignedAgent(task: OperationsTask): string {
+  return task.assignment?.workerId ?? task.agent;
+}
+
+export function assignedModel(task: OperationsTask): string {
+  return task.assignment?.implementerModel.model ?? "Unassigned";
+}
+
+/** The newest thing the run has said, otherwise the request itself. */
+export function progressLine(task: OperationsTask): string {
+  const latest = task.progress.at(-1);
+  const note = latest?.partialArtifacts.at(-1)?.note;
+  if (note !== undefined) return note;
+  const blocker = latest?.blockers.at(-1)?.summary;
+  if (blocker !== undefined) return blocker;
+  if (task.result !== null) return task.result;
+  return task.intake.request;
+}
+
+export function blockerReason(task: OperationsTask): string | null {
+  if (task.needsYou !== null) return task.needsYou.summary;
+  const latest = task.progress.at(-1);
+  if (latest?.status !== "blocked") return null;
+  return latest.blockers[0]?.summary ?? null;
 }
 
 export function tasksInColumn(

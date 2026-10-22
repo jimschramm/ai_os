@@ -199,3 +199,24 @@ it.effect("re-renders from a feed payload and falls back when the payload is emp
     ),
   ),
 );
+
+it.effect("shows a requested task with no assignment", () =>
+  Effect.gen(function* () {
+    const requested = yield* applySequence([
+      { type: "intake", intake: { ...intakeV2Example, projectId: "usba", workspaceId: "usba" } },
+    ]);
+    const shown = tasksForBoard("usba", [
+      {
+        taskId: "task-backlog",
+        title: "Draft the brief",
+        state: requested,
+        threadId: null,
+        updatedAt: at,
+      },
+    ]);
+    assert.strictEqual(shown[0]?.phase, "requested");
+    assert.strictEqual(shown[0]?.assignment, null);
+    assert.strictEqual(shown[0]?.agent, "Unassigned");
+    assert.strictEqual(shown[0]?.projectId, "usba");
+  }),
+);

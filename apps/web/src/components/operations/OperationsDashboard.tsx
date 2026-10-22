@@ -11,7 +11,6 @@ import {
   agentMark,
   findingsCount,
   progressIndex,
-  progressPercent,
   qaBreakdown,
   touchSeries,
 } from "./boardVisuals";
@@ -21,11 +20,11 @@ import { CortexView } from "./CortexView";
 import { MemoryBrowser } from "./MemoryBrowser";
 import { UsageGauges } from "./UsageGauges";
 import { hasLiveBoard, tasksForBoard } from "./adapterBoard";
+import { KanbanBoard } from "./KanbanBoard";
 import { useAdapterBoard } from "./adapterFeed";
 import type { NeedsYouItem, OperationsAgent, OperationsTask } from "./fixtures";
 import { INITIAL_MEMORY_REVIEW, type MemoryReviewState } from "./memoryModel";
 import {
-  BOARD_COLUMNS,
   activeAgentCount,
   findProject,
   needsYou,
@@ -61,14 +60,6 @@ export function OperationsProjectNamesFromServer({ children }: { children: React
 }
 
 const useProjectNames = (): ReadonlyMap<string, string> => useContext(ProjectNames);
-
-const COLUMN_ACCENT: Record<(typeof BOARD_COLUMNS)[number]["id"], string> = {
-  Ready: "border-l-info",
-  Running: "border-l-info",
-  Blocked: "border-l-warning",
-  Review: "border-l-warning",
-  Done: "border-l-success",
-};
 
 export function OperationsDashboard() {
   const names = useProjectNames();
@@ -170,7 +161,7 @@ export function OperationsDashboard() {
           </div>
         </div>
       </header>
-      <main className="min-h-0 flex-1 overflow-auto">
+      <main className="min-h-0 min-w-0 flex-1 overflow-auto">
         {surface === "memory" ? (
           <div className="p-4 sm:p-6">
             <CortexView
@@ -183,7 +174,7 @@ export function OperationsDashboard() {
             />
           </div>
         ) : (
-          <div className="ops-visual flex flex-col gap-4 p-4 sm:p-6">
+          <div className="ops-visual flex min-w-0 flex-col gap-4 p-4 sm:p-6">
             <AgentRail agents={agents} active={active} />
             <div className="grid grid-cols-1 gap-3 lg:grid-cols-3">
               <ThroughputCard tasks={tasks} />
@@ -194,7 +185,7 @@ export function OperationsDashboard() {
                 onAct={(id) => setNoted((current) => ({ ...current, [id]: true }))}
               />
             </div>
-            <section aria-labelledby="board-heading">
+            <section aria-labelledby="board-heading" className="min-w-0">
               <div className="mb-3 flex items-baseline justify-between gap-3">
                 <h2 id="board-heading" className="text-sm font-semibold tracking-tight">
                   Board
@@ -203,44 +194,15 @@ export function OperationsDashboard() {
                   {heading}
                 </p>
               </div>
-              <div className="grid grid-cols-1 gap-3 md:grid-cols-2 lg:grid-cols-5">
-                {BOARD_COLUMNS.map((column) => {
-                  const columnTasks = tasksInColumn(tasks, column.id);
-                  return (
-                    <section
-                      key={column.id}
-                      aria-labelledby={`column-${column.id}`}
-                      className="flex min-w-0 flex-col gap-2 rounded-xl border border-border bg-card/40 p-2"
-                    >
-                      <div className="flex items-center justify-between px-1.5 pt-1">
-                        <h3 id={`column-${column.id}`} className="text-sm font-medium">
-                          {column.label}
-                        </h3>
-                        <Badge size="sm" variant="outline">
-                          {columnTasks.length}
-                        </Badge>
-                      </div>
-                      <div className="flex flex-col gap-2">
-                        {columnTasks.map((task) => (
-                          <TaskCard
-                            key={task.id}
-                            task={task}
-                            accent={COLUMN_ACCENT[column.id]}
-                            pressed={task.id === selected?.id}
-                            onOpen={() => {
-                              setCurrentTaskId(task.id);
-                              setSelectedId(task.id);
-                            }}
-                          />
-                        ))}
-                        {columnTasks.length === 0 ? (
-                          <p className="px-1.5 py-3 text-xs text-muted-foreground">Nothing here</p>
-                        ) : null}
-                      </div>
-                    </section>
-                  );
-                })}
-              </div>
+              <KanbanBoard
+                tasks={tasks}
+                liveIds={new Set(cards.map((card) => card.taskId))}
+                names={names}
+                onOpen={(taskId) => {
+                  setCurrentTaskId(taskId);
+                  setSelectedId(taskId);
+                }}
+              />
             </section>
             <UsageGauges entries={usage.entries} />
           </div>
@@ -542,63 +504,6 @@ function BlockerCard({
       )}
     </section>
   );
-}
-
-function TaskCard({
-  task,
-  accent,
-  pressed,
-  onOpen,
-}: {
-  task: OperationsTask;
-  accent: string;
-  pressed: boolean;
-  onOpen: () => void;
-}) {
-  const names = useProjectNames();
-  const percent = progressPercent(task.phase);
-  return (
-    <button
-      type="button"
-      aria-pressed={pressed}
-      onClick={onOpen}
-      className={`rounded-lg border border-border border-l-2 bg-card px-2.5 py-2 text-left shadow-xs transition-colors duration-150 hover:bg-accent/40 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring focus-visible:outline-none ${accent} ${pressed ? "bg-accent/50" : ""}`}
-    >
-      <span className="flex items-center gap-2">
-        <span
-          aria-hidden="true"
-          className="ops-avatar-mark grid size-5 shrink-0 place-items-center rounded-full text-3xs font-semibold"
-          style={{ background: agentColor(task.agent) }}
-        >
-          {agentMark(task.agent)}
-        </span>
-        <span className="min-w-0">
-          <span className="line-clamp-2 block text-sm font-medium">{task.title}</span>
-          <span className="mt-0.5 block text-xs text-muted-foreground">
-            {projectLabel(task.projectId, names)}
-          </span>
-        </span>
-      </span>
-      <span className="mt-2 block h-1 overflow-hidden rounded-full bg-muted">
-        <span
-          className={`block h-1 rounded-full ${barClass(task.phase)}`}
-          style={{ width: `${percent}%` }}
-        />
-      </span>
-      <span className="mt-2 flex">
-        <Badge variant={qaBadgeTone(task)} size="sm">
-          {qaStatusLabel(task)}
-        </Badge>
-      </span>
-    </button>
-  );
-}
-
-function barClass(phase: OperationsTask["phase"]): string {
-  if (phase === "accepted") return "bg-success";
-  if (phase === "recovery_pending" || phase === "rework" || phase === "awaiting_qa")
-    return "bg-warning";
-  return "bg-info";
 }
 
 function TaskDrawer({

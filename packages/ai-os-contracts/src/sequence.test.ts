@@ -77,7 +77,7 @@ it.effect("confirms only after the intake is a durable receipt", () =>
     });
     assert.strictEqual(requested.phase, "requested");
     assert.strictEqual("acknowledgment" in requested, false);
-    assert.strictEqual(kanbanColumn(requested.phase), null);
+    assert.strictEqual(kanbanColumn(requested.phase), "Backlog");
 
     const acknowledged = yield* applySequenceEvent(requested, {
       type: "acknowledge",

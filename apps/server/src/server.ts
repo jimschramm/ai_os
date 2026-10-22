@@ -685,7 +685,7 @@ const layerMakeRoutes = Layer.mergeAll(
       Layer.provide(AuthHttp.layerAuthenticatedAuth),
     ),
     ServerHttp.layerOtlpTracesProxyRoute,
-    AiOsBoard.layer,
+    AiOsBoard.layer.pipe(Layer.provide(AiOsBoard.liveRuns)),
     ServerHttp.layerAssetRoute,
     ServerHttp.layerAttachmentUploadRoute,
     DeviceHubProxy.layer,

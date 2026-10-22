@@ -7,12 +7,16 @@ import * as Schema from "effect/Schema";
  */
 export const ADAPTER_BOARD_PATH = "/api/ai-os/board";
 export const ADAPTER_BOARD_EVENTS_PATH = "/api/ai-os/board/events";
+export const ADAPTER_BOARD_MOVE_PATH = "/api/ai-os/board/move";
+export const ADAPTER_BOARD_EVENT_PATH = "/api/ai-os/board/event";
 
 export interface AdapterBoardCard {
   readonly taskId: string;
   readonly title: string;
   readonly state: SequenceState;
   readonly threadId: string | null;
+  readonly runId?: string | null;
+  readonly revision?: number;
   readonly updatedAt: string;
 }
 
@@ -24,6 +28,8 @@ const BoardCards = Schema.Array(
     title: Schema.String,
     state: Schema.Unknown,
     threadId: Schema.NullOr(Schema.String),
+    runId: Schema.optional(Schema.NullOr(Schema.String)),
+    revision: Schema.optional(Schema.Number),
     updatedAt: Schema.String,
   }),
 );

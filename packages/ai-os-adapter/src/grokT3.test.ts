@@ -6,8 +6,10 @@ import {
   decodeCompletionSubmissionV1,
   decodeIntake,
   decodeSequenceState,
+  executionLaunchKey,
   intakeV2Example,
   leaseIdFor,
+  type KanbanMoveLedger,
 } from "@t3tools/ai-os-contracts";
 import {
   AuthAccessTokenResult,
@@ -53,11 +55,16 @@ import {
 import * as UrlParams from "effect/http/UrlParams";
 import { RpcSerialization, RpcServer } from "effect/rpc";
 
-import { ADAPTER_BOARD_EVENTS_PATH, ADAPTER_BOARD_PATH } from "./board.ts";
-import { makeAdapterBoardHub } from "./boardHub.ts";
+import {
+  ADAPTER_BOARD_EVENT_PATH,
+  ADAPTER_BOARD_EVENTS_PATH,
+  ADAPTER_BOARD_PATH,
+} from "./board.ts";
+import { acceptBoardEvent, makeAdapterBoardHub } from "./boardHub.ts";
 import {
   clearAdapterBoard,
   createGrokT3Adapter,
+  GrokT3Error,
   decodeAdapterBoard,
   memorySessionStore,
   readAdapterBoard,
@@ -82,7 +89,7 @@ interface StoredThread {
   model: string;
   instanceId: string;
   workspace: string;
-  status: "running" | "completed" | "interrupted";
+  status: "running" | "completed" | "interrupted" | "failed";
   text: string | null;
   revision: string | null;
   inputTokens?: number;
@@ -111,6 +118,7 @@ interface FakeT3 {
       Pick<StoredThread, "status" | "text" | "revision" | "inputTokens" | "outputTokens">
     >,
   ) => void;
+  readonly finishNext: (status: "completed" | "failed", text: string) => void;
 }
 
 const decodeProjection = Schema.decodeUnknownEffect(OrchestrationV2ThreadProjection);
@@ -119,6 +127,7 @@ const encodeWebSocketTicket = Schema.encodeSync(
   Schema.fromJsonString(Schema.toCodecJson(AuthWebSocketTicketResult)),
 );
 const decodeAccessToken = Schema.decodeUnknownEffect(Schema.fromJsonString(AuthAccessTokenResult));
+const encodeJson = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
 
 const authorizationFor = (scopes: ReadonlyArray<string>) =>
   Layer.succeed(RpcScopeAuthorization, (effect, { rpc }) => {
@@ -266,6 +275,7 @@ const makeFake = () => {
   const continues = new Map<string, string>();
   const interrupts = new Map<string, string>();
   let launches = 0;
+  let pending: { status: "completed" | "failed"; text: string } | null = null;
   const handlers = T3OrchestrationRpc.of({
     [ORCHESTRATION_V2_WS_METHODS.launchThread]: (input) =>
       Effect.gen(function* () {
@@ -302,11 +312,12 @@ const makeFake = () => {
           model: input.modelSelection.model,
           instanceId: input.modelSelection.instanceId,
           workspace: input.workspaceStrategy.type,
-          status: "running",
-          text: null,
-          revision: null,
+          status: pending?.status ?? "running",
+          text: pending?.text ?? null,
+          revision: pending?.status === "completed" ? SHA : null,
           runId,
         });
+        pending = null;
         byCommand.set(input.commandId, threadId);
         const thread = threads.get(threadId);
         if (thread === undefined) return yield* Effect.die(`Missing ${threadId}`);
@@ -353,6 +364,7 @@ const makeFake = () => {
   const tickets = new Map<string, readonly string[]>();
   let issued = 0;
   const hub = makeAdapterBoardHub();
+  let ledger: KanbanMoveLedger = {};
   const handlersLayer = T3OrchestrationRpc.toLayer(handlers);
   const expiresAt = DateTime.toUtc(NOW);
   const bearerScopes = (request: HttpServerRequest.HttpServerRequest) => {
@@ -434,8 +446,18 @@ const makeFake = () => {
       yield* boardGate(AuthOrchestrationOperateScope);
       const request = yield* HttpServerRequest.HttpServerRequest;
       const text = yield* request.text.pipe(Effect.orElseSucceed(() => ""));
-      if (!hub.upsert(text)) return HttpServerResponse.text("Invalid board.", { status: 400 });
-      return HttpServerResponse.empty({ status: 204 });
+      const written = hub.upsert(text);
+      if (written === "invalid") return HttpServerResponse.text("Invalid board.", { status: 400 });
+      if (written !== "ok") {
+        return HttpServerResponse.text(JSON.stringify({ detail: written }), {
+          status: 409,
+          contentType: "application/json",
+        });
+      }
+      return HttpServerResponse.text(hub.snapshot(), {
+        status: 200,
+        contentType: "application/json",
+      });
     }),
   );
   const boardEvents = boardResponse(
@@ -480,6 +502,23 @@ const makeFake = () => {
       HttpRouter.add("GET", "/ws", wsRoute),
       HttpRouter.add("GET", ADAPTER_BOARD_PATH, boardGet),
       HttpRouter.add("POST", ADAPTER_BOARD_PATH, boardPost),
+      HttpRouter.add(
+        "POST",
+        ADAPTER_BOARD_EVENT_PATH,
+        boardResponse(
+          Effect.gen(function* () {
+            yield* boardGate(AuthOrchestrationOperateScope);
+            const request = yield* HttpServerRequest.HttpServerRequest;
+            const text = yield* request.text.pipe(Effect.orElseSucceed(() => ""));
+            const result = yield* acceptBoardEvent(hub, ledger, text, CLOCK);
+            ledger = result.ledger;
+            return HttpServerResponse.text(result.body, {
+              status: result.status,
+              contentType: "application/json",
+            });
+          }),
+        ),
+      ),
       HttpRouter.add("GET", ADAPTER_BOARD_EVENTS_PATH, boardEvents),
     ),
     { disableListenLog: true, disableLogger: true },
@@ -506,6 +545,9 @@ const makeFake = () => {
       const current = threads.get(threadId);
       if (current === undefined) throw new Error(`Missing ${threadId}`);
       threads.set(threadId, { ...current, ...patch });
+    },
+    finishNext: (status, text) => {
+      pending = { status, text };
     },
   });
   return { layer, fake };
@@ -608,6 +650,9 @@ it.effect("fingerprints the provider launch will use", () =>
 
       const started = yield* grok.launch(grokRecorded.taskId);
       assert.strictEqual(started.threadId, "t3-thread-1");
+      if (grokRecorded.state.phase === "assigned") {
+        assert.strictEqual(grokRecorded.state.assignment.instanceId, "grok");
+      }
       assert.strictEqual(fake.instanceId("t3-thread-1"), "grok");
       assert.strictEqual(fake.model("t3-thread-1"), "gpt-5.4");
     }),
@@ -772,7 +817,7 @@ it.effect("reuses the server thread when the local record lost the id", () =>
       });
       const recorded = yield* record(adapter);
       const request = {
-        idempotencyKey: recorded.launchKey,
+        idempotencyKey: executionLaunchKey(recorded.taskId, `${recorded.taskId}-attempt-1`, 1),
         projectId: intakeV2Example.projectId,
         title: recorded.title,
         prompt: "already sent",
@@ -788,6 +833,102 @@ it.effect("reuses the server thread when the local record lost the id", () =>
       assert.strictEqual(started.threadId, first.threadId);
       assert.strictEqual(fake.threadCount(), 1);
       assert.strictEqual(fake.launchCount(), 1);
+    }),
+  ),
+);
+
+it.effect("follows a board interrupt instead of lapsing, then resumes", () =>
+  withFake((fake) =>
+    Effect.gen(function* () {
+      const adapter = createGrokT3Adapter({
+        client: t3Client(fake.origin),
+        clock: () => CLOCK,
+        model: TEST_MODEL,
+      });
+      const recorded = yield* record(adapter);
+      const started = yield* adapter.launch(recorded.taskId);
+      if (started.state.phase !== "executing" || started.threadId === null) {
+        return yield* Effect.die("expected an executing run");
+      }
+      const token = yield* accessTokenFor(fake.origin, PAIR_OPERATE);
+      const paused = yield* HttpClient.execute(
+        HttpClientRequest.post(`${fake.origin}${ADAPTER_BOARD_EVENT_PATH}`).pipe(
+          HttpClientRequest.setHeader("authorization", `Bearer ${token}`),
+          HttpClientRequest.bodyText(
+            yield* encodeJson({
+              taskId: recorded.taskId,
+              title: recorded.title,
+              idempotencyKey: `pause-${recorded.taskId}`,
+              threadId: started.threadId,
+              runId: started.runId,
+              event: {
+                type: "lease_expired",
+                lease: {
+                  taskId: recorded.taskId,
+                  attemptId: `${recorded.taskId}-attempt-1`,
+                  generation: started.state.run.generation,
+                  leaseId: started.state.run.leaseId,
+                },
+              },
+            }),
+            "application/json",
+          ),
+        ),
+      ).pipe(
+        Effect.flatMap((response) =>
+          response.text.pipe(Effect.map((text) => ({ response, text }))),
+        ),
+        Effect.provide(FetchHttpClient.layer),
+      );
+      assert.strictEqual(paused.response.status, 200);
+      fake.setThread(started.threadId, { status: "interrupted" });
+      const adopted = yield* adapter.observe(recorded.taskId);
+      assert.strictEqual(adopted.state.phase, "recovery_pending");
+      assert.strictEqual(fake.interruptCount(), 0);
+      const still = yield* adapter.observe(recorded.taskId);
+      assert.strictEqual(still.state.phase, "recovery_pending");
+
+      const resumed = yield* adapter.recover(recorded.taskId);
+      assert.strictEqual(resumed.state.phase, "executing");
+      assert.strictEqual(resumed.threadId, started.threadId);
+      assert.strictEqual(fake.continueCount(), 1);
+      assert.strictEqual(fake.launchCount(), 1);
+    }),
+  ),
+);
+
+it.effect("records start and the terminal outcome when the run finishes during launch", () =>
+  withFake((fake) =>
+    Effect.gen(function* () {
+      const adapter = createGrokT3Adapter({
+        client: t3Client(fake.origin),
+        clock: () => CLOCK,
+        model: TEST_MODEL,
+      });
+      const recorded = yield* record(adapter);
+      fake.finishNext("completed", "Finished before start was recorded.");
+      const done = yield* adapter.launch(recorded.taskId);
+      assert.strictEqual(done.state.phase, "awaiting_qa");
+      assert.strictEqual(fake.launchCount(), 1);
+      if (done.state.phase !== "awaiting_qa") return;
+      assert.strictEqual(done.state.completion.generation, 1);
+      assert.strictEqual(
+        done.state.completion.claimedOutcome,
+        "Finished before start was recorded.",
+      );
+
+      const failedAdapter = createGrokT3Adapter({
+        client: t3Client(fake.origin),
+        clock: () => CLOCK,
+        model: TEST_MODEL,
+      });
+      const failedRecorded = yield* record(failedAdapter, "task-fast-fail");
+      fake.finishNext("failed", "The provider exited.");
+      const failed = yield* failedAdapter.launch(failedRecorded.taskId);
+      assert.strictEqual(failed.state.phase, "failed");
+      if (failed.state.phase !== "failed") return;
+      assert.strictEqual(failed.state.blocker.summary, "The provider exited.");
+      assert.strictEqual(fake.launchCount(), 2);
     }),
   ),
 );
@@ -808,6 +949,67 @@ it.effect("interrupts the run once when cancel is repeated", () =>
       yield* adapter.cancel(recorded.taskId);
       assert.strictEqual(fake.interruptCount(), 1);
       assert.strictEqual(fake.launchCount(), 1);
+    }),
+  ),
+);
+
+it.effect("does not mark the task cancelled when the interrupt fails", () =>
+  withFake((fake) =>
+    Effect.gen(function* () {
+      const base = t3Client(fake.origin);
+      const adapter = createGrokT3Adapter({
+        client: {
+          ...base,
+          interrupt: () =>
+            Effect.fail(new GrokT3Error({ reason: "t3_rejected", detail: "The run stayed up." })),
+        },
+        clock: () => CLOCK,
+        model: TEST_MODEL,
+      });
+      const recorded = yield* record(adapter);
+      const started = yield* adapter.launch(recorded.taskId);
+      assert.strictEqual(started.state.phase, "executing");
+      const failed = yield* adapter.cancel(recorded.taskId).pipe(Effect.flip);
+      assert.strictEqual(failed.reason, "t3_rejected");
+      assert.strictEqual(adapter.result(recorded.taskId)?.state.phase, "executing");
+      const paused = yield* adapter.pause(recorded.taskId).pipe(Effect.flip);
+      assert.strictEqual(paused.reason, "t3_rejected");
+      assert.strictEqual(adapter.result(recorded.taskId)?.state.phase, "executing");
+    }),
+  ),
+);
+
+it.effect("pauses only after the interrupt and does not start when launch fails", () =>
+  withFake((fake) =>
+    Effect.gen(function* () {
+      const adapter = createGrokT3Adapter({
+        client: t3Client(fake.origin),
+        clock: () => CLOCK,
+        model: TEST_MODEL,
+      });
+      const recorded = yield* record(adapter);
+      const early = yield* adapter.cancel(recorded.taskId).pipe(Effect.flip);
+      assert.strictEqual(early.reason, "not_started");
+      assert.strictEqual(adapter.result(recorded.taskId)?.state.phase, "assigned");
+
+      const started = yield* adapter.launch(recorded.taskId);
+      const paused = yield* adapter.pause(started.taskId);
+      assert.strictEqual(paused.state.phase, "recovery_pending");
+      assert.strictEqual(fake.interruptCount(), 1);
+
+      const blockedLaunch = createGrokT3Adapter({
+        client: {
+          ...t3Client(fake.origin),
+          launch: () =>
+            Effect.fail(new GrokT3Error({ reason: "t3_rejected", detail: "No thread." })),
+        },
+        clock: () => CLOCK,
+        model: TEST_MODEL,
+      });
+      const held = yield* record(blockedLaunch, "task-held");
+      const missed = yield* blockedLaunch.launch(held.taskId).pipe(Effect.flip);
+      assert.strictEqual(missed.reason, "t3_rejected");
+      assert.strictEqual(blockedLaunch.result(held.taskId)?.state.phase, "assigned");
     }),
   ),
 );

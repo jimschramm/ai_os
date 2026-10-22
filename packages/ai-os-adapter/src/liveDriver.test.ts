@@ -1,5 +1,6 @@
 import * as NodeHttpServer from "@effect/platform-node/NodeHttpServer";
 import { assert, it } from "@effect/vitest";
+import { leaseIdFor, type KanbanMoveLedger } from "@t3tools/ai-os-contracts";
 import {
   AuthAccessTokenResult,
   AuthAccessTokenType,
@@ -24,8 +25,8 @@ import {
 } from "effect/http";
 import * as UrlParams from "effect/http/UrlParams";
 
-import { ADAPTER_BOARD_PATH, decodeAdapterBoard } from "./board.ts";
-import { makeAdapterBoardHub } from "./boardHub.ts";
+import { ADAPTER_BOARD_EVENT_PATH, ADAPTER_BOARD_PATH, decodeAdapterBoard } from "./board.ts";
+import { acceptBoardEvent, makeAdapterBoardHub } from "./boardHub.ts";
 import {
   LIVE_DRIVER_COMMAND,
   LIVE_DRIVER_DEFAULT_ORIGIN,
@@ -33,6 +34,7 @@ import {
   LiveDriverUsageError,
   isLoopbackDriverOrigin,
   parseLiveDriverArgs,
+  liveTaskId,
   resolveDriverModel,
   runLiveDriver,
   runLiveDriverCli,
@@ -52,6 +54,7 @@ const SHA = "ab".repeat(20);
 const PAIR = "pair-operate";
 
 const encodeAccessToken = Schema.encodeSync(Schema.fromJsonString(AuthAccessTokenResult));
+const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 const decodeAccessToken = Schema.decodeUnknownEffect(Schema.fromJsonString(AuthAccessTokenResult));
 
 const formField = (params: UrlParams.UrlParams, key: string) => {
@@ -61,6 +64,7 @@ const formField = (params: UrlParams.UrlParams, key: string) => {
 
 const makeServer = () => {
   const hub = makeAdapterBoardHub();
+  let ledger: KanbanMoveLedger = {};
   const bearers = new Map<string, readonly string[]>();
   let issued = 0;
   let exchanges = 0;
@@ -148,8 +152,18 @@ const makeServer = () => {
       return HttpServerResponse.text("Unauthorized", { status: 401 });
     }
     const text = yield* request.text.pipe(Effect.orElseSucceed(() => ""));
-    if (!hub.upsert(text)) return HttpServerResponse.text("Invalid board.", { status: 400 });
-    return HttpServerResponse.empty({ status: 204 });
+    const written = hub.upsert(text);
+    if (written === "invalid") return HttpServerResponse.text("Invalid board.", { status: 400 });
+    if (written !== "ok") {
+      return HttpServerResponse.text(JSON.stringify({ detail: written }), {
+        status: 409,
+        contentType: "application/json",
+      });
+    }
+    return HttpServerResponse.text(hub.snapshot(), {
+      status: 200,
+      contentType: "application/json",
+    });
   });
   const layer = HttpRouter.serve(
     Layer.mergeAll(
@@ -157,6 +171,24 @@ const makeServer = () => {
       HttpRouter.add("GET", "/api/projects", projectsRoute),
       HttpRouter.add("GET", ADAPTER_BOARD_PATH, boardGet),
       HttpRouter.add("POST", ADAPTER_BOARD_PATH, boardPost),
+      HttpRouter.add(
+        "POST",
+        ADAPTER_BOARD_EVENT_PATH,
+        Effect.gen(function* () {
+          const request = yield* HttpServerRequest.HttpServerRequest;
+          const scopes = scopesFor(request);
+          if (scopes === undefined || !scopes.includes(AuthOrchestrationOperateScope)) {
+            return HttpServerResponse.text("Unauthorized", { status: 401 });
+          }
+          const text = yield* request.text.pipe(Effect.orElseSucceed(() => ""));
+          const result = yield* acceptBoardEvent(hub, ledger, text, CLOCK);
+          ledger = result.ledger;
+          return HttpServerResponse.text(result.body, {
+            status: result.status,
+            contentType: "application/json",
+          });
+        }),
+      ),
     ),
     { disableListenLog: true, disableLogger: true },
   ).pipe(Layer.provideMerge(NodeHttpServer.layerTest));
@@ -321,6 +353,8 @@ it.effect("lists project ids and publishes the launched task to the server board
         listProjectIds: real.listProjectIds,
         listProviderModels: () => Effect.succeed(CATALOG),
         publishBoard: real.publishBoard,
+        publishEvent: real.publishEvent,
+        readBoard: real.readBoard,
         interrupt: () => Effect.die("interrupt is unused"),
         continueRun: () => Effect.die("continue is unused"),
         launch: (input) => {
@@ -332,8 +366,8 @@ it.effect("lists project ids and publishes the launched task to the server board
           return Effect.succeed({
             threadId: "t3-thread-1",
             runId: "run-1",
-            status: reads < 3 ? "running" : "completed",
-            text: reads < 3 ? "draft" : "done",
+            status: reads < 4 ? "running" : "completed",
+            text: reads < 4 ? "draft" : "done",
             revision: null,
           });
         },
@@ -439,7 +473,10 @@ it.effect("lists projects and launches in one run", () =>
           },
         ]),
       listProviderModels: () => Effect.succeed(CATALOG),
-      publishBoard: () => Effect.void,
+      publishBoard: (cards) =>
+        Effect.succeed(cards.map((card) => ({ ...card, revision: (card.revision ?? 0) + 1 }))),
+      publishEvent: () => Effect.succeed({ revision: 1 }),
+      readBoard: () => Effect.succeed([]),
       interrupt: () => Effect.die("interrupt is unused"),
       continueRun: () => Effect.die("continue is unused"),
       launch: () => {
@@ -504,7 +541,10 @@ it.effect("launches the offered default when the configured model is gpt-5.4", (
           ...CATALOG,
           serverDefault: { instanceId: "codex", model: "gpt-5.4" },
         }),
-      publishBoard: () => Effect.void,
+      publishBoard: (cards) =>
+        Effect.succeed(cards.map((card) => ({ ...card, revision: (card.revision ?? 0) + 1 }))),
+      publishEvent: () => Effect.succeed({ revision: 1 }),
+      readBoard: () => Effect.succeed([]),
       interrupt: () => Effect.die("interrupt is unused"),
       continueRun: () => Effect.die("continue is unused"),
       launch: (input) => {
@@ -559,7 +599,10 @@ it.effect("rejects a model the provider does not offer and lists the valid ones"
           },
         ]),
       listProviderModels: () => Effect.succeed(CATALOG),
-      publishBoard: () => Effect.void,
+      publishBoard: (cards) =>
+        Effect.succeed(cards.map((card) => ({ ...card, revision: (card.revision ?? 0) + 1 }))),
+      publishEvent: () => Effect.succeed({ revision: 1 }),
+      readBoard: () => Effect.succeed([]),
       interrupt: () => Effect.die("interrupt is unused"),
       continueRun: () => Effect.die("continue is unused"),
       launch: () => {
@@ -680,4 +723,112 @@ it.effect("resolves an omitted model from the server catalog", () =>
       serverDefault: { instanceId: "codex", model: "gpt-5.6-sol" },
     });
   }),
+);
+
+it.effect("stays with a task the board interrupts, then follows the resume", () =>
+  withServer((origin) =>
+    Effect.gen(function* () {
+      const taskId = liveTaskId("Tournament page", CLOCK);
+      let finish = false;
+      const real = wsT3LocalClient({ origin, pairingToken: PAIR });
+      const client: T3LocalClient = {
+        listProjectIds: real.listProjectIds,
+        listProviderModels: () => Effect.succeed(CATALOG),
+        publishBoard: real.publishBoard,
+        publishEvent: real.publishEvent,
+        readBoard: real.readBoard,
+        interrupt: () => Effect.void,
+        continueRun: () => Effect.void,
+        launch: () => Effect.succeed({ threadId: "t3-thread-1", runId: "run-1", resumed: false }),
+        read: () =>
+          Effect.succeed({
+            threadId: "t3-thread-1",
+            runId: "run-1",
+            status: finish ? "completed" : "running",
+            text: finish ? "done" : "draft",
+            revision: finish ? SHA : null,
+          }),
+      };
+      const progress: string[] = [];
+      let slept = 0;
+      const post = (idempotencyKey: string, event: unknown) =>
+        HttpClient.execute(
+          HttpClientRequest.post(`${origin}${ADAPTER_BOARD_EVENT_PATH}`).pipe(
+            HttpClientRequest.bodyText(
+              encodeJson({
+                taskId,
+                title: "Tournament page",
+                idempotencyKey,
+                threadId: "t3-thread-1",
+                runId: "run-1",
+                event,
+              }),
+              "application/json",
+            ),
+          ),
+        ).pipe(
+          Effect.flatMap((response) =>
+            response.text.pipe(Effect.map((text) => ({ status: response.status, text }))),
+          ),
+          Effect.provide(FetchHttpClient.layer),
+          Effect.orDie,
+        );
+      yield* runLiveDriver(
+        {
+          origin,
+          pairingToken: PAIR,
+          projectId: "usba",
+          model: undefined,
+          title: "Tournament page",
+          prompt: "Update the tournament page schedule.",
+          listProjects: false,
+        },
+        {
+          client,
+          clock: () => CLOCK,
+          write: (line) => {
+            progress.push(line);
+          },
+          sleep: () =>
+            Effect.gen(function* () {
+              slept += 1;
+              if (slept === 1) {
+                const paused = yield* post(`pause-${taskId}`, {
+                  type: "lease_expired",
+                  lease: {
+                    taskId,
+                    attemptId: `${taskId}-attempt-1`,
+                    generation: 1,
+                    leaseId: leaseIdFor(1),
+                  },
+                });
+                assert.strictEqual(paused.status, 200, paused.text);
+              }
+              if (slept === 2) {
+                const resolved = yield* post(`resume-${taskId}`, {
+                  type: "resolve_recovery",
+                  command: {
+                    command: "resolve_recovery",
+                    outcome: "continue",
+                    idempotencyKey: `resume-${taskId}`,
+                    taskId,
+                    attemptId: `${taskId}-attempt-1`,
+                  },
+                });
+                assert.strictEqual(resolved.status, 200, resolved.text);
+                const started = yield* post(`start-${taskId}-2`, { type: "start_execution" });
+                assert.strictEqual(started.status, 200, started.text);
+                finish = true;
+              }
+            }),
+          readRepoCommit: () => Promise.resolve(SHA),
+          pollIntervalMs: 0,
+          maxPolls: 6,
+        },
+      );
+      assert.equal(progress.includes("recovery_pending"), true);
+      assert.equal(progress.includes("awaiting_qa"), true);
+      assert.equal(progress.includes("still executing"), false);
+    }),
+  ),
 );

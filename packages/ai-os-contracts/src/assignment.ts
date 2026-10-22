@@ -63,6 +63,11 @@ export const ContextPackageSnapshotV1 = Schema.Struct({
 }).check(freezeDecoded);
 export type ContextPackageSnapshotV1 = typeof ContextPackageSnapshotV1.Type;
 
+const InstanceId = Schema.String.check(
+  Schema.isMaxLength(64),
+  Schema.isPattern(/^[A-Za-z][A-Za-z0-9_-]*$/),
+);
+
 export const AssignmentV1 = Schema.Struct({
   version: ContractVersion,
   taskId: ContractId,
@@ -70,6 +75,8 @@ export const AssignmentV1 = Schema.Struct({
   assignmentId: ContractId,
   workerId: ContractId,
   implementerModel: ModelRef,
+  // The provider instance the worker resolved. Absent on assignments recorded before it was stored.
+  instanceId: Schema.optionalKey(InstanceId),
   scope: ContractText,
   contextPackage: ContextPackageSnapshotV1,
 }).check(freezeDecoded);

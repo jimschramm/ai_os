@@ -1,11 +1,58 @@
-import { ADAPTER_BOARD_EVENTS_PATH, ADAPTER_BOARD_PATH } from "@t3tools/ai-os-adapter/board";
-import { makeAdapterBoardHub } from "@t3tools/ai-os-adapter/board-hub";
-import { AuthOrchestrationOperateScope, AuthOrchestrationReadScope } from "@t3tools/contracts";
+import {
+  ADAPTER_BOARD_EVENT_PATH,
+  ADAPTER_BOARD_EVENTS_PATH,
+  ADAPTER_BOARD_MOVE_PATH,
+  ADAPTER_BOARD_PATH,
+  type AdapterBoardCard,
+} from "@t3tools/ai-os-adapter/board";
+import {
+  decodeAdapterBoardWire,
+  encodeAdapterBoardWire,
+  makeAdapterBoardHub,
+} from "@t3tools/ai-os-adapter/board-hub";
+import {
+  launchCommandId,
+  observationEvents,
+  renderPrompt,
+  T3_LAUNCH_DEFAULTS,
+  threadViewFromProjection,
+  type T3ThreadView,
+} from "@t3tools/ai-os-adapter";
+import {
+  applyBoardWorkflowEvent,
+  commitInterruptedMove,
+  decodeSequenceEvent,
+  decodeSequenceState,
+  executionGeneration,
+  executionLaunchKey,
+  openBoardTask,
+  requestKanbanMove,
+  SequenceState,
+  type ContextPackageSnapshotV1,
+  type KanbanColumn,
+  type KanbanMoveLedger,
+  type KanbanMoveResult,
+} from "@t3tools/ai-os-contracts";
+import {
+  AuthOrchestrationOperateScope,
+  AuthOrchestrationReadScope,
+  CommandId,
+  MessageId,
+  OrchestrationMessageContext,
+  ProjectId,
+  ProviderInstanceId,
+  RunId,
+  ThreadId,
+} from "@t3tools/contracts";
+import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
+import * as Data from "effect/Data";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
+import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
 import {
   HttpRouter,
@@ -21,8 +68,375 @@ import {
   failEnvironmentScopeRequired,
 } from "./auth/http.ts";
 import * as ServerConfig from "./config.ts";
+import * as ThreadLaunch from "./orchestration-v2/ThreadLaunchService.ts";
+import * as ThreadManagement from "./orchestration-v2/ThreadManagementService.ts";
 
 const BOARD_FILE = "ai-os-board.json";
+const BOARD_FOLLOW_INTERVAL = "1 second";
+const COLUMNS = ["Backlog", "Ready", "Running", "Review", "Blocked", "Done"] as const;
+
+type BoardSequence = SequenceState;
+
+const LedgerSchema = Schema.Record(
+  Schema.String,
+  Schema.Struct({
+    column: Schema.Literals(["Backlog", "Ready", "Running", "Review", "Blocked", "Done"]),
+    taskId: Schema.String,
+    state: SequenceState,
+  }),
+);
+const decodeLedger = Schema.decodeUnknownSync(LedgerSchema);
+
+export class BoardRunError extends Data.TaggedError("BoardRunError")<{
+  readonly detail: string;
+}> {}
+
+export type BoardInterruptConfirmation = "requested" | "already_stopped";
+
+export type BoardLaunchDisposition = "active" | "completed" | "failed";
+
+export interface BoardLaunchResult {
+  readonly threadId: string;
+  readonly runId: string | null;
+  readonly disposition: BoardLaunchDisposition;
+  readonly summary: string | null;
+}
+
+/**
+ * The board asks the orchestration runtime before it records a run phase.
+ * Tests substitute this. Production uses the live thread service.
+ */
+export class BoardRuns extends Context.Service<
+  BoardRuns,
+  {
+    readonly interrupt: (input: {
+      readonly projectId: string;
+      readonly threadId: string;
+      readonly runId: string;
+      readonly commandId: string;
+    }) => Effect.Effect<BoardInterruptConfirmation, BoardRunError>;
+    readonly confirmLaunch: (input: {
+      readonly projectId: string;
+      readonly threadId: string;
+      readonly runId: string;
+    }) => Effect.Effect<"active" | "settled", BoardRunError>;
+    readonly launch: (input: {
+      readonly idempotencyKey: string;
+      readonly projectId: string;
+      readonly title: string;
+      readonly prompt: string;
+      readonly model: string;
+      readonly instanceId: string;
+      readonly contextPackage: ContextPackageSnapshotV1;
+    }) => Effect.Effect<BoardLaunchResult, BoardRunError>;
+    readonly continueRun: (input: {
+      readonly projectId: string;
+      readonly threadId: string;
+      readonly runId: string;
+      readonly commandId: string;
+      readonly messageId: string;
+      readonly text: string;
+    }) => Effect.Effect<{ readonly runId: string | null }, BoardRunError>;
+    readonly watchThread: (threadId: string) => Effect.Effect<T3ThreadView | null, BoardRunError>;
+    /** Production follows launched runs. Tests leave this off so a tick cannot race the assertion. */
+    readonly followRuns: boolean;
+  }
+>()("t3/aiOsBoard/BoardRuns") {}
+
+const runError = (detail: string) => new BoardRunError({ detail });
+
+const INTERRUPT_UNCONFIRMED = "The run did not confirm the interrupt.";
+
+const NOT_ACTIVE = "That run is not active, so the board will not mark it in progress.";
+
+const decodeMessageContext = Schema.decodeUnknownSync(OrchestrationMessageContext);
+
+const launchContext = (contextPackage: ContextPackageSnapshotV1) =>
+  decodeMessageContext({
+    version: 1,
+    records: [
+      {
+        version: 1,
+        contextId: "context-package",
+        label: "Context package",
+        kind: "context-package",
+        payload: contextPackage,
+      },
+    ],
+  });
+
+const errorDetail = (error: unknown, fallback: string): string =>
+  typeof error === "object" &&
+  error !== null &&
+  "message" in error &&
+  typeof error.message === "string" &&
+  error.message.length > 0
+    ? error.message
+    : fallback;
+
+export const liveRuns = Layer.effect(
+  BoardRuns,
+  Effect.gen(function* () {
+    const threads = yield* ThreadManagement.ThreadManagementService;
+    const launches = yield* ThreadLaunch.ThreadLaunchService;
+    const interrupt: BoardRuns["Service"]["interrupt"] = (input) =>
+      threads
+        .interruptThread({
+          projectId: ProjectId.make(input.projectId),
+          commandId: CommandId.make(input.commandId),
+          threadId: ThreadId.make(input.threadId),
+          runId: RunId.make(input.runId),
+          reason: "Operations board",
+        })
+        .pipe(
+          Effect.flatMap((result) => {
+            if (result.type === "interrupt_requested") return Effect.succeed("requested" as const);
+            if (result.type === "already_terminal") {
+              return Effect.succeed("already_stopped" as const);
+            }
+            return Effect.fail(runError(INTERRUPT_UNCONFIRMED));
+          }),
+          Effect.mapError((error) =>
+            error instanceof BoardRunError ? error : runError(INTERRUPT_UNCONFIRMED),
+          ),
+        );
+    const confirmLaunch: BoardRuns["Service"]["confirmLaunch"] = (input) =>
+      threads.getThreadShell(ThreadId.make(input.threadId)).pipe(
+        Effect.mapError(() => runError(NOT_ACTIVE)),
+        Effect.flatMap((shell) => {
+          if (shell === null) return Effect.fail(runError(NOT_ACTIVE));
+          if (shell.projectId !== ProjectId.make(input.projectId)) {
+            return Effect.fail(runError("The run belongs to a different project."));
+          }
+          const runId = RunId.make(input.runId);
+          if (shell.activeRunId === runId) return Effect.succeed("active" as const);
+          if (shell.activeRunId === null && shell.latestRunId === runId) {
+            return Effect.succeed("settled" as const);
+          }
+          return Effect.fail(runError(NOT_ACTIVE));
+        }),
+      );
+    const launch: BoardRuns["Service"]["launch"] = (input) =>
+      launches
+        .launch({
+          commandId: CommandId.make(launchCommandId(input.idempotencyKey)),
+          projectId: ProjectId.make(input.projectId),
+          title: input.title,
+          modelSelection: {
+            instanceId: ProviderInstanceId.make(input.instanceId),
+            model: input.model,
+          },
+          runtimeMode: T3_LAUNCH_DEFAULTS.runtimeMode,
+          interactionMode: T3_LAUNCH_DEFAULTS.interactionMode,
+          workspaceStrategy: T3_LAUNCH_DEFAULTS.workspaceStrategy,
+          initialMessage: {
+            text: input.prompt,
+            attachments: [],
+            context: launchContext(input.contextPackage),
+          },
+          createdBy: "user",
+          creationSource: "web",
+        })
+        .pipe(
+          Effect.map((result) => {
+            const run = result.projection.runs.at(-1);
+            const status = run?.status;
+            const assistant = result.projection.messages.findLast(
+              (message) => message.role === "assistant" && message.text.length > 0,
+            );
+            const disposition: BoardLaunchDisposition =
+              status === "completed" ? "completed" : status === "failed" ? "failed" : "active";
+            return {
+              threadId: result.threadId,
+              runId: run?.id ?? null,
+              disposition,
+              summary: assistant?.text ?? null,
+            };
+          }),
+          Effect.mapError((error) => runError(errorDetail(error, "The run did not launch."))),
+        );
+    const continueRun: BoardRuns["Service"]["continueRun"] = (input) =>
+      threads
+        .dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make(input.commandId),
+          createdBy: "user",
+          creationSource: "web",
+          threadId: ThreadId.make(input.threadId),
+          messageId: MessageId.make(input.messageId),
+          text: input.text,
+          attachments: [],
+          manualContinuationOfRunId: RunId.make(input.runId),
+          dispatchMode: { type: "start_immediately" },
+        })
+        .pipe(
+          Effect.andThen(threads.getThreadProjection(ThreadId.make(input.threadId))),
+          Effect.map((projection) => ({ runId: projection.runs.at(-1)?.id ?? null })),
+          Effect.mapError((error) => runError(errorDetail(error, "The run did not continue."))),
+        );
+    const watchThread: BoardRuns["Service"]["watchThread"] = (threadId) =>
+      threads.getThreadProjection(ThreadId.make(threadId)).pipe(
+        Effect.map((projection) => threadViewFromProjection(threadId, projection)),
+        Effect.mapError((error) => runError(errorDetail(error, "The thread could not be read."))),
+      );
+    return { interrupt, confirmLaunch, launch, continueRun, watchThread, followRuns: true };
+  }),
+);
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+
+const isColumn = (value: unknown): value is KanbanColumn =>
+  typeof value === "string" && (COLUMNS as readonly string[]).includes(value);
+
+const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
+const decodeJson = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
+
+const json = (status: number, body: Record<string, unknown>) =>
+  HttpServerResponse.text(encodeJson(body), {
+    status,
+    contentType: "application/json",
+  });
+
+const readJson = (text: string): unknown => {
+  try {
+    return decodeJson(text);
+  } catch {
+    return null;
+  }
+};
+
+const ledgerFrom = (value: unknown): KanbanMoveLedger => {
+  try {
+    return decodeLedger(value);
+  } catch {
+    return {};
+  }
+};
+
+const stringField = (record: Record<string, unknown>, key: string): string | null =>
+  typeof record[key] === "string" ? record[key] : null;
+
+const stamped = Effect.map(DateTime.now, DateTime.formatIso);
+
+const projectIdOf = (state: BoardSequence): string | null =>
+  "intake" in state ? state.intake.projectId : null;
+
+const claimText = (value: string | null, fallback: string): string => {
+  const trimmed = (value ?? "").trim().slice(0, 8_000);
+  return trimmed.length > 0 ? trimmed : fallback;
+};
+
+const evidenceRef = (threadId: string): string => {
+  const ref = `thread:${threadId}`;
+  return /^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(ref) && ref.length <= 128 ? ref : "thread:t3";
+};
+
+const rejectedMove = (
+  detail: string,
+  state: BoardSequence,
+  ledger: KanbanMoveLedger,
+): KanbanMoveResult => ({ _tag: "Rejected", detail, state, ledger });
+
+/**
+ * Record start, then a terminal outcome when the run already finished.
+ * The card leaves Ready only after both events apply, in that order.
+ */
+const recordConfirmedRun = (input: {
+  readonly state: BoardSequence;
+  readonly taskId: string;
+  readonly threadId: string;
+  readonly disposition: BoardLaunchDisposition;
+  readonly summary: string | null;
+  readonly ledger: KanbanMoveLedger;
+}): Effect.Effect<KanbanMoveResult> =>
+  Effect.gen(function* () {
+    const queued =
+      input.state.phase === "assigned" || input.state.phase === "rework" ? input.state : null;
+    if (queued === null) {
+      return rejectedMove(
+        "In Progress starts from Ready only after a worker is assigned.",
+        input.state,
+        input.ledger,
+      );
+    }
+    const generation =
+      queued.phase === "assigned" ? queued.nextGeneration : queued.run.generation + 1;
+    const attemptId = queued.assignment.attemptId;
+    const started = yield* applyBoardWorkflowEvent(
+      queued,
+      { type: "start_execution" },
+      `start-${input.taskId}-${generation}`,
+      input.taskId,
+      input.ledger,
+    );
+    if (started._tag !== "Applied" || started.state.phase !== "executing") return started;
+    if (input.disposition === "active") return started;
+    const run = started.state.run;
+    const terminal =
+      input.disposition === "completed"
+        ? yield* applyBoardWorkflowEvent(
+            started.state,
+            {
+              type: "submit_completion",
+              completion: {
+                version: "v1",
+                taskId: input.taskId,
+                attemptId,
+                generation: run.generation,
+                leaseId: run.leaseId,
+                claimedOutcome: claimText(input.summary, "The run finished."),
+                artifactRevision: { type: "named", kind: "page", id: "t3-result" },
+                evidence: [{ kind: "readback", ref: evidenceRef(input.threadId) }],
+              },
+            },
+            `complete-${input.taskId}-${run.generation}`,
+            input.taskId,
+            started.ledger,
+          )
+        : yield* applyBoardWorkflowEvent(
+            started.state,
+            {
+              type: "fail",
+              failure: {
+                taskId: input.taskId,
+                attemptId,
+                generation: run.generation,
+                leaseId: run.leaseId,
+                blocker: {
+                  summary: claimText(input.summary, "The run failed."),
+                  ownerId: queued.assignment.workerId,
+                  nextAction: "Review the thread, then retry or reassign the task.",
+                },
+              },
+            },
+            `fail-${input.taskId}-${run.generation}`,
+            input.taskId,
+            started.ledger,
+          );
+    return terminal._tag === "Applied" ? terminal : started;
+  });
+
+const publicMove = (result: KanbanMoveResult) =>
+  result._tag === "Applied"
+    ? { _tag: "Applied" as const, changed: result.changed }
+    : { _tag: result._tag, detail: result.detail };
+
+const decodeState = (value: unknown) =>
+  decodeSequenceState(value).pipe(
+    Effect.map((state) => ({ _tag: "Ok" as const, state })),
+    Effect.catchTags({
+      SchemaError: () => Effect.succeed({ _tag: "Bad" as const }),
+    }),
+  );
+
+const decodeEvent = (value: unknown) =>
+  decodeSequenceEvent(value).pipe(
+    Effect.map((event) => ({ _tag: "Ok" as const, event })),
+    Effect.catchTags({
+      SchemaError: () => Effect.succeed({ _tag: "Bad" as const }),
+    }),
+  );
 
 const authorize = (
   scope: typeof AuthOrchestrationReadScope | typeof AuthOrchestrationOperateScope,
@@ -52,6 +466,14 @@ const authResponse = {
   EnvironmentScopeRequiredError: HttpServerRespondable.toResponse,
 } as const;
 
+const asRun = <A>(effect: Effect.Effect<A, BoardRunError>) =>
+  effect.pipe(
+    Effect.map((value) => ({ _tag: "Ok" as const, value })),
+    Effect.catchTags({
+      BoardRunError: (error) => Effect.succeed({ _tag: "No" as const, detail: error.detail }),
+    }),
+  );
+
 /**
  * Board snapshot on the T3 HTTP server, so the web app uses the same origin and
  * the same session as every other API call.
@@ -62,13 +484,28 @@ export const layer = Layer.unwrap(
     const crypto = yield* Crypto.Crypto;
     const fs = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
+    const runs = yield* BoardRuns;
     const filePath = path.join(config.stateDir, BOARD_FILE);
     yield* fs.makeDirectory(path.dirname(filePath), { recursive: true }).pipe(Effect.ignore);
     const hub = makeAdapterBoardHub();
     const existing = yield* fs.readFileString(filePath).pipe(Effect.orElseSucceed(() => ""));
-    if (existing.length > 0) hub.replace(existing);
-    // One permit so two publishes cannot read the same snapshot and rename over each other.
+    let ledger: KanbanMoveLedger = {};
+    if (existing.length > 0) {
+      const parsed = readJson(existing);
+      if (Array.isArray(parsed)) {
+        hub.replace(existing);
+      } else if (
+        isRecord(parsed) &&
+        Array.isArray(parsed.cards) &&
+        hub.replace(encodeJson(parsed.cards))
+      ) {
+        if (isRecord(parsed.ledger)) {
+          ledger = ledgerFrom(parsed.ledger);
+        }
+      }
+    }
     const writes = yield* Semaphore.make(1);
+    const envelope = () => encodeJson({ cards: readJson(hub.snapshot()), ledger });
     const persist = (body: string) =>
       Effect.gen(function* () {
         const temporary = `${filePath}.${yield* crypto.randomUUIDv4()}.tmp`;
@@ -90,17 +527,30 @@ export const layer = Layer.unwrap(
       return yield* writes.withPermits(1)(
         Effect.gen(function* () {
           const previous = hub.snapshot();
-          if (!hub.upsert(text)) {
+          const written = hub.upsert(text);
+          if (written === "invalid")
             return HttpServerResponse.text("Invalid board.", { status: 400 });
+          if (written === "stale") {
+            return json(409, {
+              detail: "The board changed since this snapshot. The server kept its copy.",
+            });
           }
-          yield* persist(hub.snapshot()).pipe(
+          if (written === "forbidden") {
+            return json(409, {
+              detail: "State changes go through the workflow. The snapshot was not stored.",
+            });
+          }
+          yield* persist(envelope()).pipe(
             Effect.tapError(() =>
               Effect.sync(() => {
                 hub.replace(previous);
               }),
             ),
           );
-          return HttpServerResponse.empty({ status: 204 });
+          return HttpServerResponse.text(hub.snapshot(), {
+            status: 200,
+            contentType: "application/json",
+          });
         }),
       );
     }).pipe(
@@ -117,10 +567,512 @@ export const layer = Layer.unwrap(
       yield* authorize(AuthOrchestrationReadScope);
       return yield* hub.events;
     }).pipe(Effect.catchTags(authResponse));
+    const cardsNow = () => decodeAdapterBoardWire(hub.snapshot()) ?? [];
+    const commitCard = (card: AdapterBoardCard) => {
+      const current = cardsNow();
+      const next = current.some((item) => item.taskId === card.taskId)
+        ? current.map((item) => (item.taskId === card.taskId ? card : item))
+        : [...current, card];
+      return hub.replace(encodeAdapterBoardWire(next));
+    };
+    const persistApplied = (
+      outcome: KanbanMoveResult & { readonly _tag: "Applied" },
+      card: AdapterBoardCard | undefined,
+      fields: {
+        readonly taskId: string;
+        readonly title: string | null;
+        readonly threadId: string | null;
+        readonly runId: string | null;
+      },
+    ) =>
+      Effect.gen(function* () {
+        const previous = hub.snapshot();
+        const previousLedger = ledger;
+        if (outcome.changed) {
+          const title = card?.title ?? fields.title;
+          if (title === null) return "needs-title" as const;
+          const stored = commitCard({
+            taskId: fields.taskId,
+            title,
+            state: outcome.state,
+            threadId: fields.threadId,
+            runId: fields.runId,
+            revision: (card?.revision ?? 0) + 1,
+            updatedAt: yield* stamped,
+          });
+          if (!stored) return "rejected" as const;
+        }
+        ledger = outcome.ledger;
+        yield* persist(envelope()).pipe(
+          Effect.tapError(() =>
+            Effect.sync(() => {
+              hub.replace(previous);
+              ledger = previousLedger;
+            }),
+          ),
+        );
+        return "stored" as const;
+      });
+    const followLaunched = (
+      outcome: KanbanMoveResult,
+      taskId: string,
+      threadId: string | null,
+      runId: string | null,
+    ) =>
+      Effect.gen(function* () {
+        if (
+          outcome._tag !== "Applied" ||
+          outcome.state.phase !== "executing" ||
+          threadId === null
+        ) {
+          return { outcome, runId };
+        }
+        const executing = outcome.state;
+        const view = yield* runs
+          .watchThread(threadId)
+          .pipe(Effect.catchTags({ BoardRunError: () => Effect.succeed(null) }));
+        if (view === null) return { outcome, runId };
+        const planned = observationEvents({
+          taskId,
+          threadId,
+          state: executing,
+          view,
+          allowLapse: view.status === "interrupted",
+          model: executing.assignment.implementerModel.model,
+          workerId: executing.assignment.workerId,
+        });
+        let state: BoardSequence = executing;
+        let book: KanbanMoveLedger = outcome.ledger;
+        let changed = outcome.changed;
+        for (const item of planned) {
+          const next: KanbanMoveResult = yield* applyBoardWorkflowEvent(
+            state,
+            item.event,
+            item.idempotencyKey,
+            taskId,
+            book,
+          );
+          if (next._tag !== "Applied") break;
+          state = next.state;
+          book = next.ledger;
+          changed = changed || next.changed;
+        }
+        return {
+          outcome: { _tag: "Applied" as const, state, ledger: book, changed },
+          runId: view.runId ?? runId,
+        };
+      });
+    const move = Effect.gen(function* () {
+      yield* authorize(AuthOrchestrationOperateScope);
+      const request = yield* HttpServerRequest.HttpServerRequest;
+      const text = yield* request.text.pipe(Effect.orElseSucceed(() => ""));
+      return yield* writes.withPermits(1)(
+        Effect.gen(function* () {
+          const body = readJson(text);
+          if (!isRecord(body)) return json(400, { detail: "Expected a JSON object." });
+          const taskId = stringField(body, "taskId");
+          const idempotencyKey = stringField(body, "idempotencyKey");
+          if (taskId === null || idempotencyKey === null || !isColumn(body.column)) {
+            return json(400, { detail: "Expected taskId, column, and idempotencyKey." });
+          }
+          const card = cardsNow().find((item) => item.taskId === taskId);
+          if (card === undefined) return json(404, { detail: "No task with that id." });
+          const decoded = yield* decodeState(card.state);
+          if (decoded._tag === "Bad") {
+            return json(500, { detail: "The stored task state is invalid." });
+          }
+          const requestInput = {
+            taskId,
+            column: body.column,
+            idempotencyKey,
+            confirmed: body.confirmed === true,
+            at: yield* stamped,
+            ledger,
+          };
+          const asked = yield* requestKanbanMove(decoded.state, requestInput);
+          let launchedThread = card.threadId;
+          let launchedRun = card.runId ?? null;
+          const outcome =
+            asked._tag === "NeedsInterrupt"
+              ? yield* Effect.gen(function* () {
+                  const threadId = card.threadId;
+                  const runId = card.runId ?? null;
+                  if (threadId === null || runId === null) {
+                    return {
+                      _tag: "Rejected" as const,
+                      detail: "This card has no T3 run to interrupt.",
+                      state: decoded.state,
+                      ledger,
+                    };
+                  }
+                  const projectId = projectIdOf(decoded.state);
+                  if (projectId === null) {
+                    return {
+                      _tag: "Rejected" as const,
+                      detail: "This card has no project, so the run cannot be interrupted.",
+                      state: decoded.state,
+                      ledger,
+                    };
+                  }
+                  const interrupted = yield* asRun(
+                    runs.interrupt({
+                      projectId,
+                      threadId,
+                      runId,
+                      commandId: `board-interrupt-${idempotencyKey}`,
+                    }),
+                  );
+                  if (interrupted._tag === "No" || interrupted.value !== "requested") {
+                    return {
+                      _tag: "Rejected" as const,
+                      detail:
+                        interrupted._tag === "No"
+                          ? interrupted.detail
+                          : "The run did not confirm the interrupt, so the card stays here.",
+                      state: decoded.state,
+                      ledger,
+                    };
+                  }
+                  return yield* commitInterruptedMove(decoded.state, requestInput);
+                })
+              : asked._tag === "NeedsLaunch"
+                ? yield* Effect.gen(function* () {
+                    const queued = decoded.state;
+                    if (queued.phase !== "assigned" && queued.phase !== "rework") {
+                      return rejectedMove(
+                        "In Progress starts from Ready only after a worker is assigned.",
+                        queued,
+                        ledger,
+                      );
+                    }
+                    const projectId = projectIdOf(queued);
+                    if (projectId === null) {
+                      return rejectedMove(
+                        "This card has no project, so the run cannot be launched.",
+                        queued,
+                        ledger,
+                      );
+                    }
+                    const launched = yield* asRun(
+                      runs.launch({
+                        idempotencyKey: executionLaunchKey(
+                          taskId,
+                          queued.assignment.attemptId,
+                          executionGeneration(queued),
+                        ),
+                        projectId,
+                        title: card.title,
+                        prompt: renderPrompt(queued.intake, queued.assignment.contextPackage),
+                        model: queued.assignment.implementerModel.model,
+                        instanceId: queued.assignment.instanceId ?? T3_LAUNCH_DEFAULTS.instanceId,
+                        contextPackage: queued.assignment.contextPackage,
+                      }),
+                    );
+                    if (launched._tag === "No") {
+                      return rejectedMove(launched.detail, queued, ledger);
+                    }
+                    const runId = launched.value.runId;
+                    if (runId === null) {
+                      return rejectedMove(
+                        "Launch did not return a run, so the card stays Ready.",
+                        queued,
+                        ledger,
+                      );
+                    }
+                    const confirmed = yield* asRun(
+                      runs.confirmLaunch({
+                        projectId,
+                        threadId: launched.value.threadId,
+                        runId,
+                      }),
+                    );
+                    if (confirmed._tag === "No") {
+                      return rejectedMove(confirmed.detail, queued, ledger);
+                    }
+                    if (confirmed.value === "settled" && launched.value.disposition === "active") {
+                      return rejectedMove(
+                        "That run already stopped. Resume it before marking In Progress.",
+                        queued,
+                        ledger,
+                      );
+                    }
+                    launchedThread = launched.value.threadId;
+                    launchedRun = runId;
+                    return yield* recordConfirmedRun({
+                      state: queued,
+                      taskId,
+                      threadId: launched.value.threadId,
+                      disposition: launched.value.disposition,
+                      summary: launched.value.summary,
+                      ledger,
+                    });
+                  })
+                : asked._tag === "NeedsRecover"
+                  ? yield* Effect.gen(function* () {
+                      const waiting = decoded.state;
+                      if (waiting.phase !== "recovery_pending") {
+                        return rejectedMove(
+                          "In Progress resumes from Blocked only after a run was interrupted.",
+                          waiting,
+                          ledger,
+                        );
+                      }
+                      const threadId = card.threadId;
+                      const runId = card.runId ?? null;
+                      if (threadId === null || runId === null) {
+                        return rejectedMove(
+                          "The interrupted task has no T3 run to continue.",
+                          waiting,
+                          ledger,
+                        );
+                      }
+                      const projectId = projectIdOf(waiting);
+                      if (projectId === null) {
+                        return rejectedMove(
+                          "This card has no project, so the run cannot be resumed.",
+                          waiting,
+                          ledger,
+                        );
+                      }
+                      const resolved = yield* applyBoardWorkflowEvent(
+                        waiting,
+                        {
+                          type: "resolve_recovery",
+                          command: {
+                            command: "resolve_recovery",
+                            outcome: "continue",
+                            idempotencyKey: `resume-${taskId}`,
+                            taskId,
+                            attemptId: waiting.assignment.attemptId,
+                          },
+                        },
+                        `resume-${taskId}`,
+                        taskId,
+                        ledger,
+                      );
+                      if (resolved._tag !== "Applied" || resolved.state.phase !== "assigned") {
+                        return resolved;
+                      }
+                      const generation = resolved.state.nextGeneration;
+                      const continued = yield* asRun(
+                        runs.continueRun({
+                          projectId,
+                          threadId,
+                          runId,
+                          commandId: `continue-${taskId}-${generation}`,
+                          messageId: `continue-msg-${taskId}-${generation}`,
+                          text: "Continue the interrupted run on this thread.",
+                        }),
+                      );
+                      if (continued._tag === "No") {
+                        return rejectedMove(continued.detail, waiting, ledger);
+                      }
+                      launchedThread = threadId;
+                      launchedRun = continued.value.runId ?? runId;
+                      return yield* applyBoardWorkflowEvent(
+                        resolved.state,
+                        { type: "start_execution" },
+                        `start-${taskId}-${generation}`,
+                        taskId,
+                        resolved.ledger,
+                      );
+                    })
+                  : asked;
+          const followed = yield* followLaunched(outcome, taskId, launchedThread, launchedRun);
+          if (followed.outcome._tag !== "Applied") return json(409, publicMove(followed.outcome));
+          const saved = yield* persistApplied(followed.outcome, card, {
+            taskId,
+            title: card.title,
+            threadId: launchedThread,
+            runId: followed.runId,
+          });
+          if (saved !== "stored") {
+            return json(500, { detail: "The workflow state could not be stored." });
+          }
+          return json(200, {
+            ...publicMove(followed.outcome),
+            revision: (card.revision ?? 0) + (followed.outcome.changed ? 1 : 0),
+          });
+        }),
+      );
+    }).pipe(
+      Effect.catchTags(authResponse),
+      Effect.catch((cause) =>
+        failEnvironmentInternal("internal_error", cause).pipe(
+          Effect.catchTags({
+            EnvironmentInternalError: (error) => HttpServerRespondable.toResponse(error),
+          }),
+        ),
+      ),
+    );
+    const workflowEvent = Effect.gen(function* () {
+      yield* authorize(AuthOrchestrationOperateScope);
+      const request = yield* HttpServerRequest.HttpServerRequest;
+      const text = yield* request.text.pipe(Effect.orElseSucceed(() => ""));
+      return yield* writes.withPermits(1)(
+        Effect.gen(function* () {
+          const body = readJson(text);
+          if (!isRecord(body)) return json(400, { detail: "Expected a JSON object." });
+          const taskId = stringField(body, "taskId");
+          const idempotencyKey = stringField(body, "idempotencyKey");
+          if (taskId === null || idempotencyKey === null || !("event" in body)) {
+            return json(400, { detail: "Expected taskId, idempotencyKey, and event." });
+          }
+          const decoded = yield* decodeEvent(body.event);
+          if (decoded._tag === "Bad") return json(400, { detail: "The event is not valid." });
+          const card = cardsNow().find((item) => item.taskId === taskId);
+          const stored =
+            card === undefined
+              ? { _tag: "Missing" as const }
+              : yield* decodeState(card.state).pipe(
+                  Effect.map((result) =>
+                    result._tag === "Bad"
+                      ? { _tag: "Bad" as const }
+                      : { _tag: "Ok" as const, state: result.state },
+                  ),
+                );
+          if (stored._tag === "Bad") {
+            return json(500, { detail: "The stored task state is invalid." });
+          }
+          const replay = ledger[idempotencyKey] !== undefined;
+          const threadId =
+            typeof body.threadId === "string" ? body.threadId : (card?.threadId ?? null);
+          const runId = typeof body.runId === "string" ? body.runId : (card?.runId ?? null);
+          if (!replay && stored._tag === "Ok" && decoded.event.type === "start_execution") {
+            if (threadId === null || runId === null) {
+              return json(409, {
+                _tag: "Rejected",
+                detail: "In Progress is recorded only after the adapter launches a run.",
+              });
+            }
+            const projectId = projectIdOf(stored.state);
+            if (projectId === null) {
+              return json(409, {
+                _tag: "Rejected",
+                detail: "This card has no project, so the run cannot be checked.",
+              });
+            }
+            const confirmed = yield* asRun(runs.confirmLaunch({ projectId, threadId, runId }));
+            if (confirmed._tag === "No") {
+              return json(409, { _tag: "Rejected", detail: confirmed.detail });
+            }
+          }
+          if (
+            !replay &&
+            stored._tag === "Ok" &&
+            (decoded.event.type === "cancel" || decoded.event.type === "lease_expired")
+          ) {
+            if (threadId === null || runId === null) {
+              return json(409, {
+                _tag: "Rejected",
+                detail: "This card has no T3 run to interrupt.",
+              });
+            }
+            const projectId = projectIdOf(stored.state);
+            if (projectId === null) {
+              return json(409, {
+                _tag: "Rejected",
+                detail: "This card has no project, so the run cannot be interrupted.",
+              });
+            }
+            const interrupted = yield* asRun(
+              runs.interrupt({
+                projectId,
+                threadId,
+                runId,
+                commandId: `board-interrupt-${idempotencyKey}`,
+              }),
+            );
+            if (interrupted._tag === "No") {
+              return json(409, { _tag: "Rejected", detail: interrupted.detail });
+            }
+          }
+          const outcome =
+            stored._tag === "Missing"
+              ? yield* openBoardTask(decoded.event, idempotencyKey, taskId, ledger)
+              : yield* applyBoardWorkflowEvent(
+                  stored.state,
+                  decoded.event,
+                  idempotencyKey,
+                  taskId,
+                  ledger,
+                );
+          if (outcome._tag !== "Applied") return json(409, publicMove(outcome));
+          const saved = yield* persistApplied(outcome, card, {
+            taskId,
+            title: stringField(body, "title"),
+            threadId,
+            runId,
+          });
+          if (saved === "needs-title") return json(400, { detail: "A new task needs a title." });
+          if (saved !== "stored") return json(400, { detail: "The task could not be stored." });
+          return json(200, {
+            ...publicMove(outcome),
+            revision: (card?.revision ?? 0) + (outcome.changed ? 1 : 0),
+          });
+        }),
+      );
+    }).pipe(
+      Effect.catchTags(authResponse),
+      Effect.catch((cause) =>
+        failEnvironmentInternal("internal_error", cause).pipe(
+          Effect.catchTags({
+            EnvironmentInternalError: (error) => HttpServerRespondable.toResponse(error),
+          }),
+        ),
+      ),
+    );
+    const followExecuting = Effect.gen(function* () {
+      const open = cardsNow().filter(
+        (card) => card.state.phase === "executing" && card.threadId !== null,
+      );
+      for (const card of open) {
+        yield* writes.withPermits(1)(
+          Effect.gen(function* () {
+            const fresh = cardsNow().find((item) => item.taskId === card.taskId);
+            if (
+              fresh === undefined ||
+              fresh.state.phase !== "executing" ||
+              fresh.threadId === null
+            ) {
+              return;
+            }
+            const decoded = yield* decodeState(fresh.state);
+            if (decoded._tag === "Bad") return;
+            const followed = yield* followLaunched(
+              { _tag: "Applied", state: decoded.state, changed: false, ledger },
+              fresh.taskId,
+              fresh.threadId,
+              fresh.runId ?? null,
+            );
+            if (followed.outcome._tag !== "Applied" || !followed.outcome.changed) return;
+            yield* persistApplied(followed.outcome, fresh, {
+              taskId: fresh.taskId,
+              title: fresh.title,
+              threadId: fresh.threadId,
+              runId: followed.runId,
+            });
+          }),
+        );
+      }
+    });
+    const followLoop = followExecuting.pipe(
+      Effect.catch(() => Effect.void),
+      Effect.andThen(Effect.sleep(BOARD_FOLLOW_INTERVAL)),
+      Effect.forever,
+    );
     return Layer.mergeAll(
       HttpRouter.add("GET", ADAPTER_BOARD_PATH, snapshot),
       HttpRouter.add("POST", ADAPTER_BOARD_PATH, replace),
       HttpRouter.add("GET", ADAPTER_BOARD_EVENTS_PATH, events),
+      HttpRouter.add("POST", ADAPTER_BOARD_MOVE_PATH, move),
+      HttpRouter.add("POST", ADAPTER_BOARD_EVENT_PATH, workflowEvent),
+      Layer.effectDiscard(
+        Effect.gen(function* () {
+          if (!runs.followRuns) return;
+          yield* Effect.forkScoped(followLoop);
+        }),
+      ),
     );
   }),
 );

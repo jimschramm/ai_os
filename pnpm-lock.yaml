@@ -660,6 +660,9 @@ importers:
       '@t3tools/ai-os-adapter':
         specifier: workspace:*
         version: link:../../packages/ai-os-adapter
+      '@t3tools/ai-os-contracts':
+        specifier: workspace:*
+        version: link:../../packages/ai-os-contracts
       '@t3tools/provider-acp':
         specifier: workspace:*
         version: link:../../packages/provider-acp

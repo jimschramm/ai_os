@@ -367,7 +367,11 @@ export const runLiveDriver = (
         deps.write(label);
         lastLabel = label;
       }
-      if (session.state.phase !== "executing") return;
+      // Recovery stays with this driver. Leaving here is what let a board pause
+      // drop the owner, so a later resume had nobody watching the thread.
+      if (session.state.phase !== "executing" && session.state.phase !== "recovery_pending") {
+        return;
+      }
       yield* deps.sleep(interval);
     }
     deps.write("still executing");

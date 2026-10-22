@@ -16,7 +16,7 @@ describe("dev proxy client address", () => {
           proxyReq: { setHeader(name: string, value: string): void },
           req: {
             readonly headers: { readonly [name: string]: string | readonly string[] | undefined };
-            readonly socket: { readonly remoteAddress?: string | null };
+            readonly socket: { readonly remoteAddress?: string | undefined };
           },
         ) => void)
       | undefined;
