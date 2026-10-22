@@ -97,7 +97,8 @@ export function MemoryBrowser({
         aria-labelledby="memory-browser-title"
         aria-hidden={!open}
         inert={!open}
-        className={`ops-drawer absolute inset-y-0 right-0 z-40 flex w-full max-w-3xl flex-col border-l border-border bg-popover shadow-lg transition-transform duration-200 ease-out motion-reduce:transition-none ${open ? "translate-x-0" : "translate-x-full"}`}
+        data-state={open ? "open" : "closed"}
+        className="ops-drawer absolute inset-y-0 right-0 z-40 flex w-full max-w-3xl flex-col border-l border-border bg-popover shadow-lg"
       >
         <div className="flex items-start justify-between gap-3 border-b border-border px-4 py-4">
           <div>
