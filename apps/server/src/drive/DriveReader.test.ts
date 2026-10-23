@@ -8,7 +8,14 @@ import { afterEach, describe, expect, it } from "vite-plus/test";
 import { makeContentStore } from "./ContentStore.ts";
 import { type DriveApi, type DriveFile, FOLDER_MIME } from "./DriveApi.ts";
 import { buildSnapshot, readDriveFile, verifySnapshot } from "./DriveReader.ts";
-import { ensureProjectFolders } from "./projectFolders.ts";
+import { DriveJobStore, safeProjectDir } from "./DriveJobStore.ts";
+import {
+  AIOS_PROJECTS_FOLDER_ID,
+  AIOS_ROOT_FOLDER_ID,
+  ensureProjectFolders,
+  isInsideFolders,
+  projectRoots,
+} from "./projectFolders.ts";
 import { makeZip } from "./testZip.ts";
 
 const temps: string[] = [];
@@ -243,19 +250,22 @@ describe("buildSnapshot", () => {
 });
 
 describe("ensureProjectFolders", () => {
+  const P = AIOS_PROJECTS_FOLDER_ID;
   const aios = () =>
     fakeApi(
       [
-        { id: "aios1", name: "aios", mimeType: FOLDER_MIME, parents: ["root"] },
-        { id: "projects1", name: "projects", mimeType: FOLDER_MIME, parents: ["aios1"] },
-        { id: "existing", name: "Tournament", mimeType: FOLDER_MIME, parents: ["projects1"] },
+        { id: AIOS_ROOT_FOLDER_ID, name: "aios", mimeType: FOLDER_MIME, parents: ["root"] },
+        { id: P, name: "projects", mimeType: FOLDER_MIME, parents: [AIOS_ROOT_FOLDER_ID] },
+        { id: "existing", name: "Tournament", mimeType: FOLDER_MIME, parents: [P] },
         { id: "existingIn", name: "inputs", mimeType: FOLDER_MIME, parents: ["existing"] },
+        { id: "deep", name: "Annex", mimeType: FOLDER_MIME, parents: ["existingIn"] },
+        { id: "elsewhere", name: "Personal", mimeType: FOLDER_MIME, parents: ["root"] },
       ],
       {},
       {},
     );
 
-  it("creates only what is missing and reuses the rest", async () => {
+  it("creates only what is missing under the known aios/projects folder", async () => {
     const { api, calls } = aios();
     const first = await ensureProjectFolders(api, "Tournament");
     expect(first.inputFolderId).toBe("existingIn");
@@ -264,21 +274,111 @@ describe("ensureProjectFolders", () => {
     expect(again.created).toEqual([]);
     expect(again.outputFolderId).toBe(first.outputFolderId);
     expect(calls.filter((call) => call.startsWith("create"))).toEqual(["create existing/outputs"]);
+    // The aios root is addressed by id, never searched for or created.
+    expect(calls.some((call) => call.includes("root"))).toBe(false);
   });
 
   it("creates the project folder with inputs and outputs under aios/projects", async () => {
     const { api, calls } = aios();
     const made = await ensureProjectFolders(api, " New one ");
     expect(made.created).toEqual(["New one", "inputs", "outputs"]);
-    expect(calls).toEqual([
-      "create projects1/New one",
+    expect(calls.filter((call) => call.startsWith("create"))).toEqual([
+      `create ${P}/New one`,
       "create new-New one/inputs",
       "create new-New one/outputs",
     ]);
+    await expect(ensureProjectFolders(api, "a/b")).rejects.toThrow(/cannot contain/);
   });
 
-  it("fails clearly when the aios folder is missing", async () => {
-    const { api } = fakeApi([], {}, {});
-    await expect(ensureProjectFolders(api, "X")).rejects.toThrow(/No "aios" folder/);
+  it("fails clearly, creating nothing, when aios/projects is not reachable", async () => {
+    const { api, calls } = fakeApi([], {}, {});
+    await expect(ensureProjectFolders(api, "X")).rejects.toThrow(/aios\/projects folder/);
+    expect(calls.filter((call) => call.startsWith("create"))).toEqual([]);
+  });
+
+  it("scopes folder evaluation to the project's own folders", async () => {
+    const { api } = aios();
+    const roots = await projectRoots(api, { inputFolderId: "existingIn" });
+    expect(roots.sort()).toEqual(["existing", "existingIn"]);
+    expect(await isInsideFolders(api, "deep", roots)).toBe(true);
+    expect(await isInsideFolders(api, "existingIn", roots)).toBe(true);
+    expect(await isInsideFolders(api, "elsewhere", roots)).toBe(false);
+    expect(await isInsideFolders(api, P, roots)).toBe(false);
+    expect(await isInsideFolders(api, "missing-id", roots)).toBe(false);
+  });
+});
+
+describe("snapshot resume", () => {
+  it("reuses a finished snapshot and clears a half-written one", async () => {
+    const worktree = await temp();
+    const store = makeContentStore(await temp());
+    const { api, calls } = fakeApi(
+      [
+        {
+          id: "txt1-0000000",
+          name: "a.txt",
+          mimeType: "text/plain",
+          size: 2,
+          modifiedTime: "2026-10-01T00:00:00Z",
+        },
+      ],
+      {},
+      { "txt1-0000000": new TextEncoder().encode("hi") },
+    );
+    // A run cut short by a restart leaves its temp folder behind.
+    const stale = path.join(worktree, ".ai_os", "drive", "task-r.tmp-1");
+    await fs.mkdir(stale, { recursive: true });
+    const first = await buildSnapshot({
+      api,
+      store,
+      worktree,
+      taskId: "task-r",
+      refs: ["txt1-0000000"],
+      resume: true,
+    });
+    expect(
+      await fs.stat(stale).then(
+        () => true,
+        () => false,
+      ),
+    ).toBe(false);
+    const downloads = calls.filter((call) => call.startsWith("download")).length;
+    const again = await buildSnapshot({
+      api,
+      store,
+      worktree,
+      taskId: "task-r",
+      refs: ["txt1-0000000"],
+      resume: true,
+    });
+    expect(again.ref).toEqual(first.ref);
+    expect(calls.filter((call) => call.startsWith("download")).length).toBe(downloads);
+    await expect(
+      buildSnapshot({ api, store, worktree, taskId: "task-r", refs: ["txt1-0000000"] }),
+    ).rejects.toThrow(/already exists/);
+  });
+});
+
+describe("DriveJobStore", () => {
+  it("keeps jobs on disk (mode 600) so running ones resume after a restart", async () => {
+    const dir = path.join(await temp(), "drive-jobs");
+    const jobs = new DriveJobStore(dir);
+    const base = { projectId: "p1", taskId: "t1", refs: ["abcdefghijk"] };
+    await jobs.save({
+      ...base,
+      jobId: "job-aaaaaaaa",
+      state: "running",
+      done: 1,
+      total: 3,
+      current: "a",
+    });
+    await jobs.save({ ...base, jobId: "job-bbbbbbbb", state: "failed", error: "x", status: 502 });
+    const reopened = new DriveJobStore(dir);
+    expect((await reopened.running()).map((job) => job.jobId)).toEqual(["job-aaaaaaaa"]);
+    expect((await fs.stat(path.join(dir, "job-aaaaaaaa.json"))).mode & 0o777).toBe(0o600);
+    await reopened.remove("job-bbbbbbbb");
+    expect(await reopened.get("job-bbbbbbbb")).toBeNull();
+    expect(await reopened.get("../../etc/passwd")).toBeNull();
+    expect(() => safeProjectDir("../x")).toThrow(/Invalid project id/);
   });
 });
