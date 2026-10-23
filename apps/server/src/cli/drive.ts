@@ -60,6 +60,8 @@ const withConfig = <A, E, R>(
   Effect.gen(function* () {
     const logLevel = yield* GlobalFlag.LogLevel;
     const config = yield* resolveCliAuthConfig(flags, logLevel);
+    // Which home holds the Drive token is never left implicit (stderr, so output stays parseable).
+    yield* Console.error(`T3 home: ${config.baseDir} (Drive token in ${config.secretsDir})`);
     return yield* run(config);
   });
 

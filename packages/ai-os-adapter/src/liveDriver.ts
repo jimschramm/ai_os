@@ -106,7 +106,44 @@ export interface LiveDriverDependencies {
   readonly readRepoCommit: (workspaceRoot: string) => Promise<string>;
   readonly pollIntervalMs?: number;
   readonly maxPolls?: number;
+  /** Milliseconds now, for outage timing (default Date.now). */
+  readonly now?: () => number;
+  /** How long the server may stay unreachable before a task is Blocked (default 10 minutes). */
+  readonly unavailableLimitMs?: number;
 }
+
+/** About ten minutes of a server that does not answer, then the task is Blocked. */
+export const SERVER_UNAVAILABLE_LIMIT_MS = 10 * 60_000;
+
+const isUnavailable = (error: unknown) =>
+  Schema.is(GrokT3Error)(error) && error.reason === "t3_unavailable";
+
+/**
+ * Tracks one stretch of server unavailability. `retry` answers whether to ask
+ * again; once the limit passes it fails the task as Blocked with `reason`.
+ */
+const outage = (deps: LiveDriverDependencies) => {
+  const now = deps.now ?? Date.now;
+  const limit = deps.unavailableLimitMs ?? SERVER_UNAVAILABLE_LIMIT_MS;
+  let since: number | null = null;
+  return {
+    ok: () => {
+      since = null;
+    },
+    retry: (reason: string) =>
+      Effect.suspend(() => {
+        since ??= now();
+        if (now() - since < limit) return Effect.void;
+        const minutes = Math.round(limit / 60_000);
+        return Effect.fail(
+          new GrokT3Error({
+            reason: "blocked",
+            detail: `Blocked: the T3 server was unavailable for ${minutes} minute${minutes === 1 ? "" : "s"}; ${reason}`,
+          }),
+        );
+      }),
+  };
+};
 
 const take = (argv: readonly string[], index: number, flag: string): string => {
   const value = argv[index + 1];
@@ -386,20 +423,28 @@ const snapshotDrive = (
     }
     let lastDone = -1;
     const interval = deps.pollIntervalMs ?? 1_000;
+    const down = outage(deps);
     for (;;) {
       // The server persists the job and resumes it after a restart, so a lost
       // connection means "ask again about the same job", never "start another".
       const status = yield* call("snapshot/status", { jobId: started.jobId }).pipe(
         Effect.map((value): unknown => value),
-        Effect.catchIf(
-          (error) => Schema.is(GrokT3Error)(error) && error.reason === "t3_unavailable",
-          () =>
-            Effect.sync(() => {
-              deps.write("drive: server unavailable; still waiting for the same snapshot job");
-              return RETRY;
-            }),
+        Effect.catchIf(isUnavailable, () =>
+          down
+            .retry(
+              `Drive snapshot job ${started.jobId} may still finish on the server. Run the task again once it is back.`,
+            )
+            .pipe(
+              Effect.andThen(
+                Effect.sync(() => {
+                  deps.write("drive: server unavailable; still waiting for the same snapshot job");
+                  return RETRY;
+                }),
+              ),
+            ),
         ),
       );
+      if (status !== RETRY) down.ok();
       if (status === RETRY) {
         yield* deps.sleep(interval);
         continue;
@@ -608,13 +653,33 @@ export const runLiveDriver = (
         let lastLabel = "";
         const limit = deps.maxPolls ?? 600;
         const interval = deps.pollIntervalMs ?? 1_000;
+        const down = outage(deps);
         for (let attempt = 0; untilDone || attempt < limit; attempt += 1) {
-          const view = yield* deps.client.read(threadId);
+          // A server that stops answering is retried for a while, then the task is Blocked.
+          const polled = yield* Effect.all([
+            deps.client.read(threadId),
+            adapter.observe(recorded.taskId),
+          ]).pipe(
+            Effect.map((pair) => ({ pair })),
+            Effect.catchIf(isUnavailable, () =>
+              down
+                .retry(
+                  `task ${recorded.taskId} (thread ${threadId}) may still be running. Check it in T3 once the server is back.`,
+                )
+                .pipe(Effect.as(null)),
+            ),
+          );
+          if (polled === null) {
+            write("server unavailable; still watching");
+            yield* deps.sleep(interval);
+            continue;
+          }
+          down.ok();
+          const [view, session] = polled.pair;
           if (view.text !== null && view.text !== lastText) {
             write(view.text);
             lastText = view.text;
           }
-          const session = yield* adapter.observe(recorded.taskId);
           const label = phaseLabel(session);
           if (label !== lastLabel) {
             write(label);
@@ -683,7 +748,11 @@ export const runLiveDriver = (
           ).pipe(
             Effect.tapError((error) =>
               Effect.sync(() => {
-                write(`failed: ${error.message}`);
+                write(
+                  Schema.is(GrokT3Error)(error) && error.reason === "blocked"
+                    ? error.message.replace(/^Blocked/, "blocked")
+                    : `failed: ${error.message}`,
+                );
                 // A launched run we lost track of may still be going: it keeps
                 // its slot, so no further tasks start.
                 if (launched && halted === null) {
@@ -697,14 +766,20 @@ export const runLiveDriver = (
         },
         { concurrency },
       );
-      const failed = results.filter((result) => result._tag === "Failure").length;
+      const failures = results.flatMap((result) =>
+        result._tag === "Failure" ? [result.failure] : [],
+      );
+      const failed = failures.length;
+      const blocked = failures.filter(
+        (error) => Schema.is(GrokT3Error)(error) && error.reason === "blocked",
+      ).length;
       deps.write(
-        `evaluated ${files.length - failed}/${files.length} files${failed > 0 ? `, ${failed} failed` : ""}`,
+        `evaluated ${files.length - failed}/${files.length} files${failed - blocked > 0 ? `, ${failed - blocked} failed` : ""}${blocked > 0 ? `, ${blocked} blocked` : ""}`,
       );
       if (failed > 0) {
         return yield* new GrokT3Error({
-          reason: "invalid_task",
-          detail: `${failed} of ${files.length} folder tasks failed; see the lines marked failed.`,
+          reason: blocked === failed ? "blocked" : "invalid_task",
+          detail: `${failed} of ${files.length} folder tasks failed or were blocked; see the lines marked failed or blocked.`,
         });
       }
       return;

@@ -9,7 +9,7 @@
  *
  * `version` comes from Drive's modifiedTime (+ md5 when Drive has one), so an
  * unchanged file is never downloaded twice and an edited one gets a new entry.
- * Each entry records the sha256 of the stored original. Entries are written to
+ * Each entry records the sha256 of the stored original and of its text. Entries are written to
  * a temp dir and renamed, so a crash never leaves half an entry.
  */
 import { createHash, randomUUID } from "node:crypto";
@@ -36,6 +36,8 @@ export interface DriveContentMeta {
   readonly sha256: string | null;
   readonly originalFile: string | null;
   readonly textFile: string | null;
+  /** sha256 of text.txt; entries without it (older ones) are re-read. */
+  readonly textSha256?: string | null;
   readonly textChars: number;
   readonly error: string | null;
   readonly storedAt: string;
@@ -76,6 +78,12 @@ export const makeContentStore = (root: string) => {
       if (meta.originalFile !== null && meta.sha256 !== null) {
         const bytes = await fs.readFile(path.join(dir, meta.originalFile));
         if (sha256Hex(bytes) !== meta.sha256) return null;
+      }
+      // Same for the extracted text: missing or changed text is a cache miss.
+      if (meta.textFile !== null) {
+        if (typeof meta.textSha256 !== "string") return null;
+        const text = await fs.readFile(path.join(dir, meta.textFile));
+        if (sha256Hex(text) !== meta.textSha256) return null;
       }
       return toStored(dir, meta);
     } catch {
@@ -128,6 +136,7 @@ export const makeContentStore = (root: string) => {
         sha256: input.original === null ? null : sha256Hex(input.original),
         originalFile,
         textFile,
+        textSha256: input.text === null ? null : sha256Hex(Buffer.from(input.text, "utf8")),
         textChars: input.text?.length ?? 0,
         error: input.error,
         storedAt: new Date().toISOString(),

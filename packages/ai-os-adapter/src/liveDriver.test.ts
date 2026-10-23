@@ -1233,6 +1233,67 @@ it.effect("keeps polling the same snapshot job across a server restart", () =>
   ),
 );
 
+it.effect(
+  "blocks the task, without launching, after 10 minutes of an unreachable server during the snapshot",
+  () =>
+    Effect.gen(function* () {
+      const drive = fakeDriveRoutes();
+      let launches = 0;
+      let minutes = 0;
+      const client = {
+        listProjectIds: () =>
+          Effect.succeed([{ id: "usba", title: "USBA", workspaceRoot: "/w", defaultModel: null }]),
+        listProviderModels: () => Effect.succeed(CATALOG),
+        launch: () => {
+          launches += 1;
+          return Effect.die("must not launch");
+        },
+        driveCall: (
+          route: Parameters<typeof drive.driveCall>[0],
+          body: Parameters<typeof drive.driveCall>[1],
+        ) =>
+          route === "snapshot/status"
+            ? Effect.fail(new GrokT3Error({ reason: "t3_unavailable", detail: "down" }))
+            : drive.driveCall(route, body),
+      } as unknown as T3LocalClient;
+      const lines: string[] = [];
+      const error = yield* runLiveDriver(
+        {
+          origin: "http://127.0.0.1:1",
+          pairingToken: undefined,
+          projectId: "usba",
+          model: undefined,
+          title: "One",
+          prompt: "Read it.",
+          listProjects: false,
+          drive: ["fileAAAAAAAAAA"],
+        },
+        {
+          client,
+          clock: () => CLOCK,
+          write: (line) => lines.push(line),
+          sleep: () => Effect.void,
+          readRepoCommit: () => Promise.resolve(SHA),
+          pollIntervalMs: 0,
+          now: () => (minutes += 1) * 60_000,
+        },
+      ).pipe(Effect.flip);
+      assert.strictEqual(
+        Schema.is(GrokT3Error)(error) ? error.reason : null,
+        "blocked",
+        error.message,
+      );
+      assert.match(
+        error.message,
+        /^Blocked: the T3 server was unavailable for 10 minutes; Drive snapshot job job-1/,
+      );
+      assert.strictEqual(launches, 0);
+      // Polled until the limit, never a second job.
+      assert.strictEqual(drive.calls.filter((call) => call.route === "snapshot").length, 1);
+      assert.ok(lines.filter((line) => line.startsWith("drive: server unavailable")).length >= 9);
+    }),
+);
+
 it.effect("stops a folder run when it loses track of a launched task", () =>
   withServer((origin) =>
     Effect.gen(function* () {
@@ -1277,10 +1338,26 @@ it.effect("stops a folder run when it loses track of a launched task", () =>
           readRepoCommit: () => Promise.resolve(SHA),
           pollIntervalMs: 0,
           maxPolls: 3,
+          // Each look at the clock is a minute later: the outage passes 10 minutes quickly.
+          now: (() => {
+            let minutes = 0;
+            return () => (minutes += 1) * 60_000;
+          })(),
         },
       ).pipe(Effect.flip);
-      assert.strictEqual(outcome.message.includes("folder tasks failed"), true, outcome.message);
+      assert.strictEqual(
+        outcome.message.includes("folder tasks failed or were blocked"),
+        true,
+        outcome.message,
+      );
       assert.strictEqual(launches, 1, lines.join("\n"));
+      assert.equal(
+        lines.some((line) =>
+          line.includes("blocked: the T3 server was unavailable for 10 minutes"),
+        ),
+        true,
+        lines.join("\n"),
+      );
       assert.equal(
         lines.some((line) => line.startsWith("stopping the folder run")),
         true,
@@ -1343,7 +1420,11 @@ it.effect("stops a folder run when a launch answer is lost", () =>
           maxPolls: 3,
         },
       ).pipe(Effect.flip);
-      assert.strictEqual(outcome.message.includes("folder tasks failed"), true, outcome.message);
+      assert.strictEqual(
+        outcome.message.includes("folder tasks failed or were blocked"),
+        true,
+        outcome.message,
+      );
       assert.strictEqual(launches, 1, lines.join("\n"));
       assert.equal(
         lines.some((line) => line.startsWith("stopping the folder run")),

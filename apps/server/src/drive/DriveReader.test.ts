@@ -278,6 +278,39 @@ describe("readDriveFile", () => {
   });
 });
 
+describe("ContentStore", () => {
+  const entry = {
+    fileId: "f1",
+    version: "v1",
+    name: "a.txt",
+    mimeType: "text/plain",
+    modifiedTime: null,
+    md5Checksum: null,
+    webViewLink: null,
+    kind: "text" as const,
+    method: "utf8",
+    original: new TextEncoder().encode("orig"),
+    originalExt: "txt",
+    text: "extracted",
+    error: null,
+  };
+
+  it("treats missing or changed extracted text as a cache miss, then repairs it", async () => {
+    const store = makeContentStore(await temp());
+    const first = await store.put(entry);
+    expect(await store.get("f1", "v1")).not.toBeNull();
+    await fs.rm(first.textPath!);
+    expect(await store.get("f1", "v1")).toBeNull();
+    const repaired = await store.put(entry);
+    expect(await fs.readFile(repaired.textPath!, "utf8")).toBe("extracted");
+    await fs.writeFile(repaired.textPath!, "tampered");
+    expect(await store.get("f1", "v1")).toBeNull();
+    const again = await store.put(entry);
+    expect(await fs.readFile(again.textPath!, "utf8")).toBe("extracted");
+    expect(await store.get("f1", "v1")).not.toBeNull();
+  });
+});
+
 describe("buildSnapshot", () => {
   it("copies a folder (all depths) read-only into the worktree with a manifest and totals", async () => {
     const { api, calls } = tree();
