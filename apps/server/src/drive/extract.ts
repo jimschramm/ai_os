@@ -140,14 +140,26 @@ const firstInner = (xml: string, name: string) => {
   return undefined;
 };
 
-/** The value of `key="..."` (key starting at a word boundary) in a tag's attributes. */
+const isSpace = (ch: string | undefined) => ch === " " || ch === "\t" || ch === "\n" || ch === "\r";
+
+/**
+ * The value of `key="..."` or `key='...'` (XML allows either quote and space
+ * around `=`; key whole) in a tag's attributes.
+ */
 const attr = (attrs: string, key: string): string | undefined => {
-  const needle = `${key}="`;
-  let at = attrs.indexOf(needle);
-  while (at > 0 && isWordChar(attrs[at - 1])) at = attrs.indexOf(needle, at + 1);
-  if (at === -1) return undefined;
-  const end = attrs.indexOf('"', at + needle.length);
-  return end === -1 ? undefined : attrs.slice(at + needle.length, end);
+  for (let at = attrs.indexOf(key); at !== -1; at = attrs.indexOf(key, at + 1)) {
+    if (at > 0 && !isSpace(attrs[at - 1])) continue;
+    let i = at + key.length;
+    while (isSpace(attrs[i])) i += 1;
+    if (attrs[i] !== "=") continue;
+    i += 1;
+    while (isSpace(attrs[i])) i += 1;
+    const quote = attrs[i];
+    if (quote !== '"' && quote !== "'") return undefined;
+    const end = attrs.indexOf(quote, i + 1);
+    return end === -1 ? undefined : attrs.slice(i + 1, end);
+  }
+  return undefined;
 };
 
 /**

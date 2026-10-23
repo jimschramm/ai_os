@@ -153,6 +153,31 @@ describe("PPTX slide order", () => {
   });
 });
 
+describe("single-quoted attributes", () => {
+  it("reads single-quoted XLSX and PPTX attributes, values and slide order", async () => {
+    const sheets = await extractXlsx(
+      makeZip({
+        "xl/workbook.xml": "<workbook><sheet name='Q &amp; A' r:id = 'rId1'/></workbook>",
+        "xl/_rels/workbook.xml.rels": "<Relationship Id='rId1' Target='worksheets/sheet1.xml'/>",
+        "xl/sharedStrings.xml": "<sst><si><t>shared</t></si></sst>",
+        "xl/worksheets/sheet1.xml":
+          "<worksheet><sheetData><row r='1'><c r='A1' t='s'><v>0</v></c><c r='C1' t='b'><v>1</v></c></row></sheetData></worksheet>",
+      }),
+    );
+    expect(sheets).toBe("## Sheet: Q & A\nshared\t\tTRUE");
+    const slides = await extractPptx(
+      makeZip({
+        "ppt/slides/slide1.xml": "<a:p>one</a:p>",
+        "ppt/slides/slide2.xml": "<a:p>two</a:p>",
+        "ppt/presentation.xml": "<p:sldId id='1' r:id='rId2'/><p:sldId id='2' r:id='rId1'/>",
+        "ppt/_rels/presentation.xml.rels":
+          "<Relationship Id='rId1' Target='slides/slide1.xml'/><Relationship Id='rId2' Target='slides/slide2.xml'/>",
+      }),
+    );
+    expect(slides).toBe("## Slide 1\ntwo\n\n## Slide 2\none");
+  });
+});
+
 describe("repeated part references", () => {
   it("rejects a worksheet listed twice and a slide listed twice", async () => {
     const sheet = `<worksheet><sheetData><row><c><v>1</v></c></row></sheetData></worksheet>`;
