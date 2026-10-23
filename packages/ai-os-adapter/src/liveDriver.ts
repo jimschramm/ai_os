@@ -717,6 +717,15 @@ export const runLiveDriver = (
           `skipped ${file.path ?? file.name}: a shortcut to a file outside the project (attach it with --drive ${file.id})`,
         );
       }
+      // Shortcuts whose target is deleted or not shared: reported, and counted as failed.
+      const unresolved = (
+        isRecord(listing) && Array.isArray(listing.unresolved) ? listing.unresolved : []
+      ).filter(isRecord);
+      for (const shortcut of unresolved) {
+        deps.write(
+          `failed ${String(shortcut.path ?? shortcut.name ?? shortcut.id)}: a shortcut that could not be followed (${String(shortcut.reason ?? "unknown reason")})`,
+        );
+      }
       const totalBytes = files.reduce((sum, file) => sum + (file.size ?? 0), 0);
       const concurrency = request.concurrency ?? DEFAULT_FOLDER_CONCURRENCY;
       deps.write(
@@ -769,17 +778,18 @@ export const runLiveDriver = (
       const failures = results.flatMap((result) =>
         result._tag === "Failure" ? [result.failure] : [],
       );
-      const failed = failures.length;
+      const failed = failures.length + unresolved.length;
+      const total = files.length + unresolved.length;
       const blocked = failures.filter(
         (error) => Schema.is(GrokT3Error)(error) && error.reason === "blocked",
       ).length;
       deps.write(
-        `evaluated ${files.length - failed}/${files.length} files${failed - blocked > 0 ? `, ${failed - blocked} failed` : ""}${blocked > 0 ? `, ${blocked} blocked` : ""}`,
+        `evaluated ${total - failed}/${total} files${failed - blocked > 0 ? `, ${failed - blocked} failed` : ""}${blocked > 0 ? `, ${blocked} blocked` : ""}`,
       );
       if (failed > 0) {
         return yield* new GrokT3Error({
           reason: blocked === failed ? "blocked" : "invalid_task",
-          detail: `${failed} of ${files.length} folder tasks failed or were blocked; see the lines marked failed or blocked.`,
+          detail: `${failed} of ${total} folder tasks failed or were blocked; see the lines marked failed or blocked.`,
         });
       }
       return;

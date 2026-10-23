@@ -191,6 +191,21 @@ describe("part references", () => {
     await expect(extractXlsx(book("worksheets/nope.xml"))).rejects.toThrow(/missing part/);
   });
 
+  it("rejects a listed slide whose relationship or part is missing", async () => {
+    const deck = (rels: string) =>
+      extractPptx(
+        makeZip({
+          "ppt/slides/slide1.xml": "<a:p>a</a:p>",
+          "ppt/presentation.xml": '<p:sldId r:id="rId1"/><p:sldId r:id="rId2"/>',
+          "ppt/_rels/presentation.xml.rels": `<Relationship Id="rId1" Target="slides/slide1.xml"/>${rels}`,
+        }),
+      );
+    await expect(deck("")).rejects.toThrow(/slide 2 has no relationship/);
+    await expect(deck('<Relationship Id="rId2" Target="slides/slide9.xml"/>')).rejects.toThrow(
+      /slide 2 points to missing part ppt\/slides\/slide9\.xml/,
+    );
+  });
+
   it("rejects two slides sharing one notes part", async () => {
     const rels =
       '<Relationship Id="rN" Type="x/notesSlide" Target="../notesSlides/notesSlide1.xml"/>';

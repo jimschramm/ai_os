@@ -899,7 +899,7 @@ const driveManifestFor = (taskId: string, ids: readonly string[]) => ({
 });
 
 /** Fake Drive routes: records calls; snapshot jobs finish on the second poll. */
-const fakeDriveRoutes = (options: { problem?: unknown } = {}) => {
+const fakeDriveRoutes = (options: { problem?: unknown; listing?: unknown } = {}) => {
   const calls: Array<{ route: string; body: Record<string, unknown> }> = [];
   const jobs = new Map<string, { taskId: string; refs: string[]; polls: number }>();
   const driveCall: NonNullable<T3LocalClient["driveCall"]> = (route, body) => {
@@ -918,6 +918,7 @@ const fakeDriveRoutes = (options: { problem?: unknown } = {}) => {
           ],
         });
       case "list":
+        if (options.listing !== undefined) return Effect.succeed(options.listing);
         return Effect.succeed({
           root: {
             id: "folderBBBBBBBB",
@@ -1389,6 +1390,77 @@ it.effect("rides out proxy 503/502/504 answers on the same snapshot job, over HT
       assert.deepStrictEqual([...new Set(served.polledIds)], ["job-http"]);
       assert.ok(served.polledIds.length >= 4);
       assert.strictEqual(launches, 1);
+    }),
+  ),
+);
+
+it.effect("counts a folder's unresolved shortcuts as failed, even with nothing else to read", () =>
+  withServer((origin) =>
+    Effect.gen(function* () {
+      const drive = fakeDriveRoutes({
+        listing: {
+          root: {
+            id: "folderBBBBBBBB",
+            name: "RFP",
+            mimeType: "application/vnd.google-apps.folder",
+          },
+          files: [],
+          skipped: [],
+          unresolved: [
+            { path: "old link", id: "sc1", name: "old link", reason: "its target was deleted" },
+          ],
+        },
+      });
+      let launches = 0;
+      const real = wsT3LocalClient({ origin, pairingToken: PAIR });
+      const client: T3LocalClient = {
+        listProjectIds: real.listProjectIds,
+        listProviderModels: () => Effect.succeed(CATALOG),
+        publishBoard: real.publishBoard,
+        publishEvent: real.publishEvent,
+        readBoard: real.readBoard,
+        interrupt: () => Effect.die("interrupt is unused"),
+        continueRun: () => Effect.die("continue is unused"),
+        launch: () => {
+          launches += 1;
+          return Effect.die("nothing should launch");
+        },
+        read: () => Effect.die("read is unused"),
+        driveCall: drive.driveCall,
+      };
+      const lines: string[] = [];
+      const outcome = yield* runLiveDriver(
+        {
+          origin,
+          pairingToken: PAIR,
+          projectId: "usba",
+          model: undefined,
+          title: "Review",
+          prompt: "Score this document.",
+          listProjects: false,
+          evaluateFolder: "inputs",
+          concurrency: 1,
+        },
+        {
+          client,
+          clock: () => "2026-10-21T19:00:00.000Z",
+          write: (line) => lines.push(line),
+          sleep: () => Effect.void,
+          readRepoCommit: () => Promise.resolve(SHA),
+          pollIntervalMs: 0,
+          maxPolls: 3,
+        },
+      ).pipe(Effect.flip);
+      assert.strictEqual(launches, 0);
+      assert.match(outcome.message, /1 of 1 folder tasks failed/);
+      assert.equal(
+        lines.includes(
+          "failed old link: a shortcut that could not be followed (its target was deleted)",
+        ),
+        true,
+        lines.join("\n"),
+      );
+      assert.equal(lines.includes("evaluated 0/1 files, 1 failed"), true, lines.join("\n"));
     }),
   ),
 );

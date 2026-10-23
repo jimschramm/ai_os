@@ -388,11 +388,23 @@ export const extractPptx = async (bytes: Uint8Array) => {
     .sort((a, b) => numberIn(a) - numberIn(b));
   // Show order comes from presentation.xml; file numbers change when slides move.
   const presentationRels = relTargets(parts.get("ppt/_rels/presentation.xml.rels") ?? "", "ppt/");
-  const ordered = [...startTags(parts.get("ppt/presentation.xml") ?? "", "p:sldId")]
-    .map((attrs) => attr(attrs, "r:id"))
-    .filter((id): id is string => id !== undefined && id !== "")
-    .map((id) => presentationRels.get(id)?.target)
-    .filter((name): name is string => name !== undefined && parts.has(name));
+  // Every listed slide must resolve to a part: none is dropped silently. File
+  // order is used only when the presentation lists no slides.
+  const ordered = [...startTags(parts.get("ppt/presentation.xml") ?? "", "p:sldId")].map(
+    (attrs, position) => {
+      const id = attr(attrs, "r:id");
+      const target = id === undefined || id === "" ? undefined : presentationRels.get(id)?.target;
+      if (target === undefined) {
+        throw new Error(`Malformed presentation: slide ${position + 1} has no relationship.`);
+      }
+      if (!parts.has(target)) {
+        throw new Error(
+          `Malformed presentation: slide ${position + 1} points to missing part ${target}.`,
+        );
+      }
+      return target;
+    },
+  );
   // Each slide once: repeated references would re-render one part many times.
   if (new Set(ordered).size !== ordered.length) {
     throw new Error("Malformed presentation: a slide is listed twice.");
