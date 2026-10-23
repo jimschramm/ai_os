@@ -215,7 +215,9 @@ export const layer = Layer.unwrap(
         const id = parseDriveRef(ref);
         if (id === null) return yield* bad(`Not a Google Drive link or id: ${ref}`);
         const roots = yield* fromPromise(() => projectRoots(drive, folders));
-        const inside = yield* fromPromise(() => isInsideFolders(drive, id, roots));
+        // The folder itself, after following a shortcut, must be the project's.
+        const target = yield* fromPromise(async () => drive.resolve(await drive.getFile(id)));
+        const inside = yield* fromPromise(() => isInsideFolders(drive, target.id, roots));
         if (!inside) {
           return yield* bad(
             "Folder evaluation works only on this project's Drive folders (aios/projects/<name>/...). Attach other files with --drive instead.",
@@ -226,7 +228,7 @@ export const layer = Layer.unwrap(
         // listed as skipped, to attach by id if wanted.
         const skipped: Array<ReturnType<typeof publicFile>> = [];
         const resolved = yield* fromPromise(() =>
-          resolveRef(drive, ref, {
+          resolveRef(drive, target.id, {
             followShortcut: (target) => isInsideFolders(drive, target.id, roots),
             skipped: (target) => skipped.push(publicFile(target)),
           }),
@@ -248,15 +250,27 @@ export const layer = Layer.unwrap(
       job: DriveJob,
       worktree: string,
       drive: ReturnType<typeof makeDriveApi>,
+      folders: { readonly inputFolderId?: string; readonly outputFolderId?: string },
       resume: boolean,
-    ) =>
-      buildSnapshot({
+    ) => {
+      // Inside an attached folder, a shortcut is read only when its target is in
+      // the project's folders or in a folder attached to this task.
+      let allowed: Promise<string[]> | undefined;
+      const followShortcut = async (target: { id: string }) => {
+        allowed ??= projectRoots(drive, folders).then((roots) => [
+          ...roots,
+          ...job.refs.flatMap((ref) => parseDriveRef(ref) ?? []),
+        ]);
+        return isInsideFolders(drive, target.id, await allowed);
+      };
+      return buildSnapshot({
         api: drive,
         store: storeFor(job.projectId),
         worktree,
         taskId: job.taskId,
         refs: job.refs,
         resume,
+        followShortcut,
         onProgress: (done, total, current) => {
           // Progress is best effort; the final state is what counts.
           jobs.save({ ...job, state: "running", done, total, current }).catch(() => undefined);
@@ -278,6 +292,7 @@ export const layer = Layer.unwrap(
           // The final state could not be saved: the job stays "running" on disk and
           // resumes (reusing the finished snapshot) on the next start.
         });
+    };
 
     const snapshot = handle(AuthOrchestrationOperateScope, (input) =>
       Effect.gen(function* () {
@@ -290,7 +305,7 @@ export const layer = Layer.unwrap(
           return yield* bad("Pass projectId, taskId and at least one Drive link.");
         }
         // Files attached by link or pick, or the project's own folders, for this project's task.
-        yield* projectDrive(projectId);
+        const folders = yield* projectDrive(projectId);
         const worktree = yield* worktreeOf(projectId);
         const drive = yield* api;
         const jobId = yield* crypto.randomUUIDv4().pipe(Effect.orDie);
@@ -314,7 +329,7 @@ export const layer = Layer.unwrap(
             yield* fromPromise(() => jobs.save(job));
           }),
         );
-        void runJob(job, worktree, drive, false);
+        void runJob(job, worktree, drive, folders, false);
         return { jobId };
       }),
     );
@@ -355,7 +370,9 @@ export const layer = Layer.unwrap(
       resumed.add(key);
       const worktree = yield* worktreeOf(job.projectId).pipe(Effect.orElseSucceed(() => null));
       const drive = yield* api.pipe(Effect.orElseSucceed(() => null));
-      if (worktree === null || drive === null) {
+      // Drive may have been turned off for the project while the server was down.
+      const folders = yield* projectDrive(job.projectId).pipe(Effect.orElseSucceed(() => null));
+      if (worktree === null || drive === null || folders === null) {
         yield* Effect.promise(() =>
           jobs.save({
             ...job,
@@ -363,14 +380,16 @@ export const layer = Layer.unwrap(
             error:
               worktree === null
                 ? `Project ${job.projectId} is gone; the Drive snapshot was not resumed.`
-                : "Drive login needed: run `drive login` on this machine.",
-            status: worktree === null ? 404 : 401,
+                : folders === null
+                  ? `Drive is off for project ${job.projectId}; the Drive snapshot was not resumed.`
+                  : "Drive login needed: run `drive login` on this machine.",
+            status: worktree === null ? 404 : folders === null ? 403 : 401,
           }),
         );
         continue;
       }
       yield* Effect.logInfo(`Resuming Drive snapshot job ${job.jobId} for task ${job.taskId}.`);
-      void runJob(job, worktree, drive, true);
+      void runJob(job, worktree, drive, folders, true);
     }
 
     const verify = handle(AuthOrchestrationReadScope, (input) =>

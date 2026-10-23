@@ -206,6 +206,8 @@ export const buildSnapshot = async (input: {
   readonly now?: () => Date;
   /** Resuming after a restart: return the finished snapshot if it is already there. */
   readonly resume?: boolean;
+  /** Which shortcut targets inside attached folders to read; the rest are skipped. */
+  readonly followShortcut?: (target: DriveFile) => Promise<boolean>;
   /** Called after each file with (done, total, Drive path). */
   readonly onProgress?: (done: number, total: number, drivePath: string) => void;
 }): Promise<SnapshotResult> => {
@@ -230,22 +232,35 @@ export const buildSnapshot = async (input: {
     }
     throw new DriveApiError(`A Drive snapshot already exists at ${relRoot}.`);
   }
+  // Work in progress lives in .tmp/, which no task folder can be named (task
+  // folders start with a letter or digit), as "<task folder>~<uuid>".
+  const tmpDir = path.join(input.worktree, ...DRIVE_SNAPSHOT_DIR.split("/"), ".tmp");
+  await assertNoSymlinks(input.worktree, `${DRIVE_SNAPSHOT_DIR}/.tmp`);
   // Resuming after a restart: clear what this task's interrupted run left behind.
   // The server runs one job per task, so no live job owns these folders.
   if (input.resume === true) {
-    const parent = path.dirname(absRoot);
-    for (const entry of await fs.readdir(parent).catch(() => [] as string[])) {
-      if (entry.startsWith(`${path.basename(absRoot)}.tmp-`)) {
-        await fs.rm(path.join(parent, entry), { recursive: true, force: true });
+    for (const entry of await fs.readdir(tmpDir).catch(() => [] as string[])) {
+      if (entry.startsWith(`${path.basename(absRoot)}~`)) {
+        await fs.rm(path.join(tmpDir, entry), { recursive: true, force: true });
       }
     }
   }
+  const skippedShortcuts: Array<{ path: string; id: string; name: string }> = [];
+  const listOptions: ListRecursiveOptions =
+    input.followShortcut === undefined
+      ? {}
+      : {
+          followShortcut: input.followShortcut,
+          skipped: (target) =>
+            skippedShortcuts.push({ path: target.path, id: target.id, name: target.name }),
+        };
   const resolved: ResolvedRef[] = [];
-  for (const ref of input.refs) resolved.push(await resolveRef(input.api, ref));
+  for (const ref of input.refs) resolved.push(await resolveRef(input.api, ref, listOptions));
 
   await ensureIgnored(input.worktree);
-  const temporary = `${absRoot}.tmp-${randomUUID()}`;
-  await fs.mkdir(path.dirname(temporary), { recursive: true });
+  const temporary = path.join(tmpDir, `${path.basename(absRoot)}~${randomUUID()}`);
+  await fs.mkdir(tmpDir, { recursive: true });
+  await assertNoSymlinks(input.worktree, `${DRIVE_SNAPSHOT_DIR}/.tmp`);
   await assertNoSymlinks(input.worktree, relRoot);
   await fs.mkdir(temporary);
   const seen = new Set<string>();
@@ -325,6 +340,8 @@ export const buildSnapshot = async (input: {
       totalBytes,
       failedFiles,
       files: full,
+      // Shortcuts to files outside the project and the attached folders: not read.
+      skippedShortcuts,
     };
     const manifestText = `${JSON.stringify(manifest, null, 2)}\n`;
     await fs.writeFile(path.join(temporary, "manifest.json"), manifestText, { mode: 0o444 });

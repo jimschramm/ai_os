@@ -75,8 +75,19 @@ export const readCompoundFile = (bytes: Uint8Array): CompoundFile => {
     }
     return ids;
   };
+  // Every sector belongs to one stream: shared chains would let a small file
+  // expand into many copies of the same data.
+  const owned = new Set<number>();
+  const ownedMini = new Set<number>();
+  const claim = (ids: readonly number[], set: Set<number>) => {
+    for (const id of ids) {
+      if (set.has(id)) throw new Error("Overlapping streams.");
+      set.add(id);
+    }
+  };
   const readRegular = (start: number, size?: number) => {
     const ids = chain(start, fat);
+    claim(ids, owned);
     const out = new Uint8Array(ids.length * sectorSize);
     ids.forEach((id, index) => out.set(sector(id), index * sectorSize));
     return size === undefined ? out : out.subarray(0, Math.min(size, out.length));
@@ -111,6 +122,7 @@ export const readCompoundFile = (bytes: Uint8Array): CompoundFile => {
       if (size === 0) streams.set(name, new Uint8Array(0));
       else if (size < cutoff) {
         const ids = chain(start, miniFat);
+        claim(ids, ownedMini);
         const out = new Uint8Array(ids.length * miniSize);
         ids.forEach((id, index) =>
           out.set(miniStream.subarray(id * miniSize, (id + 1) * miniSize), index * miniSize),

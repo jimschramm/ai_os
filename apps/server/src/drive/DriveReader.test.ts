@@ -391,6 +391,59 @@ describe("snapshot safety", () => {
     expect(await verifySnapshot(worktree, ref)).toBeNull();
   });
 
+  it("reads shortcut targets in an attached folder only where the caller allows", async () => {
+    const files: DriveFile[] = [
+      { id: "fold-000000", name: "In", mimeType: FOLDER_MIME },
+      { id: "own1-000000", name: "own.txt", mimeType: "text/plain", size: 1 },
+      { id: "ext1-000000", name: "personal.txt", mimeType: "text/plain", size: 1 },
+    ];
+    const base = fakeApi(files, { "fold-000000": ["own1-000000"] }, {});
+    const api: DriveApi = {
+      ...base.api,
+      // Drive returns the folder's own file plus a shortcut's target.
+      listRecursive: async (_id, options) => {
+        const out = [{ ...files[1]!, path: "own.txt" }];
+        const target = files[2]!;
+        if (options?.followShortcut === undefined || (await options.followShortcut(target))) {
+          out.push({ ...target, path: "link" });
+        } else options.skipped?.({ ...target, path: "link" });
+        return out;
+      },
+    };
+    const worktree = await temp();
+    const result = await buildSnapshot({
+      api,
+      store: makeContentStore(await temp()),
+      worktree,
+      taskId: "t1",
+      refs: ["fold-000000"],
+      followShortcut: async (target) => target.id !== "ext1-000000",
+    });
+    expect(result.ref.files.map((file) => file.id)).toEqual(["own1-000000"]);
+    const manifest = JSON.parse(await fs.readFile(result.manifestPath, "utf8"));
+    expect(manifest.skippedShortcuts).toEqual([
+      { path: "link", id: "ext1-000000", name: "personal.txt" },
+    ]);
+    expect(base.calls.some((call) => call.includes("ext1"))).toBe(false);
+  });
+
+  it("never lets one task's recovery touch another task's snapshot", async () => {
+    const { api } = tree();
+    const worktree = await temp();
+    const store = makeContentStore(await temp());
+    await buildSnapshot({ api, store, worktree, taskId: "abc.tmp-x", refs: ["txt1-0000000"] });
+    await buildSnapshot({
+      api,
+      store,
+      worktree,
+      taskId: "abc",
+      refs: ["txt1-0000000"],
+      resume: true,
+    });
+    const names = await fs.readdir(path.join(worktree, ".ai_os", "drive"));
+    expect(names.sort()).toEqual([".tmp", "abc", "abc.tmp-x"]);
+  });
+
   it("lets parallel tasks store the same file version", async () => {
     const store = makeContentStore(await temp());
     const put = (text: string) =>
@@ -433,7 +486,7 @@ describe("snapshot resume", () => {
       { "txt1-0000000": new TextEncoder().encode("hi") },
     );
     // A run cut short by a restart leaves its temp folder behind.
-    const stale = path.join(worktree, ".ai_os", "drive", "task-r.tmp-1");
+    const stale = path.join(worktree, ".ai_os", "drive", ".tmp", "task-r~1");
     await fs.mkdir(stale, { recursive: true });
     const first = await buildSnapshot({
       api,
