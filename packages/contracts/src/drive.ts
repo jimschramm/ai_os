@@ -11,9 +11,11 @@ export const DriveFolderId = Schema.String.check(Schema.isPattern(DRIVE_ID));
 export type DriveFolderId = typeof DriveFolderId.Type;
 
 /**
- * Project-only Drive settings. `inputFolderId` is an optional default place to
- * look, not a boundary: ai_os may read anything in the signed-in Drive.
- * `outputFolderId` is the default place for new outputs. Originals are never
+ * Project-only Drive settings; Drive in ai_os exists only to serve a project.
+ * `inputFolderId` (normally aios/projects/<name>/inputs) is the folder a
+ * project's tasks read and evaluate; other files are read only when attached
+ * to one of the project's tasks by link or pick. `outputFolderId` is the
+ * default place for new outputs. Originals are never
  * modified: edits become new `<name>_aios_vN` files next to the original.
  */
 export const ProjectDriveSettings = Schema.Struct({

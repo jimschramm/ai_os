@@ -32,9 +32,7 @@ import {
   runLoopbackLogin,
   type DriveClient,
 } from "../drive/GoogleDriveAuth.ts";
-import { DRIVE_CONTENT_DIR, makeContentStore } from "../drive/ContentStore.ts";
-import { makeDriveApi, type DriveApi, FOLDER_MIME } from "../drive/DriveApi.ts";
-import { readDriveFile, resolveRef } from "../drive/DriveReader.ts";
+import { makeDriveApi, type DriveApi } from "../drive/DriveApi.ts";
 import { ensureProjectFolders } from "../drive/projectFolders.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as ProcessRunner from "../processRunner.ts";
@@ -88,18 +86,6 @@ const driveApi = Effect.gen(function* () {
 
 const viaPromise = <A>(run: () => Promise<A>) =>
   Effect.tryPromise({ try: run, catch: (error) => userError((error as Error).message) });
-
-const humanBytes = (bytes: number | undefined) => {
-  if (bytes === undefined) return "";
-  const units = ["B", "KB", "MB", "GB", "TB"];
-  let value = bytes;
-  let unit = 0;
-  while (value >= 1024 && unit < units.length - 1) {
-    value /= 1024;
-    unit += 1;
-  }
-  return unit === 0 ? `${value} B` : `${value.toFixed(1)} ${units[unit]}`;
-};
 
 const loginCommand = Command.make("login", {
   ...authLocationFlags,
@@ -211,7 +197,7 @@ const folderFlag = (name: string, description: string) =>
 const LIVE_SERVER_TIMEOUT = Duration.seconds(5);
 
 const describeDrive = (projectId: string, drive: ProjectDriveSettings, via: string) =>
-  `Drive for ${projectId}: ${drive.enabled ? "on" : "off"}; output ${drive.outputFolderId ?? "not set"}; input ${drive.inputFolderId ?? "any (whole Drive)"} (${via}).`;
+  `Drive for ${projectId}: ${drive.enabled ? "on" : "off"}; output ${drive.outputFolderId ?? "not set"}; input ${drive.inputFolderId ?? "not set"} (${via}).`;
 
 /** Sends the change to the running server, which applies it under its settings lock. */
 const updateViaServer = (origin: string, update: ProjectDriveUpdate) =>
@@ -338,13 +324,13 @@ const projectCommand = Command.make("project", {
   ),
   name: Flag.String("name").pipe(
     Flag.withDescription(
-      "Folder name under My Drive/aios/projects when no folders are given. Defaults to the project's title (needs the server running).",
+      "Folder name under aios/projects when no folders are given. Defaults to the project's title (needs the server running).",
     ),
     Flag.optional,
   ),
 }).pipe(
   Command.withDescription(
-    "Turn Drive on for a project. With no folder flags, uses (or creates) My Drive/aios/projects/<project>/inputs and /outputs; or pass folder links.",
+    "Turn Drive on for a project. With no folder flags, uses (or creates) aios/projects/<project>/inputs and /outputs; or pass folder links.",
   ),
   Command.withHandler((flags) =>
     withConfig(flags, (config) =>
@@ -379,7 +365,7 @@ const projectCommand = Command.make("project", {
             return yield* viaPromise(() => ensureProjectFolders(api, name));
           }).pipe(Effect.provide(secretStoreLayer(config)));
           yield* Console.log(
-            `Drive folders: My Drive/aios/projects/${name}/inputs and /outputs (${folders.created.length === 0 ? "already there" : `created ${folders.created.join(", ")}`}).`,
+            `Drive folders: aios/projects/${name}/inputs and /outputs (${folders.created.length === 0 ? "already there" : `created ${folders.created.join(", ")}`}).`,
           );
           output = folders.outputFolderId;
           input = folders.inputFolderId;
@@ -419,73 +405,7 @@ const projectCommand = Command.make("project", {
   ),
 );
 
-const searchCommand = Command.make("search", {
-  ...authLocationFlags,
-  query: Argument.String("text").pipe(Argument.withDescription("Words in the name or the text.")),
-}).pipe(
-  Command.withDescription("Search everything in your Drive. Read-only."),
-  Command.withHandler((flags) =>
-    withConfig(flags, (config) =>
-      Effect.gen(function* () {
-        const api = yield* driveApi;
-        const files = yield* viaPromise(() => api.search(flags.query));
-        if (files.length === 0) yield* Console.log("No matches.");
-        for (const [index, file] of files.entries()) {
-          yield* Console.log(
-            `${index + 1}\t${file.name}\t${file.mimeType === FOLDER_MIME ? "folder" : humanBytes(file.size)}\t${file.modifiedTime ?? ""}\t${file.webViewLink ?? file.id}`,
-          );
-        }
-      }).pipe(Effect.provide(secretStoreLayer(config))),
-    ),
-  ),
-);
-
-const readCommand = Command.make("read", {
-  ...authLocationFlags,
-  link: Argument.String("link").pipe(
-    Argument.withDescription(
-      "Drive file or folder link, or an id. Folders are read at all depths.",
-    ),
-  ),
-}).pipe(
-  Command.withDescription(
-    "Download a Drive file or folder into the local content store and extract its text. Read-only toward Drive.",
-  ),
-  Command.withHandler((flags) =>
-    withConfig(flags, (config) =>
-      Effect.gen(function* () {
-        const api: DriveApi = yield* driveApi;
-        const store = makeContentStore(`${config.stateDir}/${DRIVE_CONTENT_DIR}`);
-        const resolved = yield* viaPromise(() => resolveRef(api, flags.link));
-        const total = resolved.files.reduce((sum, file) => sum + (file.size ?? 0), 0);
-        yield* Console.log(
-          `${resolved.root.name}: ${resolved.files.length} file(s), ${humanBytes(total)} reported by Drive.`,
-        );
-        let failed = 0;
-        for (const file of resolved.files) {
-          const stored = yield* viaPromise(() => readDriveFile(api, store, file));
-          const meta = stored.meta;
-          if (meta.error !== null) failed += 1;
-          yield* Console.log(
-            `${file.path}\t${meta.kind}/${meta.method}\t${humanBytes(meta.bytes)}\t${meta.textChars} chars${meta.error === null ? "" : `\t! ${meta.error}`}`,
-          );
-        }
-        yield* Console.log(
-          `Stored under ${store.root}${failed > 0 ? `; ${failed} file(s) without text` : ""}.`,
-        );
-      }).pipe(Effect.provide(secretStoreLayer(config))),
-    ),
-  ),
-);
-
 export const driveCommand = Command.make("drive").pipe(
-  Command.withDescription("Google Drive sign-in, project folders, search and read."),
-  Command.withSubcommands([
-    loginCommand,
-    statusCommand,
-    logoutCommand,
-    projectCommand,
-    searchCommand,
-    readCommand,
-  ]),
+  Command.withDescription("Google Drive sign-in and project folders (aios/projects/<name>)."),
+  Command.withSubcommands([loginCommand, statusCommand, logoutCommand, projectCommand]),
 );

@@ -197,6 +197,8 @@ export const buildSnapshot = async (input: {
   readonly refs: readonly string[];
   readonly pdfTimeoutMs?: number;
   readonly now?: () => Date;
+  /** Resuming after a restart: return the finished snapshot if it is already there. */
+  readonly resume?: boolean;
   /** Called after each file with (done, total, Drive path). */
   readonly onProgress?: (done: number, total: number, drivePath: string) => void;
 }): Promise<SnapshotResult> => {
@@ -212,7 +214,19 @@ export const buildSnapshot = async (input: {
       () => false,
     )
   ) {
+    // A resumed job whose snapshot finished before the restart: reuse it as is.
+    if (input.resume === true) {
+      const existing = await loadSnapshot(input.worktree, relRoot);
+      if (existing !== null) return existing;
+    }
     throw new DriveApiError(`A Drive snapshot already exists at ${relRoot}.`);
+  }
+  // Leftovers of a run cut short (server restart): only this task's temp folders.
+  const parent = path.dirname(absRoot);
+  for (const entry of await fs.readdir(parent).catch(() => [] as string[])) {
+    if (entry.startsWith(`${path.basename(absRoot)}.tmp-`)) {
+      await fs.rm(path.join(parent, entry), { recursive: true, force: true });
+    }
   }
   const resolved: ResolvedRef[] = [];
   for (const ref of input.refs) resolved.push(await resolveRef(input.api, ref));
@@ -311,6 +325,45 @@ export const buildSnapshot = async (input: {
   } catch (error) {
     await fs.rm(temporary, { recursive: true, force: true }).catch(() => undefined);
     throw error;
+  }
+};
+
+/** The reference for a finished snapshot, read back from its manifest. */
+const loadSnapshot = async (worktree: string, relRoot: string): Promise<SnapshotResult | null> => {
+  const manifestPath = path.join(worktree, ...relRoot.split("/"), "manifest.json");
+  const text = await fs.readFile(manifestPath, "utf8").catch(() => null);
+  if (text === null) return null;
+  try {
+    const manifest = JSON.parse(text) as {
+      totalFiles: number;
+      totalBytes: number;
+      failedFiles: number;
+      sources: Array<{ ref: string }>;
+      files: Array<DriveManifestFileV1>;
+    };
+    return {
+      manifestPath,
+      ref: {
+        root: relRoot,
+        manifestSha256: sha256Hex(text),
+        totalFiles: manifest.totalFiles,
+        totalBytes: manifest.totalBytes,
+        failedFiles: manifest.failedFiles,
+        files: manifest.files.map((file) => ({
+          id: file.id,
+          name: file.name,
+          drivePath: file.drivePath,
+          kind: file.kind,
+          bytes: file.bytes,
+          ...(file.original === undefined ? {} : { original: file.original }),
+          ...(file.text === undefined ? {} : { text: file.text }),
+          ...(file.error === undefined ? {} : { error: file.error }),
+        })),
+        sources: manifest.sources.map((source) => source.ref.trim()),
+      },
+    };
+  } catch {
+    return null;
   }
 };
 

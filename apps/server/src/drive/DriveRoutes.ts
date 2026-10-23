@@ -1,15 +1,18 @@
 /**
- * Drive HTTP routes on the T3 server. The Drive token never leaves the server:
- * clients (the live driver, the web app) send links and get file lists or a
- * snapshot reference back.
+ * Drive HTTP routes on the T3 server, for ai_os projects only. The Drive token
+ * never leaves the server: clients (the live driver, the web app) send links
+ * and get file lists or a snapshot reference back. Every route names a project
+ * with Drive turned on; nothing here reads Drive for anything else.
  *
- *   POST /api/drive/search    { query, limit? }               read scope
- *   POST /api/drive/list      { ref }                         read scope
- *   POST /api/drive/snapshot  { projectId, taskId, refs[] }   operate scope
- *        -> { jobId }; a big folder can take longer than one HTTP request may wait
- *   POST /api/drive/snapshot/status { jobId }                 read scope
+ *   POST /api/drive/search    { projectId, query, limit? }       read scope
+ *        names only, to pick a file to attach to that project's task
+ *   POST /api/drive/list      { projectId, ref? }                read scope
+ *        a folder inside the project's Drive folders (default: its inputs)
+ *   POST /api/drive/snapshot  { projectId, taskId, refs[] }      operate scope
+ *        -> { jobId }; the job is saved to disk and resumes after a restart
+ *   POST /api/drive/snapshot/status { jobId }                    read scope
  *        -> { state: "running", done, total } | { state: "done", manifest } | { state: "failed", error }
- *   POST /api/drive/verify    { projectId, manifest }         read scope
+ *   POST /api/drive/verify    { projectId, manifest }            read scope
  */
 import {
   AuthOrchestrationOperateScope,
@@ -28,10 +31,13 @@ import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
 import { authorize, authResponse } from "../aiOsBoard.ts";
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
 import * as ServerConfig from "../config.ts";
+import * as ServerSettings from "../serverSettings.ts";
 import * as ProjectService from "../project/ProjectService.ts";
 import { DRIVE_CONTENT_DIR, makeContentStore } from "./ContentStore.ts";
-import { makeDriveApi } from "./DriveApi.ts";
+import { makeDriveApi, parseDriveRef } from "./DriveApi.ts";
 import { buildSnapshot, resolveRef, verifySnapshot } from "./DriveReader.ts";
+import { DRIVE_JOBS_DIR, DriveJobStore, type DriveJob, safeProjectDir } from "./DriveJobStore.ts";
+import { isInsideFolders, projectRoots } from "./projectFolders.ts";
 import { DRIVE_CREDENTIALS_SECRET_NAME, decodeCredentials } from "./GoogleDriveAuth.ts";
 
 export const DRIVE_SEARCH_PATH = "/api/drive/search";
@@ -100,7 +106,9 @@ const classify = (cause: unknown) => {
         ? 400
         : message.startsWith("A Drive snapshot already exists")
           ? 409
-          : 502;
+          : (cause as { status?: number } | null)?.status === 403
+            ? 403
+            : 502;
   return { status, detail: message };
 };
 
@@ -117,12 +125,11 @@ export const layer = Layer.unwrap(
     const projects = yield* ProjectService.ProjectService;
     const path = yield* Path.Path;
     const crypto = yield* Crypto.Crypto;
-    type Job =
-      | { state: "running"; done: number; total: number; current: string | null }
-      | { state: "done"; manifest: unknown }
-      | { state: "failed"; error: string; status: number };
-    const jobs = new Map<string, Job>();
-    const store = makeContentStore(path.join(config.stateDir, DRIVE_CONTENT_DIR));
+    const settings = yield* ServerSettings.ServerSettingsService;
+    const jobs = new DriveJobStore(path.join(config.stateDir, DRIVE_JOBS_DIR));
+    /** Content is kept per project so it is reused only by that project. */
+    const storeFor = (projectId: string) =>
+      makeContentStore(path.join(config.stateDir, DRIVE_CONTENT_DIR, safeProjectDir(projectId)));
 
     const api = Effect.gen(function* () {
       const stored = yield* secrets
@@ -144,6 +151,22 @@ export const layer = Layer.unwrap(
         return project.value.workspaceRoot;
       });
 
+    /** The project's Drive settings; Drive must be on for the project. */
+    const projectDrive = (projectId: string) =>
+      Effect.gen(function* () {
+        const current = yield* settings.getSettings.pipe(
+          Effect.mapError(() => bad("Could not read settings.", 500)),
+        );
+        const drive = current.projectSettingsOverrides[ProjectId.make(projectId)]?.drive;
+        if (drive === undefined || !drive.enabled) {
+          return yield* bad(
+            `Drive is off for project ${projectId}. Turn it on with \`drive project ${projectId}\`.`,
+            403,
+          );
+        }
+        return drive;
+      });
+
     const handle = (
       scope: typeof AuthOrchestrationReadScope | typeof AuthOrchestrationOperateScope,
       run: (input: Record<string, unknown>) => Effect.Effect<unknown, DriveRouteError>,
@@ -159,8 +182,15 @@ export const layer = Layer.unwrap(
         }),
       );
 
+    const needProject = (input: Record<string, unknown>) => {
+      const projectId = stringField(input, "projectId");
+      return projectId === null ? Effect.fail(bad("Pass projectId.")) : Effect.succeed(projectId);
+    };
+
     const search = handle(AuthOrchestrationReadScope, (input) =>
       Effect.gen(function* () {
+        // Names only, to pick a file to attach to this project's task; no content is read.
+        yield* projectDrive(yield* needProject(input));
         const query = stringField(input, "query");
         if (query === null) return yield* bad("Pass a search query.");
         const limit =
@@ -175,9 +205,22 @@ export const layer = Layer.unwrap(
 
     const list = handle(AuthOrchestrationReadScope, (input) =>
       Effect.gen(function* () {
-        const ref = stringField(input, "ref");
-        if (ref === null) return yield* bad("Pass a Drive link or id.");
+        const projectId = yield* needProject(input);
+        const folders = yield* projectDrive(projectId);
+        const ref = stringField(input, "ref") ?? folders.inputFolderId ?? null;
+        if (ref === null)
+          return yield* bad("This project has no Drive input folder; pass a folder.");
         const drive = yield* api;
+        const id = parseDriveRef(ref);
+        if (id === null) return yield* bad(`Not a Google Drive link or id: ${ref}`);
+        const roots = yield* fromPromise(() => projectRoots(drive, folders));
+        const inside = yield* fromPromise(() => isInsideFolders(drive, id, roots));
+        if (!inside) {
+          return yield* bad(
+            "Folder evaluation works only on this project's Drive folders (aios/projects/<name>/...). Attach other files with --drive instead.",
+            403,
+          );
+        }
         const resolved = yield* fromPromise(() => resolveRef(drive, ref));
         return {
           root: publicFile(resolved.root),
@@ -188,38 +231,63 @@ export const layer = Layer.unwrap(
       }),
     );
 
+    /** Runs (or resumes) a snapshot job, saving its state as it goes. */
+    const runJob = (
+      job: DriveJob,
+      worktree: string,
+      drive: ReturnType<typeof makeDriveApi>,
+      resume: boolean,
+    ) =>
+      buildSnapshot({
+        api: drive,
+        store: storeFor(job.projectId),
+        worktree,
+        taskId: job.taskId,
+        refs: job.refs,
+        resume,
+        onProgress: (done, total, current) => {
+          jobs.save({ ...job, state: "running", done, total, current });
+        },
+      }).then(
+        (result) => jobs.save({ ...job, state: "done", manifest: result.ref }),
+        (cause: unknown) => {
+          const failed = classify(cause);
+          return jobs.save({
+            ...job,
+            state: "failed",
+            error: failed.detail,
+            status: failed.status,
+          });
+        },
+      );
+
     const snapshot = handle(AuthOrchestrationOperateScope, (input) =>
       Effect.gen(function* () {
-        const projectId = stringField(input, "projectId");
+        const projectId = yield* needProject(input);
         const taskId = stringField(input, "taskId");
         const refs = Array.isArray(input.refs)
           ? input.refs.filter((ref): ref is string => typeof ref === "string" && ref.trim() !== "")
           : [];
-        if (projectId === null || taskId === null || refs.length === 0) {
+        if (taskId === null || refs.length === 0) {
           return yield* bad("Pass projectId, taskId and at least one Drive link.");
         }
+        // Files attached by link or pick, or the project's own folders, for this project's task.
+        yield* projectDrive(projectId);
         const worktree = yield* worktreeOf(projectId);
         const drive = yield* api;
         const jobId = yield* crypto.randomUUIDv4().pipe(Effect.orDie);
-        const job: Job = { state: "running", done: 0, total: 0, current: null };
-        jobs.set(jobId, job);
-        // Runs outside the request so the client can poll; the server keeps it in memory only.
-        void buildSnapshot({
-          api: drive,
-          store,
-          worktree,
+        const job: DriveJob = {
+          jobId,
+          projectId,
           taskId,
           refs,
-          onProgress: (done, total, current) => {
-            jobs.set(jobId, { state: "running", done, total, current });
-          },
-        }).then(
-          (result) => jobs.set(jobId, { state: "done", manifest: result.ref }),
-          (cause: unknown) => {
-            const failed = classify(cause);
-            jobs.set(jobId, { state: "failed", error: failed.detail, status: failed.status });
-          },
-        );
+          state: "running",
+          done: 0,
+          total: 0,
+          current: null,
+        };
+        yield* fromPromise(() => jobs.save(job));
+        void runJob(job, worktree, drive, false);
         return { jobId };
       }),
     );
@@ -227,12 +295,42 @@ export const layer = Layer.unwrap(
     const snapshotStatus = handle(AuthOrchestrationReadScope, (input) =>
       Effect.gen(function* () {
         const jobId = stringField(input, "jobId");
-        const job = jobId === null ? undefined : jobs.get(jobId);
-        if (job === undefined) return yield* bad("No such snapshot job.", 404);
-        if (job.state !== "running" && jobId !== null) jobs.delete(jobId);
-        return job;
+        const job = jobId === null ? null : yield* fromPromise(() => jobs.get(jobId));
+        if (job === null) return yield* bad("No such snapshot job.", 404);
+        if (job.state === "running") {
+          return { state: job.state, done: job.done, total: job.total, current: job.current };
+        }
+        // A finished job is handed over once; its result lives on in the snapshot.
+        yield* fromPromise(() => jobs.remove(job.jobId));
+        return job.state === "done"
+          ? { state: job.state, manifest: job.manifest }
+          : { state: job.state, error: job.error, status: job.status };
       }),
     );
+
+    // Jobs that were running when the server stopped pick up where they left off:
+    // files already read come from the project's content store.
+    const pending = yield* Effect.promise(() => jobs.running().catch(() => [] as DriveJob[]));
+    for (const job of pending) {
+      const worktree = yield* worktreeOf(job.projectId).pipe(Effect.orElseSucceed(() => null));
+      const drive = yield* api.pipe(Effect.orElseSucceed(() => null));
+      if (worktree === null || drive === null) {
+        yield* Effect.promise(() =>
+          jobs.save({
+            ...job,
+            state: "failed",
+            error:
+              worktree === null
+                ? `Project ${job.projectId} is gone; the Drive snapshot was not resumed.`
+                : "Drive login needed: run `drive login` on this machine.",
+            status: worktree === null ? 404 : 401,
+          }),
+        );
+        continue;
+      }
+      yield* Effect.logInfo(`Resuming Drive snapshot job ${job.jobId} for task ${job.taskId}.`);
+      void runJob(job, worktree, drive, true);
+    }
 
     const verify = handle(AuthOrchestrationReadScope, (input) =>
       Effect.gen(function* () {
