@@ -15,6 +15,9 @@ import {
   ServerSettings,
   ServerSettingsError,
   type ServerSettingsPatch,
+  applyProjectDriveUpdate,
+  type ProjectDriveSettings,
+  type ResolvedProjectDriveUpdate,
 } from "@t3tools/contracts";
 import * as Cache from "effect/Cache";
 import * as Cause from "effect/Cause";
@@ -182,6 +185,15 @@ export class ServerSettingsService extends Context.Service<
       patch: ServerSettingsPatch,
     ) => Effect.Effect<ServerSettings, ServerSettingsError>;
 
+    /**
+     * Read-modify-write of one project's `drive` under the settings write
+     * lock, so concurrent changes to other settings are never overwritten.
+     */
+    readonly updateProjectDrive: (
+      projectId: ProjectId,
+      update: ResolvedProjectDriveUpdate,
+    ) => Effect.Effect<ProjectDriveSettings, ServerSettingsError>;
+
     readonly updateProviderInstance: (
       mutation: ProviderInstanceMutation,
       patch?: ServerSettingsPatch,
@@ -202,6 +214,25 @@ export class ServerSettingsService extends Context.Service<
 >()("t3/serverSettings/ServerSettingsService") {
   static readonly layerTest = (overrides: DeepPartial<ServerSettings> = {}) => layerTest(overrides);
 }
+
+const updateProjectDriveWith = (
+  update: (
+    build: (current: ServerSettings) => Effect.Effect<ServerSettings, ServerSettingsError>,
+  ) => Effect.Effect<ServerSettings, ServerSettingsError>,
+  projectId: ProjectId,
+  change: ResolvedProjectDriveUpdate,
+): Effect.Effect<ProjectDriveSettings, ServerSettingsError> => {
+  let drive: ProjectDriveSettings = { enabled: false };
+  return update((current) => {
+    const entry = current.projectSettingsOverrides[projectId] ?? {};
+    drive = applyProjectDriveUpdate(entry.drive, change);
+    return Effect.succeed(
+      applyServerSettingsPatch(current, {
+        projectSettingsOverrides: { [projectId]: { ...entry, drive } },
+      }),
+    );
+  }).pipe(Effect.map(() => drive));
+};
 
 const makeTest = (overrides: DeepPartial<ServerSettings> = {}) =>
   Effect.gen(function* () {
@@ -241,6 +272,8 @@ const makeTest = (overrides: DeepPartial<ServerSettings> = {}) =>
         updateTestSettings((currentSettings) =>
           Effect.succeed(applyServerSettingsPatch(currentSettings, patch)),
         ),
+      updateProjectDrive: (projectId, update) =>
+        updateProjectDriveWith(updateTestSettings, projectId, update),
       updateProviderInstance: (mutation, patch = {}) =>
         updateTestSettings((currentSettings) =>
           Effect.gen(function* () {
@@ -1152,6 +1185,8 @@ const make = Effect.gen(function* () {
       updateAndPersistSettings((current) =>
         Effect.succeed(applyServerSettingsPatch(current, patch)),
       ),
+    updateProjectDrive: (projectId, update) =>
+      updateProjectDriveWith(updateAndPersistSettings, projectId, update),
     updateProviderInstance: (mutation, patch = {}) =>
       updateAndPersistSettings((current) =>
         Effect.gen(function* () {

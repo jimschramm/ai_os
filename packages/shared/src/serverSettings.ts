@@ -274,11 +274,15 @@ function mergeProjectSettingsOverridesPatch(
       continue;
     }
     const storedProviderInstances = current[projectId]?.providerInstances;
+    // `drive` is project-only and has no settings UI yet, so clients that
+    // round-trip an entry without it must not wipe it either.
+    const storedDrive = current[projectId]?.drive;
     next.set(projectId, {
       ...entry,
       ...(Object.hasOwn(entry, "providerInstances") || storedProviderInstances === undefined
         ? {}
         : { providerInstances: storedProviderInstances }),
+      ...(Object.hasOwn(entry, "drive") || storedDrive === undefined ? {} : { drive: storedDrive }),
     });
   }
   return Object.fromEntries(next);
