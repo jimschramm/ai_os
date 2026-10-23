@@ -59,10 +59,11 @@ Google Drive, for this project only (the server holds the Drive token; files
 are read-only copies; Drive must be on for the project):
   --drive <link or id>        Attach a Drive file, or every file under a folder,
                               to this task. Repeat to attach several.
-  --drive-search "<text>"     Print numbered Drive matches (names only) to pick
+  --drive-search "<text>"     Print Drive matches (names and ids only) to pick
                               from, and stop.
-  --drive-search "<text>" --pick 1,3
-                              Attach those matches to this task.
+  --drive-search "<text>" --pick <id>,<id>
+                              Attach those matches, by the ids the search
+                              printed, to this task.
   --evaluate-folder inputs    One task per file in the project's Drive inputs
                               folder (all depths), or pass a folder link inside
                               the project's aios/projects/<name>/ folders.
@@ -91,7 +92,7 @@ export interface LiveDriverRequest {
   /** Drive links or ids to attach. */
   readonly drive?: readonly string[];
   readonly driveSearch?: string | undefined;
-  readonly pick?: readonly number[];
+  readonly pick?: readonly string[];
   /** A folder link, or "inputs" for the project's Drive inputs folder. */
   readonly evaluateFolder?: string | undefined;
   readonly concurrency?: number | undefined;
@@ -132,7 +133,7 @@ export const parseLiveDriverArgs = (
   let listProjects = false;
   const drive: string[] = [];
   let driveSearch: string | undefined;
-  let pick: number[] = [];
+  let pick: string[] = [];
   let evaluateFolder: string | undefined;
   let concurrency: number | undefined;
 
@@ -182,10 +183,12 @@ export const parseLiveDriverArgs = (
       case "--pick": {
         const raw = take(argv, index, flag);
         index += 1;
-        pick = raw.split(",").map((part) => Number(part.trim()));
-        if (pick.some((value) => !Number.isInteger(value) || value < 1)) {
+        pick = raw.split(",").map((part) => part.trim());
+        // Ids, not result numbers: a number could point at another file if the
+        // results reorder between the search and the pick.
+        if (pick.some((value) => !/^[A-Za-z0-9_-]{10,}$/.test(value))) {
           throw new LiveDriverUsageError({
-            detail: `--pick takes result numbers such as 1,3.\n\n${LIVE_DRIVER_HELP}`,
+            detail: `--pick takes the Drive ids the search printed, comma-separated.\n\n${LIVE_DRIVER_HELP}`,
           });
         }
         break;
@@ -448,13 +451,14 @@ export const runLiveDriver = (
         });
         return;
       }
-      for (const number of request.pick ?? []) {
-        const file = found[number - 1];
+      for (const id of request.pick ?? []) {
+        const file = found.find((match) => match.id === id);
         if (file === undefined) {
           return yield* new LiveDriverUsageError({
-            detail: `--pick ${number}: the search returned ${found.length} matches.`,
+            detail: `--pick ${id}: not among the ${found.length} matches for this search.`,
           });
         }
+        deps.write(`attaching ${file.name}\t${file.id}`);
         picked.push(file.id);
       }
     } else if ((request.pick ?? []).length > 0) {
@@ -524,6 +528,8 @@ export const runLiveDriver = (
       idSeed: string,
       refs: readonly string[],
       write: (line: string) => void = deps.write,
+      // Folder tasks are watched to the end so --concurrency really bounds them.
+      untilDone = false,
     ) =>
       Effect.gen(function* () {
         const stamp = deps.clock();
@@ -576,7 +582,7 @@ export const runLiveDriver = (
         let lastLabel = "";
         const limit = deps.maxPolls ?? 600;
         const interval = deps.pollIntervalMs ?? 1_000;
-        for (let attempt = 0; attempt < limit; attempt += 1) {
+        for (let attempt = 0; untilDone || attempt < limit; attempt += 1) {
           const view = yield* deps.client.read(threadId);
           if (view.text !== null && view.text !== lastText) {
             write(view.text);
@@ -615,6 +621,11 @@ export const runLiveDriver = (
         });
       }
       const files = filesOf(listing);
+      for (const file of filesOf({ files: isRecord(listing) ? listing.skipped : undefined })) {
+        deps.write(
+          `skipped ${file.path ?? file.name}: a shortcut to a file outside the project (attach it with --drive ${file.id})`,
+        );
+      }
       const totalBytes = files.reduce((sum, file) => sum + (file.size ?? 0), 0);
       const concurrency = request.concurrency ?? DEFAULT_FOLDER_CONCURRENCY;
       deps.write(
@@ -631,6 +642,7 @@ export const runLiveDriver = (
             `${title}-${index + 1}`,
             [file.id, ...shared],
             write,
+            true,
           ).pipe(
             Effect.tapError((error) => Effect.sync(() => write(`failed: ${error.message}`))),
             Effect.result,

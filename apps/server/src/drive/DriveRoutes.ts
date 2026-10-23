@@ -222,8 +222,17 @@ export const layer = Layer.unwrap(
             403,
           );
         }
-        const resolved = yield* fromPromise(() => resolveRef(drive, ref));
+        // A shortcut to something outside the project is not part of it: it is
+        // listed as skipped, to attach by id if wanted.
+        const skipped: Array<ReturnType<typeof publicFile>> = [];
+        const resolved = yield* fromPromise(() =>
+          resolveRef(drive, ref, {
+            followShortcut: (target) => isInsideFolders(drive, target.id, roots),
+            skipped: (target) => skipped.push(publicFile(target)),
+          }),
+        );
         return {
+          skipped,
           root: publicFile(resolved.root),
           totalFiles: resolved.files.length,
           totalBytes: resolved.files.reduce((sum, file) => sum + (file.size ?? 0), 0),

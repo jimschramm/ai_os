@@ -63,13 +63,25 @@ const toFile = (raw: Record<string, unknown>): DriveFile => {
 export const quoteQuery = (value: string) =>
   `'${value.replaceAll("\\", "\\\\").replaceAll("'", "\\'")}'`;
 
+export interface ListRecursiveOptions {
+  readonly followShortcut?: (target: DriveFile) => Promise<boolean>;
+  readonly skipped?: (target: DriveListedFile) => void;
+}
+
 export interface DriveApi {
   readonly getFile: (id: string) => Promise<DriveFile>;
   /** Follows a shortcut to its target; returns other files unchanged. */
   readonly resolve: (file: DriveFile) => Promise<DriveFile>;
   readonly listChildren: (folderId: string) => Promise<DriveFile[]>;
-  /** Every non-folder file under `folderId`, at any depth. Shortcuts are followed once. */
-  readonly listRecursive: (folderId: string) => Promise<DriveListedFile[]>;
+  /**
+   * Every non-folder file under `folderId`, at any depth. Shortcuts are followed
+   * once, and only where `options.followShortcut` agrees; the others go to
+   * `options.skipped`.
+   */
+  readonly listRecursive: (
+    folderId: string,
+    options?: ListRecursiveOptions,
+  ) => Promise<DriveListedFile[]>;
   /** Full-text and name search over everything Jim can read, newest first. */
   readonly search: (text: string, limit?: number) => Promise<DriveFile[]>;
   readonly download: (id: string) => Promise<Uint8Array>;
@@ -175,7 +187,7 @@ export const makeDriveApi = (
   const listChildren = (folderId: string) =>
     listQuery(`${quoteQuery(folderId)} in parents and trashed = false`, { orderBy: "folder,name" });
 
-  const listRecursive = async (folderId: string) => {
+  const listRecursive = async (folderId: string, options: ListRecursiveOptions = {}) => {
     const out: DriveListedFile[] = [];
     const seen = new Set<string>([folderId]);
     const walk = async (id: string, prefix: string) => {
@@ -184,6 +196,14 @@ export const makeDriveApi = (
           child.mimeType === SHORTCUT_MIME ? await resolve(child).catch(() => null) : child;
         if (file === null || file.trashed === true) continue;
         const path = `${prefix}${child.name}`;
+        if (
+          child.mimeType === SHORTCUT_MIME &&
+          options.followShortcut !== undefined &&
+          !(await options.followShortcut(file))
+        ) {
+          options.skipped?.({ ...file, path });
+          continue;
+        }
         if (file.mimeType === FOLDER_MIME) {
           // A shortcut loop or a folder linked twice is walked once.
           if (seen.has(file.id)) continue;

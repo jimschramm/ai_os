@@ -105,6 +105,31 @@ describe("makeDriveApi", () => {
     }
   });
 
+  it("skips shortcuts the caller does not follow, and reports them", async () => {
+    const drive = fakeDrive(
+      {
+        root1: [
+          { id: "f1", name: "a.txt", mimeType: "text/plain", size: "5" },
+          {
+            id: "sc",
+            name: "outside",
+            mimeType: SHORTCUT_MIME,
+            shortcutDetails: { targetId: "ext" },
+          },
+        ],
+      },
+      { ext: { id: "ext", name: "Personal.docx", mimeType: "text/plain", size: "3" } },
+    );
+    const api = makeDriveApi(credentials, drive.fetch);
+    const skipped: string[] = [];
+    const files = await api.listRecursive("root1", {
+      followShortcut: async (target) => target.id !== "ext",
+      skipped: (target) => skipped.push(`${target.path} -> ${target.id}`),
+    });
+    expect(files.map((file) => file.id)).toEqual(["f1"]);
+    expect(skipped).toEqual(["outside -> ext"]);
+  });
+
   it("reports Drive errors without the token", async () => {
     const drive = fakeDrive({});
     const api = makeDriveApi(credentials, drive.fetch);

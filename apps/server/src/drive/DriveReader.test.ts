@@ -368,6 +368,29 @@ describe("snapshot safety", () => {
     expect(git(linked, "status", "--porcelain")).toBe("");
   });
 
+  it("keeps an original named *.txt apart from its extracted text, even when truncated", async () => {
+    const long = `${"n".repeat(120)}.txt`;
+    const { api } = fakeApi(
+      [{ id: "long1-000000", name: long, mimeType: "text/plain", size: 2 }],
+      {},
+      { "long1-000000": new TextEncoder().encode("hi") },
+    );
+    const worktree = await temp();
+    const { ref } = await buildSnapshot({
+      api,
+      store: makeContentStore(await temp()),
+      worktree,
+      taskId: "t_1",
+      refs: ["long1-000000"],
+    });
+    const [file] = ref.files;
+    expect(file!.original).not.toBe(file!.text);
+    expect(file!.text).toMatch(/\.text\.txt$/);
+    // Task ids map to their own folder: "t_1" and "t:1" never share one.
+    expect(ref.root).toBe(".ai_os/drive/t_5f1");
+    expect(await verifySnapshot(worktree, ref)).toBeNull();
+  });
+
   it("lets parallel tasks store the same file version", async () => {
     const store = makeContentStore(await temp());
     const put = (text: string) =>

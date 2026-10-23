@@ -925,7 +925,7 @@ it("parses the Drive flags", () => {
       "--drive-search",
       "rfp",
       "--pick",
-      "1,3",
+      "fileAAAAAAAAAA,folderBBBBBBBB",
       "--evaluate-folder",
       "f",
       "--concurrency",
@@ -935,11 +935,11 @@ it("parses the Drive flags", () => {
   );
   assert.deepStrictEqual(request.drive, ["a1", "b2"]);
   assert.strictEqual(request.driveSearch, "rfp");
-  assert.deepStrictEqual(request.pick, [1, 3]);
+  assert.deepStrictEqual(request.pick, ["fileAAAAAAAAAA", "folderBBBBBBBB"]);
   assert.strictEqual(request.evaluateFolder, "f");
   assert.strictEqual(request.concurrency, 3);
   assert.throws(() => parseLiveDriverArgs(["--concurrency", "0"], {}), /--concurrency takes/);
-  assert.throws(() => parseLiveDriverArgs(["--pick", "0"], {}), /--pick takes result numbers/);
+  assert.throws(() => parseLiveDriverArgs(["--pick", "1,3"], {}), /--pick takes the Drive ids/);
 });
 
 it.effect("prints Drive search results and launches nothing without --pick", () =>
@@ -973,6 +973,37 @@ it.effect("prints Drive search results and launches nothing without --pick", () 
       "1\tBrief.pdf (1.5 KB)\tfileAAAAAAAAAA",
       "2\tAnnex (folder)\tfolderBBBBBBBB",
     ]);
+  }),
+);
+
+it.effect("picks search matches by the ids it printed, never by position", () =>
+  Effect.gen(function* () {
+    const drive = fakeDriveRoutes();
+    const client = {
+      driveCall: drive.driveCall,
+      listProjectIds: () => Effect.die("not reached"),
+    } as unknown as T3LocalClient;
+    const error = yield* runLiveDriver(
+      {
+        origin: "http://127.0.0.1:1",
+        pairingToken: undefined,
+        projectId: "usba",
+        model: undefined,
+        title: "x",
+        prompt: "y",
+        listProjects: false,
+        driveSearch: "brief",
+        pick: ["someOtherFile123"],
+      },
+      {
+        client,
+        clock: () => CLOCK,
+        write: () => undefined,
+        sleep: () => Effect.void,
+        readRepoCommit: () => Promise.resolve(SHA),
+      },
+    ).pipe(Effect.flip);
+    assert.match(error.message, /--pick someOtherFile123: not among the 2 matches/);
   }),
 );
 

@@ -25,6 +25,7 @@ import {
   type DriveFile,
   type DriveListedFile,
   DriveApiError,
+  type ListRecursiveOptions,
   FOLDER_MIME,
   parseDriveRef,
 } from "./DriveApi.ts";
@@ -164,12 +165,16 @@ export interface ResolvedRef {
 }
 
 /** A link or id → the file, or every file under the folder (recursive). */
-export const resolveRef = async (api: DriveApi, ref: string): Promise<ResolvedRef> => {
+export const resolveRef = async (
+  api: DriveApi,
+  ref: string,
+  options?: ListRecursiveOptions,
+): Promise<ResolvedRef> => {
   const id = parseDriveRef(ref);
   if (id === null) throw new DriveApiError(`Not a Google Drive link or id: ${ref}`);
   const root = await api.resolve(await api.getFile(id));
   if (root.mimeType === FOLDER_MIME) {
-    return { ref, root, files: await api.listRecursive(root.id) };
+    return { ref, root, files: await api.listRecursive(root.id, options) };
   }
   return { ref, root, files: [{ ...root, path: root.name }] };
 };
@@ -207,7 +212,8 @@ export const buildSnapshot = async (input: {
   if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(input.taskId)) {
     throw new DriveApiError(`Invalid task id: ${input.taskId}`);
   }
-  const relRoot = `${DRIVE_SNAPSHOT_DIR}/${input.taskId.replaceAll(":", "_")}`;
+  // One folder per task id, never shared: "_" and ":" are both escaped.
+  const relRoot = `${DRIVE_SNAPSHOT_DIR}/${input.taskId.replaceAll("_", "_5f").replaceAll(":", "_3a")}`;
   const absRoot = path.join(input.worktree, ...relRoot.split("/"));
   await assertNoSymlinks(input.worktree, relRoot);
   // A snapshot is immutable: never overwrite one a task already points at.
@@ -270,7 +276,8 @@ export const buildSnapshot = async (input: {
           hashes.originalSha256 = await fileSha(path.join(temporary, target));
         }
         if (stored.textPath !== null) {
-          const target = `${stem}.txt`;
+          // Its own suffix, so it never meets an original named *.txt.
+          const target = `${stem}.text.txt`;
           await fs.copyFile(stored.textPath, path.join(temporary, target));
           await fs.chmod(path.join(temporary, target), 0o444);
           text = `${relRoot}/${target}`;

@@ -42,14 +42,20 @@ export const readCompoundFile = (bytes: Uint8Array): CompoundFile => {
     if (id <= MAX_REGULAR_SECTOR) fatSectors.push(id);
   }
   let difat = dv.getUint32(0x44, true);
-  for (let guard = 0; difat <= MAX_REGULAR_SECTOR; guard += 1) {
-    if (guard > sectorCount) throw new Error("Broken sector chain.");
+  const difatSeen = new Set<number>();
+  while (difat <= MAX_REGULAR_SECTOR) {
+    if (difatSeen.has(difat)) throw new Error("Broken sector chain.");
+    difatSeen.add(difat);
     const data = view(sector(difat));
     for (let i = 0; i < perSector - 1; i += 1) {
       const id = data.getUint32(i * 4, true);
       if (id <= MAX_REGULAR_SECTOR) fatSectors.push(id);
     }
     difat = data.getUint32((perSector - 1) * 4, true);
+  }
+  // Each FAT sector once, and no more of them than the file holds.
+  if (new Set(fatSectors).size !== fatSectors.length || fatSectors.length > sectorCount) {
+    throw new Error("Broken sector table.");
   }
   const fat: number[] = [];
   for (const id of fatSectors) {
