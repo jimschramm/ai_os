@@ -165,19 +165,30 @@ export const makeDriveApi = (
     return getFile(target);
   };
 
-  const listQuery = async (q: string, extra: Record<string, string> = {}, limit = Infinity) => {
+  const listQuery = async (
+    q: string,
+    extra: Record<string, string> = {},
+    limit = Infinity,
+    /** Set for folder listings: a partial answer would silently drop files. */
+    complete: string | null = null,
+  ) => {
     const files: DriveFile[] = [];
     let pageToken: string | undefined;
     do {
       const page = await json("/files", {
         q,
-        fields: `nextPageToken,files(${FILE_FIELDS})`,
+        fields: `nextPageToken,incompleteSearch,files(${FILE_FIELDS})`,
         pageSize: String(Math.min(1000, limit)),
         includeItemsFromAllDrives: "true",
         corpora: "allDrives",
         ...extra,
         ...(pageToken === undefined ? {} : { pageToken }),
       });
+      if (complete !== null && page.incompleteSearch === true) {
+        throw new DriveApiError(
+          `Drive returned an incomplete listing of ${complete}; nothing was skipped silently. Run it again.`,
+        );
+      }
       for (const raw of (page.files as Record<string, unknown>[] | undefined) ?? []) {
         files.push(toFile(raw));
       }
@@ -186,8 +197,32 @@ export const makeDriveApi = (
     return files.slice(0, limit);
   };
 
-  const listChildren = (folderId: string) =>
-    listQuery(`${quoteQuery(folderId)} in parents and trashed = false`, { orderBy: "folder,name" });
+  // A folder is listed in its own corpus (its shared drive, or the user's
+  // files), not across all drives, where Drive may answer only in part.
+  const driveIds = new Map<string, Promise<string | undefined>>();
+  const driveIdOf = (folderId: string) => {
+    let known = driveIds.get(folderId);
+    if (known === undefined) {
+      known = getFile(folderId).then(
+        (file) => file.driveId,
+        () => undefined,
+      );
+      driveIds.set(folderId, known);
+    }
+    return known;
+  };
+  const corpusOf = async (folderId: string): Promise<Record<string, string>> => {
+    const driveId = await driveIdOf(folderId);
+    return driveId === undefined ? { corpora: "user" } : { corpora: "drive", driveId };
+  };
+
+  const listChildren = async (folderId: string) =>
+    listQuery(
+      `${quoteQuery(folderId)} in parents and trashed = false`,
+      { orderBy: "folder,name", ...(await corpusOf(folderId)) },
+      Infinity,
+      `folder ${folderId}`,
+    );
 
   const listRecursive = async (folderId: string, options: ListRecursiveOptions = {}) => {
     const out: DriveListedFile[] = [];
@@ -210,6 +245,7 @@ export const makeDriveApi = (
           // A shortcut loop or a folder linked twice is walked once.
           if (seen.has(file.id)) continue;
           seen.add(file.id);
+          if (!driveIds.has(file.id)) driveIds.set(file.id, Promise.resolve(file.driveId));
           await walk(file.id, `${path}/`);
         } else if (!seen.has(file.id)) {
           seen.add(file.id);
@@ -249,7 +285,10 @@ export const makeDriveApi = (
   const findChildFolder = async (parentId: string, name: string) => {
     const found = await listQuery(
       `${quoteQuery(parentId)} in parents and name = ${quoteQuery(name)} and mimeType = '${FOLDER_MIME}' and trashed = false`,
-      { orderBy: "createdTime" },
+      { orderBy: "createdTime", ...(await corpusOf(parentId)) },
+      Infinity,
+      // A partial answer here could make a duplicate project folder.
+      `folder ${parentId}`,
     );
     return found[0] ?? null;
   };

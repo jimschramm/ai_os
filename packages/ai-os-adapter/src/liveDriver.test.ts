@@ -166,8 +166,50 @@ const makeServer = () => {
       contentType: "application/json",
     });
   });
+  // Drive routes behind a "proxy" that answers 503, an HTML 502 and 504 while
+  // the server restarts, then the resumed job's result.
+  const drive = { starts: 0, polledIds: [] as string[], taskId: "", refs: [] as string[] };
+  const outageAnswers = [
+    HttpServerResponse.text("Service Unavailable", { status: 503 }),
+    HttpServerResponse.text("<html>Bad Gateway</html>", { status: 502, contentType: "text/html" }),
+    HttpServerResponse.text("Gateway Timeout", { status: 504 }),
+  ];
+  const driveJson = (body: unknown) =>
+    HttpServerResponse.text(JSON.stringify(body), { contentType: "application/json" });
+  const driveStart = HttpRouter.add(
+    "POST",
+    "/api/drive/snapshot",
+    Effect.gen(function* () {
+      const request = yield* HttpServerRequest.HttpServerRequest;
+      const body = JSON.parse(yield* request.text.pipe(Effect.orElseSucceed(() => "{}")));
+      drive.starts += 1;
+      drive.taskId = String(body.taskId);
+      drive.refs = body.refs;
+      return driveJson({ jobId: "job-http" });
+    }),
+  );
+  const driveStatus = HttpRouter.add(
+    "POST",
+    "/api/drive/snapshot/status",
+    Effect.gen(function* () {
+      const request = yield* HttpServerRequest.HttpServerRequest;
+      const body = JSON.parse(yield* request.text.pipe(Effect.orElseSucceed(() => "{}")));
+      drive.polledIds.push(String(body.jobId));
+      const outage = outageAnswers.shift();
+      if (outage !== undefined) return outage;
+      return driveJson({ state: "done", manifest: driveManifestFor(drive.taskId, drive.refs) });
+    }),
+  );
+  const driveVerify = HttpRouter.add(
+    "POST",
+    "/api/drive/verify",
+    Effect.succeed(driveJson({ problem: null })),
+  );
   const layer = HttpRouter.serve(
     Layer.mergeAll(
+      driveStart,
+      driveStatus,
+      driveVerify,
       HttpRouter.add("POST", "/oauth/token", tokenRoute),
       HttpRouter.add("GET", "/api/projects", projectsRoute),
       HttpRouter.add("GET", ADAPTER_BOARD_PATH, boardGet),
@@ -193,11 +235,15 @@ const makeServer = () => {
     ),
     { disableListenLog: true, disableLogger: true },
   ).pipe(Layer.provideMerge(NodeHttpServer.layerTest));
-  return { layer, exchanges: () => exchanges };
+  return { layer, exchanges: () => exchanges, drive };
 };
 
 const withServer = <A, E, R>(
-  use: (origin: string, exchanges: () => number) => Effect.Effect<A, E, R>,
+  use: (
+    origin: string,
+    exchanges: () => number,
+    drive: ReturnType<typeof makeServer>["drive"],
+  ) => Effect.Effect<A, E, R>,
 ) => {
   const server = makeServer();
   return Effect.gen(function* () {
@@ -206,7 +252,7 @@ const withServer = <A, E, R>(
     if (url.hostname === "[::]" || url.hostname === "::" || url.hostname === "0.0.0.0") {
       url.hostname = "127.0.0.1";
     }
-    return yield* use(url.origin, server.exchanges);
+    return yield* use(url.origin, server.exchanges, server.drive);
   }).pipe(Effect.provide(server.layer));
 };
 
@@ -1292,6 +1338,59 @@ it.effect(
       assert.strictEqual(drive.calls.filter((call) => call.route === "snapshot").length, 1);
       assert.ok(lines.filter((line) => line.startsWith("drive: server unavailable")).length >= 9);
     }),
+);
+
+it.effect("rides out proxy 503/502/504 answers on the same snapshot job, over HTTP", () =>
+  withServer((origin, _exchanges, served) =>
+    Effect.gen(function* () {
+      let launches = 0;
+      const real = wsT3LocalClient({ origin, pairingToken: PAIR });
+      const client: T3LocalClient = {
+        ...real,
+        listProviderModels: () => Effect.succeed(CATALOG),
+        interrupt: () => Effect.die("interrupt is unused"),
+        continueRun: () => Effect.die("continue is unused"),
+        launch: () => {
+          launches += 1;
+          return Effect.succeed({ threadId: `thread-${launches}`, runId: "run-1", resumed: false });
+        },
+        read: (threadId) =>
+          Effect.succeed({
+            threadId,
+            runId: "run-1",
+            status: "completed",
+            text: "done",
+            revision: null,
+          }),
+      };
+      let tick = 0;
+      yield* runLiveDriver(
+        {
+          origin,
+          pairingToken: PAIR,
+          projectId: "usba",
+          model: undefined,
+          title: "Review",
+          prompt: "Score this document.",
+          listProjects: false,
+          drive: ["sharedCCCCCCCC"],
+        },
+        {
+          client,
+          clock: () => `2026-10-21T21:00:${String(tick++ % 60).padStart(2, "0")}.000Z`,
+          write: () => undefined,
+          sleep: () => Effect.void,
+          readRepoCommit: () => Promise.resolve(SHA),
+          pollIntervalMs: 0,
+          maxPolls: 3,
+        },
+      );
+      assert.strictEqual(served.starts, 1);
+      assert.deepStrictEqual([...new Set(served.polledIds)], ["job-http"]);
+      assert.ok(served.polledIds.length >= 4);
+      assert.strictEqual(launches, 1);
+    }),
+  ),
 );
 
 it.effect("stops a folder run when it loses track of a launched task", () =>

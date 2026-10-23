@@ -115,15 +115,21 @@ const makeCfb = (
     return { blockName, padded };
   });
   const data = new Uint8Array(blocks.reduce((sum, b) => sum + b.padded.length, 0));
+  const dataSectors = data.length / SECTOR;
+  // As many FAT sectors as the file needs (up to the 109 the header lists).
+  let fatSectors = 1;
+  while (fatSectors * 128 < fatSectors + 1 + dataSectors) fatSectors += 1;
+  if (fatSectors > 109) throw new Error("test file too large");
+  const dirSector = fatSectors;
+  const firstData = fatSectors + 1;
   const starts: number[] = [];
   let filled = 0;
   for (const b of blocks) {
-    starts.push(2 + filled / SECTOR);
+    starts.push(firstData + filled / SECTOR);
     data.set(b.padded, filled);
     filled += b.padded.length;
   }
-  const dataSectors = data.length / SECTOR;
-  const out = new Uint8Array(SECTOR * (3 + dataSectors));
+  const out = new Uint8Array(SECTOR * (1 + firstData + dataSectors));
   const dv = new DataView(out.buffer);
   out.set([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]);
   dv.setUint16(0x18, 0x3e, true);
@@ -131,21 +137,23 @@ const makeCfb = (
   dv.setUint16(0x1c, 0xfffe, true);
   dv.setUint16(0x1e, 9, true);
   dv.setUint16(0x20, 6, true);
-  dv.setUint32(0x2c, 1, true);
-  dv.setUint32(0x30, 1, true);
+  dv.setUint32(0x2c, fatSectors, true);
+  dv.setUint32(0x30, dirSector, true);
   dv.setUint32(0x38, 4096, true);
   dv.setUint32(0x3c, 0xfffffffe, true);
   dv.setUint32(0x44, 0xfffffffe, true);
-  for (let i = 0; i < 109; i += 1) dv.setUint32(0x4c + i * 4, i === 0 ? 0 : 0xffffffff, true);
-  const fat = SECTOR; // sector 0
-  for (let i = 0; i < 128; i += 1) dv.setUint32(fat + i * 4, 0xffffffff, true);
-  dv.setUint32(fat, 0xfffffffd, true);
-  dv.setUint32(fat + 4, 0xfffffffe, true);
+  for (let i = 0; i < 109; i += 1)
+    dv.setUint32(0x4c + i * 4, i < fatSectors ? i : 0xffffffff, true);
+  const fat = SECTOR; // FAT sectors start at sector 0
+  for (let i = 0; i < fatSectors * 128; i += 1) dv.setUint32(fat + i * 4, 0xffffffff, true);
+  for (let i = 0; i < fatSectors; i += 1) dv.setUint32(fat + i * 4, 0xfffffffd, true);
+  dv.setUint32(fat + dirSector * 4, 0xfffffffe, true);
   for (let s = 0; s < dataSectors; s += 1) {
-    const last = starts.includes(3 + s) || s === dataSectors - 1;
-    dv.setUint32(fat + (2 + s) * 4, last ? 0xfffffffe : 3 + s, true);
+    const sector = firstData + s;
+    const last = starts.includes(sector + 1) || s === dataSectors - 1;
+    dv.setUint32(fat + sector * 4, last ? 0xfffffffe : sector + 1, true);
   }
-  const dir = SECTOR * 2; // sector 1
+  const dir = SECTOR * (1 + dirSector);
   const entry = (index: number, entryName: string, type: number, start: number, size: number) => {
     const base = dir + index * 128;
     for (let c = 0; c < entryName.length; c += 1)
@@ -157,7 +165,7 @@ const makeCfb = (
   };
   entry(0, "Root Entry", 5, 0xfffffffe, 0);
   blocks.forEach((b, i) => entry(1 + i, b.blockName, 2, starts[i]!, b.padded.length));
-  out.set(data, SECTOR * 3);
+  out.set(data, SECTOR * (1 + firstData));
   return out;
 };
 
@@ -496,5 +504,26 @@ describe("record bounds", () => {
       extractPpt(makeCfb("PowerPoint Document", new Uint8Array(bytes)));
     expect(ppt(container(11, atom("abc")))).toContain("abc");
     expect(() => ppt(container(4, atom("abc")))).toThrow(/No slide text/);
+  });
+
+  it("reads a container holding more text atoms than a call can take as arguments", () => {
+    const count = 300_000;
+    const letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    // Four distinct letters per atom, so no two atoms repeat.
+    const word = (k: number) =>
+      [0, 1, 2, 3].map((d) => letters[Math.floor(k / 52 ** d) % 52]!).join("");
+    const body = new Uint8Array(count * 12);
+    for (let k = 0; k < count; k += 1) {
+      // TextBytesAtom (0x0fa8) of four characters.
+      body.set([0, 0, 0xa8, 0x0f, 4, 0, 0, 0, ...[...word(k)].map((c) => c.charCodeAt(0))], k * 12);
+    }
+    const stream = new Uint8Array(8 + body.length);
+    new DataView(stream.buffer).setUint32(4, body.length, true);
+    stream.set([0x0f, 0x00, 0xf0, 0x0f], 0);
+    stream.set(body, 8);
+    const text = extractPpt(makeCfb("PowerPoint Document", stream));
+    expect(text).toContain(word(0));
+    expect(text).toContain(word(count - 1));
+    expect(text.split("\n").filter((line) => line.length === 4).length).toBe(count);
   });
 });

@@ -710,16 +710,27 @@ export const wsT3LocalClient = (options: T3ClientOptions): T3LocalClient => {
           Effect.orElseSucceed((): unknown => null),
         );
         if (response.status >= 400) {
-          const detail =
+          const serverError =
             typeof parsed === "object" &&
             parsed !== null &&
             "error" in parsed &&
             typeof parsed.error === "string"
               ? parsed.error
-              : `Drive ${route} failed (${response.status}).`;
+              : null;
+          // A restarting server behind a proxy answers 503/504, or a 502 that is
+          // not the Drive routes' own JSON error: the server is unavailable, not refusing.
+          const unavailableNow =
+            response.status === 503 ||
+            response.status === 504 ||
+            (response.status === 502 && serverError === null);
           return yield* new GrokT3Error({
-            reason: response.status === 401 ? "unauthenticated" : "t3_rejected",
-            detail,
+            reason:
+              response.status === 401
+                ? "unauthenticated"
+                : unavailableNow
+                  ? "t3_unavailable"
+                  : "t3_rejected",
+            detail: serverError ?? `Drive ${route} failed (${response.status}).`,
           });
         }
         return parsed;

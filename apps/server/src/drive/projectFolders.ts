@@ -133,7 +133,7 @@ export const isInsideFolders = async (
       if (seen.has(current)) continue;
       seen.add(current);
       const file = await api.getFile(current).catch(() => null);
-      next.push(...(file?.parents ?? []));
+      for (const parent of file?.parents ?? []) next.push(parent);
     }
     frontier = next;
   }

@@ -105,6 +105,51 @@ describe("makeDriveApi", () => {
     }
   });
 
+  it("lists each folder in its own corpus and refuses an incomplete listing", async () => {
+    const drive = fakeDrive(
+      {
+        mine1: [{ id: "shared1", name: "Team", mimeType: FOLDER_MIME, driveId: "sd1" }],
+        shared1: [{ id: "f9", name: "c.txt", mimeType: "text/plain", size: "1" }],
+      },
+      { mine1: { id: "mine1", name: "Mine", mimeType: FOLDER_MIME } },
+    );
+    const api = makeDriveApi(credentials, drive.fetch);
+    expect((await api.listRecursive("mine1")).map((file) => file.path)).toEqual(["Team/c.txt"]);
+    const lists = drive.calls.filter((call) => call.url.searchParams.has("q"));
+    expect(
+      lists.map((call) => [
+        call.url.searchParams.get("corpora"),
+        call.url.searchParams.get("driveId"),
+      ]),
+    ).toEqual([
+      ["user", null],
+      ["drive", "sd1"],
+    ]);
+    expect(lists[0]!.url.searchParams.get("fields")).toContain("incompleteSearch");
+
+    // Drive says it answered only in part: the listing fails rather than dropping files.
+    const partial = async (raw: string, init: RequestInit) => {
+      const url = new URL(raw);
+      if (url.hostname === "oauth2.googleapis.com") {
+        return new Response(JSON.stringify({ access_token: "a", expires_in: 3600 }));
+      }
+      if (url.searchParams.has("q")) {
+        return new Response(
+          JSON.stringify({
+            incompleteSearch: true,
+            files: [{ id: "f1", name: "a.txt", mimeType: "text/plain" }],
+          }),
+        );
+      }
+      return drive.fetch(raw, init);
+    };
+    const incomplete = makeDriveApi(credentials, partial);
+    await expect(incomplete.listRecursive("mine1")).rejects.toThrow(/incomplete listing/);
+    await expect(incomplete.findChildFolder("mine1", "inputs")).rejects.toThrow(
+      /incomplete listing/,
+    );
+  });
+
   it("skips shortcuts the caller does not follow, and reports them", async () => {
     const drive = fakeDrive(
       {

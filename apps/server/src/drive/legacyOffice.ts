@@ -560,13 +560,14 @@ export const extractPpt = (bytes: Uint8Array) => {
       .replace(/[\r\v]/g, "\n")
       .trim();
   /** Text atoms inside a container, in order. */
-  const textsIn = (start: number, end: number, depth = 0): string[] => {
-    const out: string[] = [];
+  // Nested containers append into one array: spreading a large result into
+  // push() would exceed the engine's argument limit.
+  const textsIn = (start: number, end: number, depth = 0, out: string[] = []): string[] => {
     for (let at = start; at + 8 <= end && depth < 64;) {
       const record = header(at);
       // A record may not run past its container.
       if (record === null || record.next <= at || record.next > end) break;
-      if (record.version === 0x0f) out.push(...textsIn(record.body, record.next, depth + 1));
+      if (record.version === 0x0f) textsIn(record.body, record.next, depth + 1, out);
       else if (record.type === 0x0fa0 || record.type === 0x0fa8) {
         const text = textOf(record.type, record.body, record.next);
         if (text.length > 0) out.push(text);
