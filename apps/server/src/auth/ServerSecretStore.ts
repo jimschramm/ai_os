@@ -207,7 +207,11 @@ export const make = Effect.gen(function* () {
           yield* fileSystem.chmod(secretPath, 0o600);
         }).pipe(
           Effect.catch((cause) =>
-            fileSystem.remove(tempPath).pipe(
+            // A temp path that already existed belongs to someone else; keep it.
+            (isPlatformError(cause) && cause.reason._tag === "AlreadyExists"
+              ? Effect.void
+              : fileSystem.remove(tempPath)
+            ).pipe(
               Effect.ignore,
               Effect.flatMap(() =>
                 Effect.fail(

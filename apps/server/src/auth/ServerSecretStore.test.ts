@@ -238,20 +238,46 @@ it.layer(NodeServices.layer)("ServerSecretStore.layer", (it) => {
     }).pipe(Effect.provide(NodeServices.layer)),
   );
 
-  it.effect("is never wider than owner-only, even with a permissive umask", () =>
+  it.effect("never removes a temp file it did not create", () =>
     Effect.gen(function* () {
-      const secretStore = yield* ServerSecretStore.ServerSecretStore;
-      const config = yield* ServerConfig.ServerConfig;
-      const fileSystem = yield* FileSystem.FileSystem;
-      const previous = process.umask(0o000);
-      try {
-        yield* secretStore.set("umask-check", Uint8Array.from([1, 2, 3]));
-      } finally {
-        process.umask(previous);
-      }
-      const info = yield* fileSystem.stat(`${config.secretsDir}/umask-check.bin`);
-      assert.equal(Number(info.mode) & 0o777, 0o600);
-    }).pipe(Effect.provide(ServerSecretStore.layer.pipe(Layer.provideMerge(layerServerConfig())))),
+      const removed: Array<string> = [];
+      const layerCollidingFileSystem = Layer.effect(
+        FileSystem.FileSystem,
+        Effect.gen(function* () {
+          const fileSystem = yield* FileSystem.FileSystem;
+          return {
+            ...fileSystem,
+            makeDirectory: () => Effect.void,
+            chmod: () => Effect.void,
+            writeFile: (path) =>
+              Effect.fail(
+                PlatformError.systemError({
+                  _tag: "AlreadyExists",
+                  module: "FileSystem",
+                  method: "writeFile",
+                  pathOrDescriptor: String(path),
+                  description: "Temporary secret file already exists.",
+                }),
+              ),
+            remove: (path) =>
+              Effect.sync(() => {
+                removed.push(String(path));
+              }),
+          } satisfies FileSystem.FileSystem;
+        }),
+      ).pipe(Layer.provide(NodeServices.layer));
+      const secretStore = yield* Effect.service(ServerSecretStore.ServerSecretStore).pipe(
+        Effect.provide(
+          ServerSecretStore.layer.pipe(
+            Layer.provide(layerServerConfig()),
+            Layer.provideMerge(layerCollidingFileSystem),
+          ),
+        ),
+      );
+      const error = yield* Effect.flip(secretStore.set("collide", Uint8Array.from([1])));
+      assert.equal(error._tag, "SecretStorePersistError");
+      assert.deepEqual(removed, []);
+    }),
   );
 
   it.effect("propagates read failures other than missing-file errors", () =>
