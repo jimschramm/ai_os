@@ -188,6 +188,11 @@ it.layer(NodeServices.layer)("ServerSecretStore.layer", (it) => {
   it.effect("uses restrictive permissions for the secret directory and files", () =>
     Effect.gen(function* () {
       const chmodCalls: Array<{ readonly path: string; readonly mode: number }> = [];
+      const writeCalls: Array<{
+        readonly path: string;
+        readonly flag: string | undefined;
+        readonly mode: number | undefined;
+      }> = [];
       const layerRecordingFileSystem = Layer.effect(
         FileSystem.FileSystem,
         Effect.gen(function* () {
@@ -196,7 +201,10 @@ it.layer(NodeServices.layer)("ServerSecretStore.layer", (it) => {
           return {
             ...fileSystem,
             makeDirectory: () => Effect.void,
-            writeFile: () => Effect.void,
+            writeFile: (path, _data, options) =>
+              Effect.sync(() => {
+                writeCalls.push({ path: String(path), flag: options?.flag, mode: options?.mode });
+              }),
             rename: () => Effect.void,
             chmod: (path, mode) =>
               Effect.sync(() => {
@@ -221,7 +229,29 @@ it.layer(NodeServices.layer)("ServerSecretStore.layer", (it) => {
         chmodCalls.some((call) => call.mode === 0o700 && /[\\/]secrets$/.test(call.path)),
       );
       assert.isAtLeast(chmodCalls.filter((call) => call.mode === 0o600).length, 2);
+      // The temporary file is created owner-only before any bytes land in it.
+      assert.deepEqual(
+        writeCalls.map(({ flag, mode }) => ({ flag, mode })),
+        [{ flag: "wx", mode: 0o600 }],
+      );
+      assert.match(writeCalls[0]!.path, /\.tmp$/);
     }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("is never wider than owner-only, even with a permissive umask", () =>
+    Effect.gen(function* () {
+      const secretStore = yield* ServerSecretStore.ServerSecretStore;
+      const config = yield* ServerConfig.ServerConfig;
+      const fileSystem = yield* FileSystem.FileSystem;
+      const previous = process.umask(0o000);
+      try {
+        yield* secretStore.set("umask-check", Uint8Array.from([1, 2, 3]));
+      } finally {
+        process.umask(previous);
+      }
+      const info = yield* fileSystem.stat(`${config.secretsDir}/umask-check.bin`);
+      assert.equal(Number(info.mode) & 0o777, 0o600);
+    }).pipe(Effect.provide(ServerSecretStore.layer.pipe(Layer.provideMerge(layerServerConfig())))),
   );
 
   it.effect("propagates read failures other than missing-file errors", () =>

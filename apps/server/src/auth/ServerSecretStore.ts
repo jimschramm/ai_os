@@ -199,7 +199,9 @@ export const make = Effect.gen(function* () {
       Effect.flatMap((uuid) => {
         const tempPath = `${secretPath}.${uuid}.tmp`;
         return Effect.gen(function* () {
-          yield* fileSystem.writeFile(tempPath, value);
+          // Created exclusively with owner-only mode, so the secret bytes are
+          // never readable by others, whatever the process umask is.
+          yield* fileSystem.writeFile(tempPath, value, { flag: "wx", mode: 0o600 });
           yield* fileSystem.chmod(tempPath, 0o600);
           yield* fileSystem.rename(tempPath, secretPath);
           yield* fileSystem.chmod(secretPath, 0o600);
