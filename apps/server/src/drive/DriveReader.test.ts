@@ -607,6 +607,38 @@ describe("snapshot safety", () => {
     expect(git(worktree, "status", "--porcelain", "--untracked-files=all")).toBe("?? .gitignore");
   });
 
+  it("writes and cleans up nothing outside the worktree when the snapshot folder is swapped mid-run", async () => {
+    const worktree = await temp();
+    const outside = await temp();
+    const { api } = tree();
+    let swapped = false;
+    const swapping = {
+      ...api,
+      download: async (id: string) => {
+        if (!swapped) {
+          swapped = true;
+          const drive = path.join(worktree, ".ai_os", "drive");
+          await fs.rename(drive, path.join(outside, "moved"));
+          await fs.symlink(path.join(outside, "moved"), drive);
+        }
+        return api.download(id);
+      },
+    };
+    await expect(
+      buildSnapshot({
+        api: swapping,
+        store: makeContentStore(await temp()),
+        worktree,
+        taskId: "t1",
+        refs: ["txt1-0000000"],
+      }),
+    ).rejects.toThrow(/changed while the Drive snapshot was being written/);
+    // The staging folder that was moved out is left as it was: empty, not written to or removed.
+    const [staged] = await fs.readdir(path.join(outside, "moved", ".tmp"));
+    expect(await fs.readdir(path.join(outside, "moved", ".tmp", staged!))).toEqual([]);
+    expect((await fs.readdir(path.join(outside, "moved"))).sort()).toEqual([".tmp"]);
+  });
+
   it("keeps snapshots out of git in a linked worktree too", async () => {
     const main = await temp();
     git(main, "init", "-q");

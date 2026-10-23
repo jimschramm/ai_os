@@ -350,6 +350,28 @@ export const buildSnapshot = async (input: {
   await assertNoSymlinks(input.worktree, `${DRIVE_SNAPSHOT_DIR}/.tmp`);
   await assertNoSymlinks(input.worktree, relRoot);
   await fs.mkdir(temporary);
+  // The folders the snapshot goes through, by identity: after each slow step
+  // (downloads) they must still be the same real folders, so a folder swapped
+  // for a symlink mid-run can't redirect a write, the publish or the cleanup.
+  const chain: Array<{ dir: string; dev: number; ino: number }> = [];
+  for (
+    let dir = temporary;
+    dir.length > input.worktree.length && dir.startsWith(input.worktree);
+    dir = path.dirname(dir)
+  ) {
+    const stat = await fs.lstat(dir);
+    chain.push({ dir, dev: stat.dev, ino: stat.ino });
+  }
+  const stillOurs = async () => {
+    for (const { dir, dev, ino } of chain) {
+      const stat = await fs.lstat(dir).catch(() => null);
+      if (stat === null || !stat.isDirectory() || stat.dev !== dev || stat.ino !== ino) {
+        throw new DriveApiError(
+          `${path.relative(input.worktree, dir)} changed while the Drive snapshot was being written; nothing was published.`,
+        );
+      }
+    }
+  };
   if (inGit) {
     // Staged copies too: checked (empty folder, so git sees a directory)
     // before anything is downloaded; git can't re-include files under an
@@ -391,6 +413,7 @@ export const buildSnapshot = async (input: {
         const hashes: Record<string, string> = {};
         if (stored.originalPath !== null) {
           const target = names.original;
+          await stillOurs();
           await fs.copyFile(stored.originalPath, path.join(temporary, target));
           await fs.chmod(path.join(temporary, target), 0o444);
           original = `${relRoot}/${target}`;
@@ -399,6 +422,7 @@ export const buildSnapshot = async (input: {
         if (stored.textPath !== null) {
           // Its own suffix, so it never meets an original named *.txt.
           const target = names.text;
+          await stillOurs();
           await fs.copyFile(stored.textPath, path.join(temporary, target));
           await fs.chmod(path.join(temporary, target), 0o444);
           text = `${relRoot}/${target}`;
@@ -450,6 +474,7 @@ export const buildSnapshot = async (input: {
       skippedShortcuts,
     };
     const manifestText = `${JSON.stringify(manifest, null, 2)}\n`;
+    await stillOurs();
     await fs.writeFile(path.join(temporary, "manifest.json"), manifestText, { mode: 0o444 });
     if (inGit) {
       // Every path the snapshot will have, checked by git itself: a .gitignore
@@ -461,6 +486,8 @@ export const buildSnapshot = async (input: {
       ]);
     }
     await input.onPublish?.(sha256Hex(manifestText));
+    await stillOurs();
+    await assertNoSymlinks(input.worktree, relRoot);
     await fs.rename(temporary, absRoot);
     return {
       manifestPath: path.join(absRoot, "manifest.json"),
@@ -475,7 +502,10 @@ export const buildSnapshot = async (input: {
       },
     };
   } catch (error) {
-    await fs.rm(temporary, { recursive: true, force: true }).catch(() => undefined);
+    // Cleanup only through the same folders; if they were swapped, leave it.
+    await stillOurs()
+      .then(() => fs.rm(temporary, { recursive: true, force: true }))
+      .catch(() => undefined);
     throw error;
   }
 };
