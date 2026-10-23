@@ -203,6 +203,25 @@ const updateViaServer = (origin: string, update: ProjectDriveUpdate) =>
   });
 
 /**
+ * Takes `lock` first and only then builds the settings layer, so settings are
+ * read inside the lock and no other writer can change them in between.
+ * Exported for the ordering test.
+ */
+export const updateUnderLock = <E, R, LE, LR>(
+  lock: Effect.Effect<void, E, R>,
+  settingsLayer: Layer.Layer<ServerSettings.ServerSettingsService, LE, LR>,
+  projectId: ProjectId,
+  resolved: ResolvedProjectDriveUpdate,
+) =>
+  Effect.gen(function* () {
+    yield* lock;
+    return yield* Effect.gen(function* () {
+      const settings = yield* ServerSettings.ServerSettingsService;
+      return yield* settings.updateProjectDrive(projectId, resolved);
+    }).pipe(Effect.provide(settingsLayer));
+  }).pipe(Effect.scoped);
+
+/**
  * With no server reachable, take the same exclusive ownership lock a server
  * takes at start, so no server can write settings while this one does.
  */
@@ -211,8 +230,8 @@ const updateOffline = (
   projectId: ProjectId,
   resolved: ResolvedProjectDriveUpdate,
 ) =>
-  Effect.gen(function* () {
-    yield* ServerOwnership.acquireServerOwnership(config.serverRuntimeStatePath).pipe(
+  updateUnderLock(
+    ServerOwnership.acquireServerOwnership(config.serverRuntimeStatePath).pipe(
       Effect.provide(ProcessRunner.layer),
       Effect.mapError((error) =>
         error._tag === "ServerAlreadyRunningError"
@@ -221,20 +240,16 @@ const updateOffline = (
             )
           : userError(error.message),
       ),
-    );
-    yield* clearPersistedServerRuntimeState(config.serverRuntimeStatePath);
-    const settings = yield* ServerSettings.ServerSettingsService;
-    return yield* settings.updateProjectDrive(projectId, resolved);
-  }).pipe(
-    Effect.scoped,
-    Effect.provide(
-      ServerSettings.layer.pipe(
-        Layer.provide(ServerSecretStore.layer),
-        Layer.provide(SqlitePersistence.layerConfig),
-        Layer.provide(ServerConfig.layer(config)),
-        Layer.provide(Layer.succeed(References.MinimumLogLevel, "Error")),
-      ),
+      Effect.andThen(clearPersistedServerRuntimeState(config.serverRuntimeStatePath)),
     ),
+    ServerSettings.layer.pipe(
+      Layer.provide(ServerSecretStore.layer),
+      Layer.provide(SqlitePersistence.layerConfig),
+      Layer.provide(ServerConfig.layer(config)),
+      Layer.provide(Layer.succeed(References.MinimumLogLevel, "Error")),
+    ),
+    projectId,
+    resolved,
   );
 
 const projectCommand = Command.make("project", {

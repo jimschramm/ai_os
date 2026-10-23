@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vite-plus/test";
 import { ProjectId, applyProjectDriveUpdate, resolveProjectDriveUpdate } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Layer from "effect/Layer";
 
 import * as ServerSettings from "../serverSettings.ts";
+import { updateUnderLock } from "./drive.ts";
 
 const ID = "1AbCdEfGhIjKlMnOpQrStUvWxYz_-12345";
 const OTHER = "0ZyXwVuTsRqPoNmLkJiHgFeDcBa_-98765";
@@ -70,5 +72,28 @@ describe("ServerSettingsService.updateProjectDrive", () => {
       defaultAutoPull: true,
       drive: { enabled: true, outputFolderId: ID, inputFolderId: OTHER },
     });
+  });
+});
+
+describe("offline drive project", () => {
+  it("reads settings only after the ownership lock is held", async () => {
+    const order: string[] = [];
+    const lock = Effect.acquireRelease(
+      Effect.sync(() => order.push("lock")),
+      () => Effect.sync(() => order.push("unlock")),
+    ).pipe(Effect.asVoid);
+    const settingsLayer = Layer.effectDiscard(Effect.sync(() => order.push("load settings"))).pipe(
+      Layer.provideMerge(ServerSettings.layerTest()),
+    );
+    const drive = await Effect.runPromise(
+      updateUnderLock(lock, settingsLayer, ProjectId.make("p-lock-test"), {
+        outputFolderId: ID,
+        clearInput: false,
+        clearOutput: false,
+        disable: false,
+      }),
+    );
+    expect(drive).toEqual({ enabled: true, outputFolderId: ID });
+    expect(order).toEqual(["lock", "load settings", "unlock"]);
   });
 });
