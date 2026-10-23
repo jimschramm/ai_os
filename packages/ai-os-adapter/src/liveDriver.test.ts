@@ -853,7 +853,7 @@ const driveManifestFor = (taskId: string, ids: readonly string[]) => ({
 });
 
 /** Fake Drive routes: records calls; snapshot jobs finish on the second poll. */
-const fakeDriveRoutes = (options: { problem?: string } = {}) => {
+const fakeDriveRoutes = (options: { problem?: unknown } = {}) => {
   const calls: Array<{ route: string; body: Record<string, unknown> }> = [];
   const jobs = new Map<string, { taskId: string; refs: string[]; polls: number }>();
   const driveCall: NonNullable<T3LocalClient["driveCall"]> = (route, body) => {
@@ -910,7 +910,7 @@ const fakeDriveRoutes = (options: { problem?: string } = {}) => {
         );
       }
       case "verify":
-        return Effect.succeed({ problem: options.problem ?? null });
+        return Effect.succeed({ problem: "problem" in options ? options.problem : null });
     }
   };
   return { calls, driveCall };
@@ -1112,53 +1112,57 @@ it.effect(
     ),
 );
 
-it.effect("does not launch when the Drive snapshot check fails", () =>
-  withServer((origin) =>
-    Effect.gen(function* () {
-      const drive = fakeDriveRoutes({ problem: "The Drive snapshot .ai_os/drive/x is missing." });
-      let launched = 0;
-      const real = wsT3LocalClient({ origin, pairingToken: PAIR });
-      const client: T3LocalClient = {
-        listProjectIds: real.listProjectIds,
-        listProviderModels: () => Effect.succeed(CATALOG),
-        publishBoard: real.publishBoard,
-        publishEvent: real.publishEvent,
-        readBoard: real.readBoard,
-        interrupt: () => Effect.die("unused"),
-        continueRun: () => Effect.die("unused"),
-        launch: () => {
-          launched += 1;
-          return Effect.die("must not launch");
-        },
-        read: () => Effect.die("unused"),
-        driveCall: drive.driveCall,
-      };
-      const exit = yield* Effect.exit(
-        runLiveDriver(
-          {
-            origin,
-            pairingToken: PAIR,
-            projectId: "usba",
-            model: undefined,
-            title: "One",
-            prompt: "Read it.",
-            listProjects: false,
-            drive: ["fileAAAAAAAAAA"],
-          },
-          {
-            client,
-            clock: () => CLOCK,
-            write: () => undefined,
-            sleep: () => Effect.void,
-            readRepoCommit: () => Promise.resolve(SHA),
-          },
-        ),
-      );
-      assert.equal(Exit.isFailure(exit), true);
-      assert.strictEqual(launched, 0);
-    }),
-  ),
-);
+for (const problem of ["The Drive snapshot .ai_os/drive/x is missing.", false, undefined, 0]) {
+  it.effect(
+    `does not launch when the Drive snapshot check answers ${JSON.stringify(problem)}`,
+    () =>
+      withServer((origin) =>
+        Effect.gen(function* () {
+          const drive = fakeDriveRoutes({ problem });
+          let launched = 0;
+          const real = wsT3LocalClient({ origin, pairingToken: PAIR });
+          const client: T3LocalClient = {
+            listProjectIds: real.listProjectIds,
+            listProviderModels: () => Effect.succeed(CATALOG),
+            publishBoard: real.publishBoard,
+            publishEvent: real.publishEvent,
+            readBoard: real.readBoard,
+            interrupt: () => Effect.die("unused"),
+            continueRun: () => Effect.die("unused"),
+            launch: () => {
+              launched += 1;
+              return Effect.die("must not launch");
+            },
+            read: () => Effect.die("unused"),
+            driveCall: drive.driveCall,
+          };
+          const exit = yield* Effect.exit(
+            runLiveDriver(
+              {
+                origin,
+                pairingToken: PAIR,
+                projectId: "usba",
+                model: undefined,
+                title: "One",
+                prompt: "Read it.",
+                listProjects: false,
+                drive: ["fileAAAAAAAAAA"],
+              },
+              {
+                client,
+                clock: () => CLOCK,
+                write: () => undefined,
+                sleep: () => Effect.void,
+                readRepoCommit: () => Promise.resolve(SHA),
+              },
+            ),
+          );
+          assert.equal(Exit.isFailure(exit), true);
+          assert.strictEqual(launched, 0);
+        }),
+      ),
+  );
+}
 
 it.effect("keeps polling the same snapshot job across a server restart", () =>
   withServer((origin) =>

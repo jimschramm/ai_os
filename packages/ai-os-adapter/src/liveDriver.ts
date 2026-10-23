@@ -415,8 +415,12 @@ const snapshotDrive = (
         );
         const check = yield* call("verify", { projectId, manifest });
         const problem = isRecord(check) ? check.problem : "unreadable check";
-        if (typeof problem === "string") {
-          return yield* new GrokT3Error({ reason: "invalid_task", detail: problem });
+        // Only an explicit null passes; anything else is a problem.
+        if (problem !== null) {
+          return yield* new GrokT3Error({
+            reason: "invalid_task",
+            detail: typeof problem === "string" ? problem : "unreadable check",
+          });
         }
         return manifest;
       }

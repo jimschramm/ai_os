@@ -572,8 +572,12 @@ export const createGrokT3Adapter = (input: {
         typeof check === "object" && check !== null && "problem" in check
           ? (check as { problem: unknown }).problem
           : "unreadable check";
-      if (typeof problem === "string") {
-        return yield* fail("invalid_task", `Drive snapshot check failed: ${problem}`);
+      // Only an explicit null passes; anything else is a problem.
+      if (problem !== null) {
+        return yield* fail(
+          "invalid_task",
+          `Drive snapshot check failed: ${typeof problem === "string" ? problem : "unreadable check"}`,
+        );
       }
     });
 
