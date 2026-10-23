@@ -263,6 +263,37 @@ describe("Drive routes", () => {
     expect((await waitDone(post, winner.body.jobId)).body.state).toBe("done");
   });
 
+  it("on shutdown stops and awaits a running job, which the next server resumes", async () => {
+    const stateDir = await temp();
+    const worktree = await worktreeRepo();
+    let release = () => {};
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const first = fakeDrive(gate);
+    const server = serve(stateDir, worktree, first.api);
+    const started = await server.post(DriveRoutes.DRIVE_SNAPSHOT_PATH, {
+      projectId: "usba",
+      taskId: "t-stop",
+      refs: [INPUTS],
+    });
+    for (let i = 0; i < 200 && !first.calls.some((call) => call.startsWith("download")); i += 1) {
+      await new Promise((done) => setTimeout(done, 10));
+    }
+    let disposed = false;
+    const closing = server.dispose().then(() => (disposed = true));
+    await new Promise((done) => setTimeout(done, 50));
+    // Still waiting for the job's download to come back.
+    expect(disposed).toBe(false);
+    release();
+    await closing;
+    const jobs = new DriveJobStore(path.join(stateDir, DRIVE_JOBS_DIR));
+    expect((await jobs.get(started.body.jobId))!.state).toBe("running");
+    // Nothing of the stopped run is left in staging.
+    const staging = path.join(worktree, ".ai_os", "drive", ".tmp");
+    expect(await fs.readdir(staging).catch(() => [])).toEqual([]);
+    const restarted = serve(stateDir, worktree, fakeDrive().api);
+    expect((await waitDone(restarted.post, started.body.jobId)).body.state).toBe("done");
+  });
+
   it("after a restart between publishing and saving done, resumes onto the pinned snapshot", async () => {
     const stateDir = await temp();
     const worktree = await worktreeRepo();

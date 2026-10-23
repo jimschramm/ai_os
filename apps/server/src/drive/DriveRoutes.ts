@@ -248,14 +248,17 @@ export const layerWith = (options: DriveRoutesOptions = {}) =>
           // A shortcut to something outside the project is not part of it: it is
           // listed as skipped, to attach by id if wanted.
           const skipped: Array<ReturnType<typeof publicFile>> = [];
+          const unresolved: Array<{ path: string; id: string; name: string; reason: string }> = [];
           const resolved = yield* fromPromise(() =>
             resolveRef(drive, target.id, {
               followShortcut: (target) => isInsideFolders(drive, target.id, roots),
               skipped: (target) => skipped.push(publicFile(target)),
+              unresolved: (shortcut) => unresolved.push(shortcut),
             }),
           );
           return {
             skipped,
+            unresolved,
             root: publicFile(resolved.root),
             totalFiles: resolved.files.length,
             totalBytes: resolved.files.reduce((sum, file) => sum + (file.size ?? 0), 0),
@@ -265,6 +268,16 @@ export const layerWith = (options: DriveRoutesOptions = {}) =>
       );
 
       const startLock = Semaphore.makeUnsafe(1);
+      // Jobs in flight. When the layer closes they are stopped (between files)
+      // and awaited, so a replacement server never resumes a job still running here.
+      const active = new Set<Promise<void>>();
+      const stopping = new AbortController();
+      yield* Effect.addFinalizer(() =>
+        Effect.promise(async () => {
+          stopping.abort();
+          await Promise.allSettled([...active]);
+        }),
+      );
 
       /** Runs (or resumes) a snapshot job, saving its state as it goes. */
       const runJob = (
@@ -274,6 +287,18 @@ export const layerWith = (options: DriveRoutesOptions = {}) =>
         folders: { readonly inputFolderId?: string; readonly outputFolderId?: string },
         resume: boolean,
       ) => {
+        const run = buildJob(job, worktree, drive, folders, resume);
+        active.add(run);
+        void run.finally(() => active.delete(run));
+        return run;
+      };
+      const buildJob = (
+        job: DriveJob,
+        worktree: string,
+        drive: DriveApi,
+        folders: { readonly inputFolderId?: string; readonly outputFolderId?: string },
+        resume: boolean,
+      ): Promise<void> => {
         // Inside an attached folder, a shortcut is read only when its target is in
         // the project's folders or in a folder attached to this task.
         let allowed: Promise<string[]> | undefined;
@@ -318,6 +343,7 @@ export const layerWith = (options: DriveRoutesOptions = {}) =>
               pinnedManifestSha256: manifestSha256,
             }),
           followShortcut,
+          signal: stopping.signal,
           onProgress: (done, total, current) => {
             // Progress is best effort; the final state is what counts.
             jobs.save({ ...job, state: "running", done, total, current }).catch(() => undefined);
@@ -326,6 +352,8 @@ export const layerWith = (options: DriveRoutesOptions = {}) =>
           .then(
             (result) => jobs.save({ ...job, state: "done", manifest: result.ref }),
             (cause: unknown) => {
+              // Stopped by shutdown: left "running" on disk, so the next start resumes it.
+              if (stopping.signal.aborted) return;
               const failed = classify(cause);
               return jobs.save({
                 ...job,

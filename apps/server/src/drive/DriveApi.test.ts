@@ -150,6 +150,39 @@ describe("makeDriveApi", () => {
     );
   });
 
+  it("never drops a shortcut it cannot follow silently", async () => {
+    const shortcut = (id: string, target: string) => ({
+      id,
+      name: `link-${target}`,
+      mimeType: SHORTCUT_MIME,
+      shortcutDetails: { targetId: target },
+    });
+    const drive = fakeDrive({
+      root1: [
+        { id: "f1", name: "a.txt", mimeType: "text/plain", size: "5" },
+        shortcut("sc1", "gone"),
+      ],
+      root2: [shortcut("sc2", "flaky")],
+    });
+    const api = makeDriveApi(credentials, async (raw: string, init: RequestInit) =>
+      new URL(raw).pathname.endsWith("/files/flaky")
+        ? new Response(JSON.stringify({ error: { message: "Bad request" } }), { status: 400 })
+        : drive.fetch(raw, init),
+    );
+    // Deleted or unshared target: reported with a reason, or the listing fails.
+    await expect(api.listRecursive("root1")).rejects.toThrow(/link-gone could not be followed/);
+    const unresolved: Array<{ path: string; reason: string }> = [];
+    const files = await api.listRecursive("root1", { unresolved: (s) => unresolved.push(s) });
+    expect(files.map((file) => file.path)).toEqual(["a.txt"]);
+    expect(unresolved).toEqual([
+      expect.objectContaining({ path: "link-gone", reason: expect.stringMatching(/deleted/) }),
+    ]);
+    // Any other failure fails the listing even with the callback.
+    await expect(api.listRecursive("root2", { unresolved: () => {} })).rejects.toThrow(
+      /Bad request/,
+    );
+  });
+
   it("skips shortcuts the caller does not follow, and reports them", async () => {
     const drive = fakeDrive(
       {

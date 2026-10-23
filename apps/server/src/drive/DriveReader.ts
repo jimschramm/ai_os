@@ -286,6 +286,8 @@ export const buildSnapshot = async (input: {
   readonly followShortcut?: (target: DriveFile) => Promise<boolean>;
   /** Called after each file with (done, total, Drive path). */
   readonly onProgress?: (done: number, total: number, drivePath: string) => void;
+  /** Stops the build between files (and before publishing); staging is cleaned up. */
+  readonly signal?: AbortSignal;
 }): Promise<SnapshotResult> => {
   if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(input.taskId)) {
     throw new DriveApiError(`Invalid task id: ${input.taskId}`);
@@ -333,13 +335,19 @@ export const buildSnapshot = async (input: {
     }
   }
   const skippedShortcuts: Array<{ path: string; id: string; name: string }> = [];
+  // Shortcuts whose target is deleted or not shared: recorded and counted as failed.
+  const unresolvedShortcuts: Array<{ path: string; id: string; name: string; reason: string }> = [];
+  const unresolved = (shortcut: (typeof unresolvedShortcuts)[number]) => {
+    unresolvedShortcuts.push(shortcut);
+  };
   const listOptions: ListRecursiveOptions =
     input.followShortcut === undefined
-      ? {}
+      ? { unresolved }
       : {
           followShortcut: input.followShortcut,
           skipped: (target) =>
             skippedShortcuts.push({ path: target.path, id: target.id, name: target.name }),
+          unresolved,
         };
   const resolved: ResolvedRef[] = [];
   for (const ref of input.refs) resolved.push(await resolveRef(input.api, ref, listOptions));
@@ -400,6 +408,7 @@ export const buildSnapshot = async (input: {
         if (seen.has(file.id)) continue;
         seen.add(file.id);
         index += 1;
+        input.signal?.throwIfAborted();
         const stored = await readDriveFile(input.api, input.store, file, {
           ...(input.pdfTimeoutMs === undefined ? {} : { pdfTimeoutMs: input.pdfTimeoutMs }),
         });
@@ -453,7 +462,8 @@ export const buildSnapshot = async (input: {
       }
     }
     const totalBytes = files.reduce((sum, file) => sum + file.bytes, 0);
-    const failedFiles = files.filter((file) => file.error !== undefined).length;
+    const failedFiles =
+      files.filter((file) => file.error !== undefined).length + unresolvedShortcuts.length;
     const manifest = {
       version: 1,
       taskId: input.taskId,
@@ -472,6 +482,8 @@ export const buildSnapshot = async (input: {
       files: full,
       // Shortcuts to files outside the project and the attached folders: not read.
       skippedShortcuts,
+      // Shortcuts that could not be followed (counted in failedFiles).
+      unresolvedShortcuts,
     };
     const manifestText = `${JSON.stringify(manifest, null, 2)}\n`;
     await stillOurs();
@@ -485,6 +497,7 @@ export const buildSnapshot = async (input: {
         ...entries.map((entry) => `${relRoot}/${entry.split(path.sep).join("/")}`),
       ]);
     }
+    input.signal?.throwIfAborted();
     await input.onPublish?.(sha256Hex(manifestText));
     await stillOurs();
     await assertNoSymlinks(input.worktree, relRoot);

@@ -66,6 +66,17 @@ export const quoteQuery = (value: string) =>
 export interface ListRecursiveOptions {
   readonly followShortcut?: (target: DriveFile) => Promise<boolean>;
   readonly skipped?: (target: DriveListedFile) => void;
+  /**
+   * Shortcuts whose target is gone or not shared (no target, HTTP 403/404),
+   * with the reason. Without this callback such a shortcut fails the listing,
+   * so it is never dropped silently. Other errors always fail it.
+   */
+  readonly unresolved?: (shortcut: {
+    path: string;
+    id: string;
+    name: string;
+    reason: string;
+  }) => void;
 }
 
 export interface DriveApi {
@@ -229,10 +240,36 @@ export const makeDriveApi = (
     const seen = new Set<string>([folderId]);
     const walk = async (id: string, prefix: string) => {
       for (const child of await listChildren(id)) {
-        const file =
-          child.mimeType === SHORTCUT_MIME ? await resolve(child).catch(() => null) : child;
-        if (file === null || file.trashed === true) continue;
         const path = `${prefix}${child.name}`;
+        let file: DriveFile = child;
+        if (child.mimeType === SHORTCUT_MIME) {
+          try {
+            file = await resolve(child);
+          } catch (error) {
+            // Gone or not shared; a rate limit (also 403) or anything else is not.
+            const dead =
+              error instanceof DriveApiError &&
+              (error.status === 404 ||
+                (error.status === 403 && !/rate ?limit|quota/i.test(error.message)) ||
+                (error.status === undefined && /has no target/.test(error.message)));
+            if (!dead) throw error;
+            const reason =
+              error.status === 404
+                ? "its target was deleted or is not shared with you"
+                : error.status === 403
+                  ? "you have no access to its target"
+                  : error.message;
+            if (options.unresolved === undefined) {
+              throw new DriveApiError(
+                `Shortcut ${path} could not be followed: ${reason}.`,
+                error.status,
+              );
+            }
+            options.unresolved({ path, id: child.id, name: child.name, reason });
+            continue;
+          }
+        }
+        if (file.trashed === true) continue;
         if (
           child.mimeType === SHORTCUT_MIME &&
           options.followShortcut !== undefined &&
