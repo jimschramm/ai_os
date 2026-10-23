@@ -97,6 +97,23 @@ export const buildAuthUrl = (input: {
   return url.toString();
 };
 
+/** OAuth error codes are reported only from a fixed list; anything else is "unknown". */
+const KNOWN_OAUTH_ERRORS = new Set([
+  "access_denied",
+  "invalid_client",
+  "invalid_grant",
+  "invalid_request",
+  "invalid_scope",
+  "unauthorized_client",
+  "unsupported_grant_type",
+  "server_error",
+  "temporarily_unavailable",
+  "admin_policy_enforced",
+  "org_internal",
+]);
+export const safeOAuthError = (value: unknown): string =>
+  typeof value === "string" && KNOWN_OAUTH_ERRORS.has(value) ? value : "unknown error";
+
 type CallbackResult = { readonly code: string } | { readonly error: string };
 
 /**
@@ -119,7 +136,7 @@ export const readCallback = (
     return { error: "State mismatch: this sign-in response was not started by ai_os." };
   }
   const error = url.searchParams.get("error");
-  if (error !== null) return { error: `Google returned an error: ${error}` };
+  if (error !== null) return { error: `Google returned an error: ${safeOAuthError(error)}.` };
   const code = url.searchParams.get("code");
   if (code === null || code.length === 0) return { error: "Google returned no code." };
   return { code };
@@ -155,7 +172,7 @@ export const exchangeCode = async (input: {
   const body = (await response.json().catch(() => ({}))) as Record<string, unknown>;
   if (!response.ok) {
     // Only Google's error code goes into the message, never the body.
-    const code = typeof body.error === "string" ? body.error : `HTTP ${response.status}`;
+    const code = body.error === undefined ? `HTTP ${response.status}` : safeOAuthError(body.error);
     throw new DriveAuthError(`Token exchange failed: ${code}.`);
   }
   if (typeof body.refresh_token !== "string" || body.refresh_token.length === 0) {

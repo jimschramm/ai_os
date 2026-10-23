@@ -14,6 +14,7 @@ import {
   readCallback,
   revokeToken,
   runLoopbackLogin,
+  safeOAuthError,
 } from "./GoogleDriveAuth.ts";
 
 const client = { clientId: "123-abc.apps.googleusercontent.com", clientSecret: "shh-secret" };
@@ -52,7 +53,7 @@ describe("callback validation", () => {
     expect(readCallback("/oauth2callback?state=bad&code=c", "good")).toHaveProperty("error");
     expect(readCallback("/oauth2callback?code=c", "good")).toHaveProperty("error");
     expect(readCallback("/oauth2callback?state=good&error=access_denied", "good")).toEqual({
-      error: "Google returned an error: access_denied",
+      error: "Google returned an error: access_denied.",
     });
     expect(readCallback("/favicon.ico", "good")).toBe("ignore");
   });
@@ -214,5 +215,24 @@ describe("loopback login", () => {
     expect(page.status).toBe(400);
     expect(String(await settled)).toMatch(/State mismatch/);
     expect(exchanged).toBe(false);
+  });
+  it("never echoes unknown OAuth error text", async () => {
+    const evil = "secret-abc\u001b[31m";
+    const result = readCallback(`/oauth2callback?state=s&error=${encodeURIComponent(evil)}`, "s");
+    expect(result).toEqual({ error: "Google returned an error: unknown error." });
+    expect(readCallback("/oauth2callback?state=s&error=access_denied", "s")).toEqual({
+      error: "Google returned an error: access_denied.",
+    });
+    const fetchFn = async () => new Response(JSON.stringify({ error: evil }), { status: 400 });
+    await expect(
+      exchangeCode({
+        code: "c",
+        verifier: "v",
+        redirectUri: "http://127.0.0.1:1/oauth2callback",
+        client: { clientId: "x.apps.googleusercontent.com", clientSecret: "s" },
+        fetch: fetchFn,
+      }),
+    ).rejects.toThrow(/^Token exchange failed: unknown error\.$/);
+    expect(safeOAuthError(42)).toBe("unknown error");
   });
 });

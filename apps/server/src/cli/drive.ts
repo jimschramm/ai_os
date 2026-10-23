@@ -42,6 +42,14 @@ const withConfig = <A, E, R>(
     return yield* run(config);
   });
 
+const clientIdOf = (text: string): string | null => {
+  try {
+    return parseClientJson(text).clientId;
+  } catch {
+    return null;
+  }
+};
+
 const secretStoreLayer = (config: ServerConfig.ServerConfig["Service"]) =>
   ServerSecretStore.layer.pipe(
     Layer.provide(ServerConfig.layer(config)),
@@ -102,6 +110,8 @@ const loginCommand = Command.make("login", {
           catch: (error) => userError((error as Error).message),
         });
         // Client is stored only after a successful sign-in, so a bad file never sticks.
+        // Drop the old token first so a failed write can never pair an old token with a new client.
+        yield* store.remove(DRIVE_TOKEN_SECRET_NAME);
         yield* store.set(DRIVE_CLIENT_SECRET_NAME, new TextEncoder().encode(clientText));
         yield* store.set(DRIVE_TOKEN_SECRET_NAME, encodeToken(token));
         yield* Console.log(
@@ -121,6 +131,16 @@ const statusCommand = Command.make("status", { ...authLocationFlags }).pipe(
         const token = Option.isSome(stored) ? decodeToken(stored.value) : null;
         if (token === null) {
           yield* Console.log("Google Drive: not signed in.");
+          return;
+        }
+        const clientBytes = yield* readSecret(DRIVE_CLIENT_SECRET_NAME);
+        const clientId = Option.isSome(clientBytes)
+          ? clientIdOf(new TextDecoder().decode(clientBytes.value))
+          : null;
+        if (clientId !== token.clientId) {
+          yield* Console.log(
+            "Google Drive: token does not match the stored client. Run drive login again.",
+          );
           return;
         }
         yield* Console.log(
