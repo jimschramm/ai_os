@@ -179,18 +179,31 @@ export const extractDoc = (bytes: Uint8Array) => {
   if (!Number.isInteger(pieces) || pieces < 1 || plc + lcb > clx.byteLength) {
     throw new Error("Broken piece table.");
   }
-  let raw = "";
+  // Pieces run in order over the text, each over its own bytes of the stream;
+  // anything else is a broken (or hostile) table, not something to clamp.
+  const ranges: Array<{ start: number; end: number; compressed: boolean }> = [];
   for (let i = 0; i < pieces; i += 1) {
     const cpStart = clx.getUint32(plc + i * 4, true);
     const cpEnd = clx.getUint32(plc + (i + 1) * 4, true);
-    const fcValue = clx.getUint32(plc + (pieces + 1) * 4 + i * 8 + 2, true);
-    const count = Math.max(0, cpEnd - cpStart);
-    if ((fcValue & 0x40000000) !== 0) {
-      const offset = (fcValue & 0x3fffffff) / 2;
-      raw += cp1252.decode(word.subarray(offset, offset + count));
-    } else {
-      raw += utf16.decode(word.subarray(fcValue, fcValue + count * 2));
+    if (cpEnd < cpStart || (i > 0 && cpStart < clx.getUint32(plc + (i - 1) * 4, true))) {
+      throw new Error("Broken piece table.");
     }
+    const fcValue = clx.getUint32(plc + (pieces + 1) * 4 + i * 8 + 2, true);
+    const compressed = (fcValue & 0x40000000) !== 0;
+    const start = compressed ? (fcValue & 0x3fffffff) / 2 : fcValue;
+    const end = start + (cpEnd - cpStart) * (compressed ? 1 : 2);
+    if (end > word.length) throw new Error("Broken piece table.");
+    ranges.push({ start, end, compressed });
+  }
+  const sorted = ranges
+    .filter((range) => range.end > range.start)
+    .sort((a, b) => a.start - b.start);
+  for (let i = 1; i < sorted.length; i += 1) {
+    if (sorted[i]!.start < sorted[i - 1]!.end) throw new Error("Broken piece table.");
+  }
+  let raw = "";
+  for (const range of ranges) {
+    raw += (range.compressed ? cp1252 : utf16).decode(word.subarray(range.start, range.end));
   }
   // Field codes: 0x13 instruction 0x14 result 0x15; keep only the result.
   let text = "";

@@ -444,6 +444,24 @@ describe("snapshot safety", () => {
     expect(names.sort()).toEqual([".tmp", "abc", "abc.tmp-x"]);
   });
 
+  it("verifies a copy whose name has consecutive dots", async () => {
+    const { api } = fakeApi(
+      [{ id: "dots-0000000", name: "budget..final.txt", mimeType: "text/plain", size: 2 }],
+      {},
+      { "dots-0000000": new TextEncoder().encode("hi") },
+    );
+    const worktree = await temp();
+    const { ref } = await buildSnapshot({
+      api,
+      store: makeContentStore(await temp()),
+      worktree,
+      taskId: "t1",
+      refs: ["dots-0000000"],
+    });
+    expect(ref.files[0]!.original).toContain("budget..final");
+    expect(await verifySnapshot(worktree, ref)).toBeNull();
+  });
+
   it("lets parallel tasks store the same file version", async () => {
     const store = makeContentStore(await temp());
     const put = (text: string) =>
@@ -515,6 +533,30 @@ describe("snapshot resume", () => {
     expect(calls.filter((call) => call.startsWith("download")).length).toBe(downloads);
     await expect(
       buildSnapshot({ api, store, worktree, taskId: "task-r", refs: ["txt1-0000000"] }),
+    ).rejects.toThrow(/already exists/);
+    // A different job, or a copy changed since, is never reused.
+    await expect(
+      buildSnapshot({
+        api,
+        store,
+        worktree,
+        taskId: "task-r",
+        refs: ["other-000000"],
+        resume: true,
+      }),
+    ).rejects.toThrow(/already exists/);
+    const copy = path.join(worktree, first.ref.files[0]!.text!);
+    await fs.chmod(copy, 0o644);
+    await fs.writeFile(copy, "changed");
+    await expect(
+      buildSnapshot({
+        api,
+        store,
+        worktree,
+        taskId: "task-r",
+        refs: ["txt1-0000000"],
+        resume: true,
+      }),
     ).rejects.toThrow(/already exists/);
   });
 });

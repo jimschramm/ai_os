@@ -227,8 +227,17 @@ export const buildSnapshot = async (input: {
   ) {
     // A resumed job whose snapshot finished before the restart: reuse it as is.
     if (input.resume === true) {
+      // Only if it is this job's own snapshot and every copy is intact.
       const existing = await loadSnapshot(input.worktree, relRoot);
-      if (existing !== null) return existing;
+      if (
+        existing !== null &&
+        existing.taskId === input.taskId &&
+        JSON.stringify(existing.result.ref.sources) ===
+          JSON.stringify(input.refs.map((ref) => ref.trim())) &&
+        (await verifySnapshot(input.worktree, existing.result.ref)) === null
+      ) {
+        return existing.result;
+      }
     }
     throw new DriveApiError(`A Drive snapshot already exists at ${relRoot}.`);
   }
@@ -365,19 +374,23 @@ export const buildSnapshot = async (input: {
 };
 
 /** The reference for a finished snapshot, read back from its manifest. */
-const loadSnapshot = async (worktree: string, relRoot: string): Promise<SnapshotResult | null> => {
+const loadSnapshot = async (
+  worktree: string,
+  relRoot: string,
+): Promise<{ taskId: unknown; result: SnapshotResult } | null> => {
   const manifestPath = path.join(worktree, ...relRoot.split("/"), "manifest.json");
   const text = await fs.readFile(manifestPath, "utf8").catch(() => null);
   if (text === null) return null;
   try {
     const manifest = JSON.parse(text) as {
+      taskId: unknown;
       totalFiles: number;
       totalBytes: number;
       failedFiles: number;
       sources: Array<{ ref: string }>;
       files: Array<DriveManifestFileV1>;
     };
-    return {
+    const result: SnapshotResult = {
       manifestPath,
       ref: {
         root: relRoot,
@@ -398,6 +411,7 @@ const loadSnapshot = async (worktree: string, relRoot: string): Promise<Snapshot
         sources: manifest.sources.map((source) => source.ref.trim()),
       },
     };
+    return { taskId: manifest.taskId, result };
   } catch {
     return null;
   }
@@ -468,7 +482,11 @@ export const verifySnapshot = async (worktree: string, ref: DriveManifestRefV1) 
     ] as const) {
       const rel = file[pathKey];
       if (typeof rel !== "string") continue;
-      if (!rel.startsWith(`${ref.root}/`) || rel.includes("..")) {
+      const segments = rel.split("/");
+      if (
+        !rel.startsWith(`${ref.root}/`) ||
+        segments.some((part) => part === ".." || part === "")
+      ) {
         return `The Drive snapshot ${ref.root} lists a file outside the snapshot.`;
       }
       const actual = await fileSha(path.join(worktree, ...rel.split("/"))).catch(() => null);

@@ -132,3 +132,23 @@ describe("malformed XLSX", () => {
     await expect(extractXlsx(bad)).rejects.toThrow(/Malformed cell reference/);
   });
 });
+
+describe("PPTX slide order", () => {
+  it("follows presentation.xml and each slide's notes relationship", async () => {
+    const rel = (id: string, type: string, target: string) =>
+      `<Relationship Id="${id}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/${type}" Target="${target}"/>`;
+    const moved = makeZip({
+      "ppt/presentation.xml":
+        '<p:presentation><p:sldIdLst><p:sldId id="257" r:id="rId3"/><p:sldId id="256" r:id="rId2"/></p:sldIdLst></p:presentation>',
+      "ppt/_rels/presentation.xml.rels": `<Relationships>${rel("rId2", "slide", "slides/slide1.xml")}${rel("rId3", "slide", "slides/slide2.xml")}</Relationships>`,
+      "ppt/slides/slide1.xml": "<p:sld><a:t>Was first</a:t></p:sld>",
+      "ppt/slides/slide2.xml": "<p:sld><a:t>Now first</a:t></p:sld>",
+      "ppt/slides/_rels/slide2.xml.rels": `<Relationships>${rel("rId1", "notesSlide", "../notesSlides/notesSlide7.xml")}</Relationships>`,
+      "ppt/notesSlides/notesSlide7.xml": "<p:notes><a:t>Notes of now-first</a:t></p:notes>",
+    });
+    const text = await extractPptx(moved);
+    expect(text.indexOf("Now first")).toBeLessThan(text.indexOf("Was first"));
+    expect(text).toContain("## Slide 1\nNow first\n### Notes\nNotes of now-first");
+    expect(text).toContain("## Slide 2\nWas first");
+  });
+});

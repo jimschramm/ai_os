@@ -211,18 +211,55 @@ export const extractXlsx = async (bytes: Uint8Array) => {
 const drawingXmlToText = (xml: string) =>
   stripTags(xml.replace(/<a:br\/>/g, "\n").replace(/<\/a:p>/g, "\n"));
 
+/** Relationship id -> { target part name, type }, with targets resolved against `base`. */
+const relTargets = (xml: string, base: string) => {
+  const out = new Map<string, { target: string; type: string }>();
+  for (const match of xml.matchAll(/<Relationship\b([^>]*)\/?>/g)) {
+    const attrs = match[1] ?? "";
+    const id = /\bId="([^"]+)"/.exec(attrs)?.[1];
+    const target = /\bTarget="([^"]+)"/.exec(attrs)?.[1];
+    if (id === undefined || target === undefined) continue;
+    const parts = (target.startsWith("/") ? target.slice(1) : `${base}${target}`).split("/");
+    const resolved: string[] = [];
+    for (const part of parts) {
+      if (part === "..") resolved.pop();
+      else if (part !== "." && part !== "") resolved.push(part);
+    }
+    out.set(id, { target: resolved.join("/"), type: /\bType="([^"]+)"/.exec(attrs)?.[1] ?? "" });
+  }
+  return out;
+};
+
 export const extractPptx = async (bytes: Uint8Array) => {
   const parts = await readZipText(bytes, (name) =>
-    /^ppt\/(slides\/slide|notesSlides\/notesSlide)\d+\.xml$/.test(name),
+    /^ppt\/(slides\/slide\d+\.xml|slides\/_rels\/slide\d+\.xml\.rels|notesSlides\/notesSlide\d+\.xml|presentation\.xml|_rels\/presentation\.xml\.rels)$/.test(
+      name,
+    ),
   );
-  const slides = [...parts.keys()]
-    .filter((name) => name.startsWith("ppt/slides/"))
+  const fileSlides = [...parts.keys()]
+    .filter((name) => /^ppt\/slides\/slide\d+\.xml$/.test(name))
     .sort((a, b) => numberIn(a) - numberIn(b));
+  // Show order comes from presentation.xml; file numbers change when slides move.
+  const presentationRels = relTargets(parts.get("ppt/_rels/presentation.xml.rels") ?? "", "ppt/");
+  const ordered = [
+    ...(parts.get("ppt/presentation.xml") ?? "").matchAll(/<p:sldId\b[^>]*\br:id="([^"]+)"/g),
+  ]
+    .map((match) => presentationRels.get(match[1]!)?.target)
+    .filter((name): name is string => name !== undefined && parts.has(name));
+  const slides = ordered.length > 0 ? ordered : fileSlides;
   if (slides.length === 0) throw new Error("No slides in this file.");
   return slides
-    .map((name) => {
-      const number = numberIn(name);
-      const notes = parts.get(`ppt/notesSlides/notesSlide${number}.xml`);
+    .map((name, position) => {
+      const number = ordered.length > 0 ? position + 1 : numberIn(name);
+      // Notes are found through the slide's own relationships.
+      const slideRels = relTargets(
+        parts.get(name.replace(/slides\/(slide\d+\.xml)$/, "slides/_rels/$1.rels")) ?? "",
+        "ppt/slides/",
+      );
+      const notesName =
+        [...slideRels.values()].find((rel) => rel.type.endsWith("/notesSlide"))?.target ??
+        `ppt/notesSlides/notesSlide${numberIn(name)}.xml`;
+      const notes = parts.get(notesName);
       const noteText =
         notes === undefined ? "" : tidy(drawingXmlToText(notes)).replace(/^\d+$/m, "");
       return `## Slide ${number}\n${tidy(drawingXmlToText(parts.get(name) ?? ""))}${noteText.trim().length > 0 ? `\n### Notes\n${noteText.trim()}` : ""}`;
