@@ -1160,6 +1160,75 @@ it.effect("does not launch when the Drive snapshot check fails", () =>
   ),
 );
 
+it.effect("keeps polling the same snapshot job across a server restart", () =>
+  withServer((origin) =>
+    Effect.gen(function* () {
+      const drive = fakeDriveRoutes();
+      let launches = 0;
+      let dropped = 0;
+      const real = wsT3LocalClient({ origin, pairingToken: PAIR });
+      const client: T3LocalClient = {
+        listProjectIds: real.listProjectIds,
+        listProviderModels: () => Effect.succeed(CATALOG),
+        publishBoard: real.publishBoard,
+        publishEvent: real.publishEvent,
+        readBoard: real.readBoard,
+        interrupt: () => Effect.die("interrupt is unused"),
+        continueRun: () => Effect.die("continue is unused"),
+        launch: () => {
+          launches += 1;
+          return Effect.succeed({ threadId: `thread-${launches}`, runId: "run-1", resumed: false });
+        },
+        read: (threadId) =>
+          Effect.succeed({
+            threadId,
+            runId: "run-1",
+            status: "completed",
+            text: "done",
+            revision: null,
+          }),
+        // The first two status polls hit a restarting server.
+        driveCall: (route, body) =>
+          route === "snapshot/status" && dropped < 2
+            ? Effect.sync(() => (dropped += 1)).pipe(
+                Effect.andThen(
+                  Effect.fail(
+                    new GrokT3Error({ reason: "t3_unavailable", detail: "server restarting" }),
+                  ),
+                ),
+              )
+            : drive.driveCall(route, body),
+      };
+      const lines: string[] = [];
+      let tick = 0;
+      yield* runLiveDriver(
+        {
+          origin,
+          pairingToken: PAIR,
+          projectId: "usba",
+          model: undefined,
+          title: "Review",
+          prompt: "Score this document.",
+          listProjects: false,
+          drive: ["sharedCCCCCCCC"],
+        },
+        {
+          client,
+          clock: () => `2026-10-21T20:00:${String(tick++ % 60).padStart(2, "0")}.000Z`,
+          write: (line) => lines.push(line),
+          sleep: () => Effect.void,
+          readRepoCommit: () => Promise.resolve(SHA),
+          pollIntervalMs: 0,
+          maxPolls: 3,
+        },
+      );
+      assert.strictEqual(dropped, 2);
+      assert.strictEqual(launches, 1, lines.join("\n"));
+      assert.strictEqual(drive.calls.filter((call) => call.route === "snapshot").length, 1);
+    }),
+  ),
+);
+
 it.effect("stops a folder run when it loses track of a launched task", () =>
   withServer((origin) =>
     Effect.gen(function* () {

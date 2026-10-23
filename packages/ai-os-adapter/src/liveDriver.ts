@@ -363,6 +363,8 @@ const driveClient = (client: T3LocalClient) =>
       )
     : Effect.succeed(client.driveCall);
 
+const RETRY = Symbol("retry");
+
 const sizeLabel = (bytes: number | null) =>
   bytes === null ? "" : ` (${describeDriveSize(1, bytes).replace(/^1 file, /, "")})`;
 
@@ -385,7 +387,23 @@ const snapshotDrive = (
     let lastDone = -1;
     const interval = deps.pollIntervalMs ?? 1_000;
     for (;;) {
-      const status = yield* call("snapshot/status", { jobId: started.jobId });
+      // The server persists the job and resumes it after a restart, so a lost
+      // connection means "ask again about the same job", never "start another".
+      const status = yield* call("snapshot/status", { jobId: started.jobId }).pipe(
+        Effect.map((value): unknown => value),
+        Effect.catchIf(
+          (error) => Schema.is(GrokT3Error)(error) && error.reason === "t3_unavailable",
+          () =>
+            Effect.sync(() => {
+              deps.write("drive: server unavailable; still waiting for the same snapshot job");
+              return RETRY;
+            }),
+        ),
+      );
+      if (status === RETRY) {
+        yield* deps.sleep(interval);
+        continue;
+      }
       if (!isRecord(status)) return yield* unreadable("snapshot status");
       if (status.state === "done" || status.state === "failed") {
         // Result in hand: the server may drop the job now.
