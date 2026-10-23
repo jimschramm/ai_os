@@ -239,26 +239,30 @@ export const runLoopbackLogin = async (input: {
         }
         settled = true;
         clearTimeout(timer);
-        // Resolves once the page is fully written, so closing the listener
-        // afterwards never cuts the browser off mid-response.
+        // Resolves once the page is fully written or the browser has gone,
+        // so closing the listener afterwards never cuts a response short and
+        // a browser that disconnects early never leaves login hanging.
+        const gone = new Promise<void>((done) => response.once("close", () => done()));
         const respond = (ok: boolean) =>
-          new Promise<void>((done) => {
-            response.once("close", () => done());
-            response
-              .writeHead(ok ? 200 : 400, {
-                "content-type": "text/html; charset=utf-8",
-                connection: "close",
-              })
-              .end(
-                ok
-                  ? PAGE(
-                      "Signed in to Google Drive",
-                      "You can close this tab and go back to the terminal.",
-                    )
-                  : PAGE("Sign-in failed", "Go back to the terminal for details."),
-                () => done(),
-              );
-          });
+          response.destroyed || response.writableEnded
+            ? Promise.resolve()
+            : new Promise<void>((done) => {
+                void gone.then(done);
+                response
+                  .writeHead(ok ? 200 : 400, {
+                    "content-type": "text/html; charset=utf-8",
+                    connection: "close",
+                  })
+                  .end(
+                    ok
+                      ? PAGE(
+                          "Signed in to Google Drive",
+                          "You can close this tab and go back to the terminal.",
+                        )
+                      : PAGE("Sign-in failed", "Go back to the terminal for details."),
+                    () => done(),
+                  );
+              });
         if ("code" in result) {
           resolve({ code: result.code, respond });
         } else {

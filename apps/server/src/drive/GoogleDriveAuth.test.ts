@@ -251,6 +251,32 @@ describe("loopback login", () => {
     expect(String(await settled)).toMatch(/invalid_grant/);
   });
 
+  it("still finishes login if the browser disconnects during the token exchange", async () => {
+    let release!: () => void;
+    let markStarted!: () => void;
+    const started = new Promise<void>((resolve) => (markStarted = resolve));
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const { shown, login } = start(async () => {
+      markStarted();
+      await gate;
+      return okToken({ refresh_token: "rt", scope: grantedScope });
+    });
+    const auth = await shown;
+    const callback = new URL(
+      `${auth.searchParams.get("redirect_uri")}?state=${auth.searchParams.get("state")}&code=abc`,
+    );
+    const { get } = await import("node:http");
+    const request = get(callback);
+    request.on("error", () => undefined);
+    await started;
+    const closed = new Promise((resolve) => request.once("close", resolve));
+    request.destroy();
+    await closed;
+    release();
+    await expect(login).resolves.toMatchObject({ refreshToken: "rt" });
+    await expect(fetch(callback)).rejects.toThrow();
+  });
+
   it("never echoes unknown OAuth error text", async () => {
     const evil = "secret-abc\u001b[31m";
     const result = readCallback(`/oauth2callback?state=s&error=${encodeURIComponent(evil)}`, "s");
