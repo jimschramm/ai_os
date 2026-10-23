@@ -26,6 +26,8 @@ describe("parseDriveFolderId", () => {
     `http://drive.google.com/drive/folders/${ID}`,
     `https://evil.example/drive/folders/${ID}`,
     `https://drive.google.com.evil.example/drive/folders/${ID}`,
+    `https://drive.google.com/drive/folders/${ID}%20extra`,
+    `https://drive.google.com/drive/folders/${ID}/extra`,
     "not a url at all !!",
   ])("rejects %s", (input) => {
     expect(parseDriveFolderId(input)).toBeNull();

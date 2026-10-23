@@ -23,7 +23,8 @@ export const ProjectDriveSettings = Schema.Struct({
 });
 export type ProjectDriveSettings = typeof ProjectDriveSettings.Type;
 
-const FOLDER_PATH = /\/folders\/([A-Za-z0-9_-]+)/;
+// The id must be the whole last path segment (a trailing slash is fine).
+const FOLDER_PATH = /\/folders\/([A-Za-z0-9_-]+)\/?$/;
 
 /**
  * Accepts a pasted Drive folder link (any `.../folders/<id>` form, with or
