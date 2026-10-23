@@ -529,48 +529,75 @@ const plainPath = async (worktree: string, rel: string) => {
   return true;
 };
 
-/**
- * The repo's info/exclude path as git resolves it (linked worktrees included);
- * null only when git confirms this is not a checkout. Any other failure (git
- * missing, a timeout, a broken repo) is an error: the snapshot must not be
- * written where it could be committed.
- */
-const gitExcludePath = (worktree: string) =>
-  new Promise<string | null>((resolve, reject) => {
-    execFile(
-      "git",
-      ["rev-parse", "--path-format=absolute", "--git-path", "info/exclude"],
-      { cwd: worktree, timeout: 10_000 },
-      (error, stdout, stderr) => {
-        const out = String(stdout).trim();
-        if (error === null && out !== "") return resolve(out);
-        const notRepo =
-          error !== null &&
-          (error as { code?: unknown }).code === 128 &&
-          /not a git repository/i.test(String(stderr));
-        if (notRepo) return resolve(null);
-        reject(
-          new Error(
-            `Could not check whether ${worktree} is a git checkout, so the Drive snapshot was not written: ${error?.message ?? "git printed no path"}`,
-          ),
-        );
-      },
+type GitResult =
+  | { ok: true; stdout: string }
+  | { ok: false; code: unknown; stderr: string; message: string };
+
+const runGit = (worktree: string, args: string[]) =>
+  new Promise<GitResult>((resolve) => {
+    execFile("git", args, { cwd: worktree, timeout: 10_000 }, (error, stdout, stderr) =>
+      resolve(
+        error === null
+          ? { ok: true, stdout: String(stdout) }
+          : {
+              ok: false,
+              code: (error as { code?: unknown }).code,
+              stderr: String(stderr),
+              message: error.message,
+            },
+      ),
     );
   });
 
-/** Keeps snapshots out of git without touching the project's .gitignore. */
+const gitProblem = (worktree: string, detail: string) =>
+  new Error(
+    `Could not make sure git ignores the Drive snapshot in ${worktree}, so it was not written: ${detail}`,
+  );
+
+/**
+ * Keeps snapshots out of git without touching the project's .gitignore: an
+ * info/exclude line for this worktree's own .ai_os/drive (the project can be a
+ * subfolder of the repo), then git itself must confirm a snapshot file would
+ * be ignored (no .gitignore negation wins) and nothing there is tracked.
+ * Only "not a git repository" lets a snapshot go ahead without this; any other
+ * git failure stops it.
+ */
 const ensureIgnored = async (worktree: string) => {
-  const exclude = await gitExcludePath(worktree);
-  // Not a git checkout: there is nothing to keep the snapshot out of.
-  if (exclude === null) return;
-  const line = "/.ai_os/drive/";
-  await fs.mkdir(path.dirname(exclude), { recursive: true });
-  const current = await fs.readFile(exclude, "utf8").catch(() => "");
+  const where = await runGit(worktree, [
+    "rev-parse",
+    "--path-format=absolute",
+    "--git-path",
+    "info/exclude",
+    "--show-prefix",
+  ]);
+  if (!where.ok) {
+    if (where.code === 128 && /not a git repository/i.test(where.stderr)) return;
+    throw gitProblem(worktree, where.message);
+  }
+  const [exclude, prefix = ""] = where.stdout.split("\n");
+  if (exclude === undefined || exclude.trim() === "")
+    throw gitProblem(worktree, "git printed no path");
+  const line = `/${prefix.trim()}${DRIVE_SNAPSHOT_DIR}/`;
+  await fs.mkdir(path.dirname(exclude.trim()), { recursive: true });
+  const current = await fs.readFile(exclude.trim(), "utf8").catch(() => "");
   if (!current.split("\n").includes(line)) {
     await fs.appendFile(
-      exclude,
+      exclude.trim(),
       `${current.endsWith("\n") || current === "" ? "" : "\n"}${line}\n`,
     );
+  }
+  const probe = `${DRIVE_SNAPSHOT_DIR}/snapshot/manifest.json`;
+  const ignored = await runGit(worktree, ["check-ignore", "-q", "--no-index", "--", probe]);
+  if (!ignored.ok) {
+    throw gitProblem(
+      worktree,
+      ignored.code === 1 ? `a .gitignore rule un-ignores ${DRIVE_SNAPSHOT_DIR}/.` : ignored.message,
+    );
+  }
+  const tracked = await runGit(worktree, ["ls-files", "--", DRIVE_SNAPSHOT_DIR]);
+  if (!tracked.ok) throw gitProblem(worktree, tracked.message);
+  if (tracked.stdout.trim() !== "") {
+    throw gitProblem(worktree, `files under ${DRIVE_SNAPSHOT_DIR}/ are tracked by git.`);
   }
 };
 

@@ -526,11 +526,44 @@ describe("snapshot safety", () => {
           taskId: "t1",
           refs: ["txt1-0000000"],
         }),
-      ).rejects.toThrow(/Could not check whether .* is a git checkout/);
+      ).rejects.toThrow(/Could not make sure git ignores the Drive snapshot/);
     } finally {
       process.env.PATH = savedPath;
     }
     await expect(fs.stat(path.join(worktree, ".ai_os"))).rejects.toThrow();
+  });
+
+  it("keeps snapshots out of git when the project is a subfolder of the repo", async () => {
+    const repo = await temp();
+    git(repo, "init", "-q");
+    const worktree = path.join(repo, "projects", "p1");
+    await fs.mkdir(worktree, { recursive: true });
+    const { api } = tree();
+    await buildSnapshot({
+      api,
+      store: makeContentStore(await temp()),
+      worktree,
+      taskId: "t1",
+      refs: ["txt1-0000000"],
+    });
+    expect(git(repo, "status", "--porcelain", "--untracked-files=all")).toBe("");
+  });
+
+  it("publishes nothing when a .gitignore rule un-ignores the snapshot folder", async () => {
+    const worktree = await temp();
+    git(worktree, "init", "-q");
+    await fs.writeFile(path.join(worktree, ".gitignore"), "!/.ai_os/drive/\n");
+    const { api } = tree();
+    await expect(
+      buildSnapshot({
+        api,
+        store: makeContentStore(await temp()),
+        worktree,
+        taskId: "t1",
+        refs: ["txt1-0000000"],
+      }),
+    ).rejects.toThrow(/un-ignores/);
+    expect(git(worktree, "status", "--porcelain", "--untracked-files=all")).toBe("?? .gitignore");
   });
 
   it("keeps snapshots out of git in a linked worktree too", async () => {
