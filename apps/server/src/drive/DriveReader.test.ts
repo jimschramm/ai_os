@@ -571,6 +571,14 @@ describe("snapshot safety", () => {
     expect(await store.get("f1", "v1")).toBeNull();
     const repaired = await Promise.all([put("same"), put("same"), put("same"), put("same")]);
     expect(new Set(repaired.map((entry) => entry.meta.sha256)).size).toBe(1);
+    // A repaired entry is never moved aside by a later writer: copy it while more puts run.
+    await fs.writeFile(repaired[0]!.originalPath!, "corrupt again");
+    const racing = [put("same"), put("same"), put("same")];
+    const winner = await racing[0]!;
+    const copies = [put("same"), put("same")];
+    expect(await fs.readFile(winner.originalPath!, "utf8")).toBe("same");
+    await Promise.all([...racing, ...copies]);
+    expect(await fs.readFile(winner.originalPath!, "utf8")).toBe("same");
     expect(await store.get("f1", "v1")).not.toBeNull();
   });
 });

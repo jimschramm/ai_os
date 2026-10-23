@@ -83,7 +83,7 @@ export const makeContentStore = (root: string) => {
     }
   };
 
-  const put = async (input: {
+  const putNow = async (input: {
     readonly fileId: string;
     readonly version: string;
     readonly name: string;
@@ -170,6 +170,24 @@ export const makeContentStore = (root: string) => {
       await fs.rm(temporary, { recursive: true, force: true }).catch(() => undefined);
       throw error;
     }
+  };
+
+  // One write per entry at a time, and a valid entry is reused, never moved
+  // aside: a repair cannot pull an entry out from under a task copying it.
+  const queues = new Map<string, Promise<StoredContent>>();
+  const put = (input: Parameters<typeof putNow>[0]): Promise<StoredContent> => {
+    const key = entryDir(input.fileId, input.version);
+    const previous = queues.get(key);
+    const run = (previous === undefined ? Promise.resolve() : previous.catch(() => undefined)).then(
+      async () => (await get(input.fileId, input.version)) ?? putNow(input),
+    );
+    queues.set(key, run);
+    void run
+      .finally(() => {
+        if (queues.get(key) === run) queues.delete(key);
+      })
+      .catch(() => undefined);
+    return run;
   };
 
   /** Every stored version, newest line last; for memory and retrieval indexing. */

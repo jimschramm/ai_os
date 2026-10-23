@@ -168,13 +168,16 @@ export const layer = Layer.unwrap(
         return drive;
       });
 
+    type Scope = typeof AuthOrchestrationReadScope | typeof AuthOrchestrationOperateScope;
     const handle = (
-      scope: typeof AuthOrchestrationReadScope | typeof AuthOrchestrationOperateScope,
+      scope: Scope | ((input: Record<string, unknown>) => Scope),
       run: (input: Record<string, unknown>) => Effect.Effect<unknown, DriveRouteError>,
     ) =>
       Effect.gen(function* () {
-        yield* authorize(scope);
+        // A fixed scope is checked before the body is read.
+        if (typeof scope !== "function") yield* authorize(scope);
         const input = yield* body;
+        if (typeof scope === "function") yield* authorize(scope(input));
         return json(200, yield* run(input));
       }).pipe(
         Effect.catchTags({
@@ -257,10 +260,23 @@ export const layer = Layer.unwrap(
       // the project's folders or in a folder attached to this task.
       let allowed: Promise<string[]> | undefined;
       const followShortcut = async (target: { id: string }) => {
-        allowed ??= projectRoots(drive, folders).then((roots) => [
-          ...roots,
-          ...job.refs.flatMap((ref) => parseDriveRef(ref) ?? []),
-        ]);
+        // Attachments count by what they resolve to: an attached shortcut to a
+        // folder allows shortcuts inside that folder's own tree.
+        allowed ??= Promise.all([
+          projectRoots(drive, folders),
+          ...job.refs.flatMap((ref) => {
+            const id = parseDriveRef(ref);
+            return id === null
+              ? []
+              : [
+                  drive
+                    .getFile(id)
+                    .then((file) => drive.resolve(file))
+                    .then((target) => [id, target.id])
+                    .catch(() => [id]),
+                ];
+          }),
+        ]).then((lists) => [...new Set(lists.flat())]);
         return isInsideFolders(drive, target.id, await allowed);
       };
       return buildSnapshot({
@@ -347,20 +363,23 @@ export const layer = Layer.unwrap(
       }),
     );
 
-    const snapshotStatus = handle(AuthOrchestrationReadScope, (input) =>
-      Effect.gen(function* () {
-        const jobId = stringField(input, "jobId");
-        const job = jobId === null ? null : yield* fromPromise(() => jobs.get(jobId));
-        if (job === null) return yield* bad("No such snapshot job.", 404);
-        if (job.state === "running") {
-          return { state: job.state, done: job.done, total: job.total, current: job.current };
-        }
-        // A finished job answers every poll until the client acknowledges it.
-        if (input.ack === true) yield* fromPromise(() => jobs.remove(job.jobId));
-        return job.state === "done"
-          ? { state: job.state, manifest: job.manifest }
-          : { state: job.state, error: job.error, status: job.status };
-      }),
+    // Polling needs read scope; acknowledging (which deletes the job) needs operate.
+    const snapshotStatus = handle(
+      (input) => (input.ack === true ? AuthOrchestrationOperateScope : AuthOrchestrationReadScope),
+      (input) =>
+        Effect.gen(function* () {
+          const jobId = stringField(input, "jobId");
+          const job = jobId === null ? null : yield* fromPromise(() => jobs.get(jobId));
+          if (job === null) return yield* bad("No such snapshot job.", 404);
+          if (job.state === "running") {
+            return { state: job.state, done: job.done, total: job.total, current: job.current };
+          }
+          // A finished job answers every poll until the client acknowledges it.
+          if (input.ack === true) yield* fromPromise(() => jobs.remove(job.jobId));
+          return job.state === "done"
+            ? { state: job.state, manifest: job.manifest }
+            : { state: job.state, error: job.error, status: job.status };
+        }),
     );
 
     // Jobs that were running when the server stopped pick up where they left off:
