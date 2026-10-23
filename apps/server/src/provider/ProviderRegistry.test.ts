@@ -359,6 +359,7 @@ function makeMutableServerSettingsService(
           yield* PubSub.publish(changes, next);
           return next;
         }),
+      updateProjectDrive: () => Effect.die("Unexpected drive update"),
       updateProviderInstance: (mutation, patch = {}) =>
         Effect.gen(function* () {
           const current = yield* Ref.get(settingsRef);

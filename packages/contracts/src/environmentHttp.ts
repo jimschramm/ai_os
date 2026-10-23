@@ -57,6 +57,7 @@ import {
   OrchestrationV2ThreadTranscript,
 } from "./orchestrationV2.ts";
 import { Project, ProjectMutation, ProjectSnapshot } from "./project.ts";
+import { ProjectDriveSettings, ProjectDriveUpdate } from "./drive.ts";
 import {
   PullRequestDiffInput,
   PullRequestDiffResult,
@@ -94,6 +95,7 @@ export const EnvironmentRequestInvalidReason = Schema.Literals([
   "invalid_command",
   "invalid_history_cursor",
   "thread_transcript_too_large",
+  "invalid_drive_folder",
 ]);
 export type EnvironmentRequestInvalidReason = typeof EnvironmentRequestInvalidReason.Type;
 
@@ -109,6 +111,7 @@ export const EnvironmentOperationForbiddenReason = Schema.Literals([
 export type EnvironmentOperationForbiddenReason = typeof EnvironmentOperationForbiddenReason.Type;
 
 export const EnvironmentInternalErrorReason = Schema.Literals([
+  "drive_settings_update_failed",
   "bootstrap_validation_failed",
   "browser_session_issuance_failed",
   "browser_session_cookie_failed",
@@ -646,6 +649,14 @@ class EnvironmentProjectsHttpApi extends HttpApiGroup.make("projects")
       headers: OptionalBearerHeaders,
       payload: ProjectMutation,
       success: Project,
+      error: EnvironmentProjectMutationErrors,
+    }).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    HttpApiEndpoint.post("updateDrive", "/api/projects/drive", {
+      headers: OptionalBearerHeaders,
+      payload: ProjectDriveUpdate,
+      success: ProjectDriveSettings,
       error: EnvironmentProjectMutationErrors,
     }).middleware(EnvironmentAuthenticatedAuth),
   ) {}

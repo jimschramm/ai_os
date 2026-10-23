@@ -1,7 +1,9 @@
 import {
   AuthOrchestrationReadScope,
+  AuthSettingsWriteScope,
   EnvironmentHttpApi,
   requiredScopesForProjectMutation,
+  resolveProjectDriveUpdate,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as HttpApiBuilder from "effect/http-api/HttpApiBuilder";
@@ -14,6 +16,7 @@ import {
 } from "../auth/http.ts";
 import { traceLocalHandlerWork } from "../cloud/traceRelayRequest.ts";
 import * as ServerRuntimeStartup from "../serverRuntimeStartup.ts";
+import * as ServerSettings from "../serverSettings.ts";
 import * as ProjectService from "./ProjectService.ts";
 import { projectMutationOperation } from "./ProjectMutation.ts";
 
@@ -36,6 +39,7 @@ export const layer = HttpApiBuilder.group(
   Effect.fnUntraced(function* (handlers) {
     const projects = yield* ProjectService.ProjectService;
     const startup = yield* ServerRuntimeStartup.ServerRuntimeStartup;
+    const settings = yield* ServerSettings.ServerSettingsService;
 
     return handlers
       .handle(
@@ -60,6 +64,22 @@ export const layer = HttpApiBuilder.group(
           return yield* startup
             .enqueueCommand(operation)
             .pipe(traceLocalHandlerWork, Effect.catch(failProjectMutation));
+        }),
+      )
+      .handle(
+        "updateDrive",
+        Effect.fn("environment.projects.updateDrive")(function* (args) {
+          yield* annotateEnvironmentRequest(args.endpoint.name);
+          yield* requireEnvironmentScope(AuthSettingsWriteScope);
+          const { projectId, ...change } = args.payload;
+          const resolved = resolveProjectDriveUpdate(change);
+          if ("invalidLink" in resolved) {
+            return yield* failEnvironmentInvalidRequest("invalid_drive_folder");
+          }
+          return yield* settings.updateProjectDrive(projectId, resolved).pipe(
+            traceLocalHandlerWork,
+            Effect.catch((cause) => failEnvironmentInternal("drive_settings_update_failed", cause)),
+          );
         }),
       );
   }),

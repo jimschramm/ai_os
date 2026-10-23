@@ -1,5 +1,14 @@
-import { ProjectId, parseDriveFolderId, type ProjectDriveSettings } from "@t3tools/contracts";
+import {
+  AuthSettingsWriteScope,
+  EnvironmentHttpApi,
+  ProjectId,
+  type ProjectDriveSettings,
+  type ProjectDriveUpdate,
+  type ResolvedProjectDriveUpdate,
+  resolveProjectDriveUpdate,
+} from "@t3tools/contracts";
 import * as Console from "effect/Console";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
@@ -7,19 +16,28 @@ import * as Option from "effect/Option";
 import * as References from "effect/References";
 import { Argument, Command, Flag, GlobalFlag } from "effect/cli";
 import * as CliError from "effect/cli/CliError";
+import { FetchHttpClient } from "effect/http";
+import * as HttpApiClient from "effect/http-api/HttpApiClient";
 
+import * as EnvironmentAuth from "../auth/EnvironmentAuth.ts";
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
 import * as ServerConfig from "../config.ts";
 import {
-  DRIVE_CLIENT_SECRET_NAME,
-  DRIVE_TOKEN_SECRET_NAME,
-  decodeToken,
-  encodeToken,
+  DRIVE_CREDENTIALS_SECRET_NAME,
+  decodeCredentials,
+  encodeCredentials,
   parseClientJson,
   revokeToken,
   runLoopbackLogin,
+  type DriveClient,
 } from "../drive/GoogleDriveAuth.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
+import * as ProcessRunner from "../processRunner.ts";
+import * as ServerOwnership from "../serverOwnership.ts";
+import {
+  clearPersistedServerRuntimeState,
+  readPersistedServerRuntimeState,
+} from "../serverRuntimeState.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import { authLocationFlags, type CliAuthLocationFlags, resolveCliAuthConfig } from "./config.ts";
 
@@ -42,25 +60,17 @@ const withConfig = <A, E, R>(
     return yield* run(config);
   });
 
-const clientIdOf = (text: string): string | null => {
-  try {
-    return parseClientJson(text).clientId;
-  } catch {
-    return null;
-  }
-};
-
 const secretStoreLayer = (config: ServerConfig.ServerConfig["Service"]) =>
   ServerSecretStore.layer.pipe(
     Layer.provide(ServerConfig.layer(config)),
     Layer.provide(Layer.succeed(References.MinimumLogLevel, "Error")),
   );
 
-const readSecret = (name: string) =>
-  Effect.gen(function* () {
-    const store = yield* ServerSecretStore.ServerSecretStore;
-    return yield* store.get(name);
-  });
+const readCredentials = Effect.gen(function* () {
+  const store = yield* ServerSecretStore.ServerSecretStore;
+  const stored = yield* store.get(DRIVE_CREDENTIALS_SECRET_NAME);
+  return Option.isSome(stored) ? decodeCredentials(stored.value) : null;
+});
 
 const loginCommand = Command.make("login", {
   ...authLocationFlags,
@@ -77,26 +87,25 @@ const loginCommand = Command.make("login", {
       Effect.gen(function* () {
         const store = yield* ServerSecretStore.ServerSecretStore;
         const fileSystem = yield* FileSystem.FileSystem;
-        let clientText: string;
+        let client: DriveClient;
         if (Option.isSome(flags.clientJson)) {
-          clientText = yield* fileSystem
-            .readFileString(flags.clientJson.value)
-            .pipe(
-              Effect.catch(() => fail(`Cannot read ${flags.clientJson.pipe(Option.getOrThrow)}.`)),
-            );
+          const path = flags.clientJson.value;
+          const clientText = yield* fileSystem
+            .readFileString(path)
+            .pipe(Effect.catch(() => fail(`Cannot read ${path}.`)));
+          client = yield* Effect.try({
+            try: () => parseClientJson(clientText),
+            catch: (error) => userError((error as Error).message),
+          });
         } else {
-          const stored = yield* store.get(DRIVE_CLIENT_SECRET_NAME);
-          if (Option.isNone(stored)) {
+          const stored = yield* readCredentials;
+          if (stored === null) {
             return yield* fail(
               "No Google OAuth client yet. Run: drive login --client-json <path to downloaded client JSON>",
             );
           }
-          clientText = new TextDecoder().decode(stored.value);
+          client = stored.client;
         }
-        const client = yield* Effect.try({
-          try: () => parseClientJson(clientText),
-          catch: (error) => userError((error as Error).message),
-        });
         const token = yield* Effect.tryPromise({
           try: () =>
             runLoopbackLogin({
@@ -109,11 +118,9 @@ const loginCommand = Command.make("login", {
             }),
           catch: (error) => userError((error as Error).message),
         });
-        // Client is stored only after a successful sign-in, so a bad file never sticks.
-        // Drop the old token first so a failed write can never pair an old token with a new client.
-        yield* store.remove(DRIVE_TOKEN_SECRET_NAME);
-        yield* store.set(DRIVE_CLIENT_SECRET_NAME, new TextEncoder().encode(clientText));
-        yield* store.set(DRIVE_TOKEN_SECRET_NAME, encodeToken(token));
+        // Stored only after a successful sign-in, as one record, so a bad file
+        // never sticks and client and token can never be mismatched.
+        yield* store.set(DRIVE_CREDENTIALS_SECRET_NAME, encodeCredentials({ client, token }));
         yield* Console.log(
           `Signed in to Google Drive. Token stored in ${config.secretsDir} (owner-only).`,
         );
@@ -127,20 +134,9 @@ const statusCommand = Command.make("status", { ...authLocationFlags }).pipe(
   Command.withHandler((flags) =>
     withConfig(flags, (config) =>
       Effect.gen(function* () {
-        const stored = yield* readSecret(DRIVE_TOKEN_SECRET_NAME);
-        const token = Option.isSome(stored) ? decodeToken(stored.value) : null;
+        const token = (yield* readCredentials)?.token ?? null;
         if (token === null) {
           yield* Console.log("Google Drive: not signed in.");
-          return;
-        }
-        const clientBytes = yield* readSecret(DRIVE_CLIENT_SECRET_NAME);
-        const clientId = Option.isSome(clientBytes)
-          ? clientIdOf(new TextDecoder().decode(clientBytes.value))
-          : null;
-        if (clientId !== token.clientId) {
-          yield* Console.log(
-            "Google Drive: token does not match the stored client. Run drive login again.",
-          );
           return;
         }
         yield* Console.log(
@@ -157,11 +153,17 @@ const logoutCommand = Command.make("logout", { ...authLocationFlags }).pipe(
     withConfig(flags, (config) =>
       Effect.gen(function* () {
         const store = yield* ServerSecretStore.ServerSecretStore;
-        const stored = yield* store.get(DRIVE_TOKEN_SECRET_NAME);
-        const token = Option.isSome(stored) ? decodeToken(stored.value) : null;
+        const stored = yield* readCredentials;
+        const token = stored?.token ?? null;
         const revoked =
           token === null ? false : yield* Effect.promise(() => revokeToken(token.refreshToken));
-        yield* store.remove(DRIVE_TOKEN_SECRET_NAME);
+        // Keep the client so the next login needs no file; drop only the token.
+        if (stored !== null && token !== null) {
+          yield* store.set(
+            DRIVE_CREDENTIALS_SECRET_NAME,
+            encodeCredentials({ client: stored.client, token: null }),
+          );
+        }
         yield* Console.log(
           token === null
             ? "Google Drive: no token stored."
@@ -177,34 +179,63 @@ const logoutCommand = Command.make("logout", { ...authLocationFlags }).pipe(
 const folderFlag = (name: string, description: string) =>
   Flag.String(name).pipe(Flag.withDescription(description), Flag.optional);
 
-/** Pure so it can be tested: applies the CLI flags to a project's current drive setting. */
-export const nextProjectDriveSettings = (
-  current: ProjectDriveSettings | undefined,
-  input: {
-    readonly output: Option.Option<string>;
-    readonly input: Option.Option<string>;
-    readonly clearInput: boolean;
-    readonly clearOutput: boolean;
-    readonly disable: boolean;
-  },
-): ProjectDriveSettings | string => {
-  const next: { -readonly [K in keyof ProjectDriveSettings]: ProjectDriveSettings[K] } = {
-    ...current,
-    enabled: !input.disable,
-  };
-  for (const [key, raw] of [
-    ["outputFolderId", input.output],
-    ["inputFolderId", input.input],
-  ] as const) {
-    if (Option.isNone(raw)) continue;
-    const id = parseDriveFolderId(raw.value);
-    if (id === null) return `Not a Google Drive folder link or id: ${raw.value}`;
-    next[key] = id;
-  }
-  if (input.clearInput) delete next.inputFolderId;
-  if (input.clearOutput) delete next.outputFolderId;
-  return next;
-};
+const LIVE_SERVER_TIMEOUT = Duration.seconds(5);
+
+const describeDrive = (projectId: string, drive: ProjectDriveSettings, via: string) =>
+  `Drive for ${projectId}: ${drive.enabled ? "on" : "off"}; output ${drive.outputFolderId ?? "not set"}; input ${drive.inputFolderId ?? "any (whole Drive)"} (${via}).`;
+
+/** Sends the change to the running server, which applies it under its settings lock. */
+const updateViaServer = (origin: string, update: ProjectDriveUpdate) =>
+  Effect.gen(function* () {
+    const auth = yield* EnvironmentAuth.EnvironmentAuth;
+    return yield* Effect.acquireUseRelease(
+      auth.issueSession({ scopes: [AuthSettingsWriteScope], label: "ai_os drive cli" }),
+      (issued) =>
+        Effect.gen(function* () {
+          const client = yield* HttpApiClient.make(EnvironmentHttpApi, { baseUrl: origin });
+          return yield* client.projects.updateDrive({
+            headers: { authorization: `Bearer ${issued.token}` },
+            payload: update,
+          });
+        }).pipe(Effect.timeout(LIVE_SERVER_TIMEOUT)),
+      (issued) => auth.revokeSession(issued.sessionId).pipe(Effect.ignore),
+    );
+  });
+
+/**
+ * With no server reachable, take the same exclusive ownership lock a server
+ * takes at start, so no server can write settings while this one does.
+ */
+const updateOffline = (
+  config: ServerConfig.ServerConfig["Service"],
+  projectId: ProjectId,
+  resolved: ResolvedProjectDriveUpdate,
+) =>
+  Effect.gen(function* () {
+    yield* ServerOwnership.acquireServerOwnership(config.serverRuntimeStatePath).pipe(
+      Effect.provide(ProcessRunner.layer),
+      Effect.mapError((error) =>
+        error._tag === "ServerAlreadyRunningError"
+          ? userError(
+              "The ai_os server is running but did not answer. Nothing was changed; try again in a moment.",
+            )
+          : userError(error.message),
+      ),
+    );
+    yield* clearPersistedServerRuntimeState(config.serverRuntimeStatePath);
+    const settings = yield* ServerSettings.ServerSettingsService;
+    return yield* settings.updateProjectDrive(projectId, resolved);
+  }).pipe(
+    Effect.scoped,
+    Effect.provide(
+      ServerSettings.layer.pipe(
+        Layer.provide(ServerSecretStore.layer),
+        Layer.provide(SqlitePersistence.layerConfig),
+        Layer.provide(ServerConfig.layer(config)),
+        Layer.provide(Layer.succeed(References.MinimumLogLevel, "Error")),
+      ),
+    ),
+  );
 
 const projectCommand = Command.make("project", {
   ...authLocationFlags,
@@ -231,29 +262,44 @@ const projectCommand = Command.make("project", {
     withConfig(flags, (config) =>
       Effect.gen(function* () {
         const projectId = ProjectId.make(flags.projectId);
-        const settings = yield* ServerSettings.ServerSettingsService;
-        // Read-modify-write of one project entry; a running server picks the
-        // file change up through its settings watcher.
-        const current = yield* settings.getSettings;
-        const entry = current.projectSettingsOverrides[projectId] ?? {};
-        const drive = nextProjectDriveSettings(entry.drive, flags);
-        if (typeof drive === "string") return yield* fail(drive);
-        yield* settings.updateSettings({
-          projectSettingsOverrides: { [projectId]: { ...entry, drive } },
-        });
+        const update: ProjectDriveUpdate = {
+          projectId,
+          ...(Option.isSome(flags.output) ? { output: flags.output.value } : {}),
+          ...(Option.isSome(flags.input) ? { input: flags.input.value } : {}),
+          clearInput: flags.clearInput,
+          clearOutput: flags.clearOutput,
+          disable: flags.disable,
+        };
+        const { projectId: _, ...change } = update;
+        const resolved = resolveProjectDriveUpdate(change);
+        if ("invalidLink" in resolved) {
+          return yield* fail(`Not a Google Drive folder link or id: ${resolved.invalidLink}`);
+        }
+        const runtime = yield* readPersistedServerRuntimeState(config.serverRuntimeStatePath);
+        if (Option.isSome(runtime)) {
+          const live = yield* Effect.result(
+            updateViaServer(runtime.value.origin, update).pipe(
+              Effect.provide(
+                EnvironmentAuth.layerRuntime.pipe(
+                  Layer.provideMerge(FetchHttpClient.layer),
+                  Layer.provide(ServerConfig.layer(config)),
+                  Layer.provide(Layer.succeed(References.MinimumLogLevel, "Error")),
+                ),
+              ),
+            ),
+          );
+          if (live._tag === "Success") {
+            yield* Console.log(
+              describeDrive(projectId, live.success, "saved by the running server"),
+            );
+            return;
+          }
+        }
+        const drive = yield* updateOffline(config, projectId, resolved);
         yield* Console.log(
-          `Drive for ${projectId}: ${drive.enabled ? "on" : "off"}; output ${drive.outputFolderId ?? "not set"}; input ${drive.inputFolderId ?? "any (whole Drive)"}.`,
+          describeDrive(projectId, drive, "server not running; saved to settings"),
         );
-      }).pipe(
-        Effect.provide(
-          ServerSettings.layer.pipe(
-            Layer.provide(ServerSecretStore.layer),
-            Layer.provide(SqlitePersistence.layerConfig),
-            Layer.provide(ServerConfig.layer(config)),
-            Layer.provide(Layer.succeed(References.MinimumLogLevel, "Error")),
-          ),
-        ),
-      ),
+      }),
     ),
   ),
 );

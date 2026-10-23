@@ -19,9 +19,11 @@ import type { AddressInfo } from "node:net";
  */
 export const DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive"] as const;
 
-/** Fixed secret-store keys; never derived from user input. */
-export const DRIVE_CLIENT_SECRET_NAME = "google-drive-oauth-client";
-export const DRIVE_TOKEN_SECRET_NAME = "google-drive-oauth-token";
+/**
+ * Fixed secret-store key; never derived from user input. Client and token live
+ * in one record so one atomic write always keeps them paired.
+ */
+export const DRIVE_CREDENTIALS_SECRET_NAME = "google-drive-oauth";
 
 const AUTH_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth";
 const TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token";
@@ -285,17 +287,38 @@ export const runLoopbackLogin = async (input: {
   }
 };
 
-export const encodeToken = (token: StoredDriveToken) =>
-  new TextEncoder().encode(JSON.stringify(token));
+export interface StoredDriveCredentials {
+  readonly client: DriveClient;
+  /** null after logout: the client stays so the next login needs no file. */
+  readonly token: StoredDriveToken | null;
+}
 
-export const decodeToken = (bytes: Uint8Array): StoredDriveToken | null => {
+export const encodeCredentials = (credentials: StoredDriveCredentials) =>
+  new TextEncoder().encode(JSON.stringify(credentials));
+
+const isToken = (value: unknown): value is StoredDriveToken => {
+  if (typeof value !== "object" || value === null) return false;
+  const token = value as Partial<StoredDriveToken>;
+  return (
+    typeof token.refreshToken === "string" &&
+    typeof token.clientId === "string" &&
+    typeof token.obtainedAt === "string" &&
+    Array.isArray(token.scopes) &&
+    token.scopes.every((scope) => typeof scope === "string")
+  );
+};
+
+/** Returns null for anything that is not a well-formed, matching pair. */
+export const decodeCredentials = (bytes: Uint8Array): StoredDriveCredentials | null => {
   try {
-    const value = JSON.parse(new TextDecoder().decode(bytes)) as Partial<StoredDriveToken>;
-    return typeof value.refreshToken === "string" &&
-      typeof value.clientId === "string" &&
-      typeof value.obtainedAt === "string" &&
-      Array.isArray(value.scopes)
-      ? (value as StoredDriveToken)
+    const value = JSON.parse(new TextDecoder().decode(bytes)) as Partial<StoredDriveCredentials>;
+    const client = value.client as Partial<DriveClient> | undefined;
+    if (typeof client?.clientId !== "string" || typeof client.clientSecret !== "string") {
+      return null;
+    }
+    if (value.token === null) return { client: client as DriveClient, token: null };
+    return isToken(value.token) && value.token.clientId === client.clientId
+      ? { client: client as DriveClient, token: value.token }
       : null;
   } catch {
     return null;

@@ -6,8 +6,8 @@ import {
   DRIVE_SCOPES,
   DriveAuthError,
   buildAuthUrl,
-  decodeToken,
-  encodeToken,
+  decodeCredentials,
+  encodeCredentials,
   exchangeCode,
   makePkce,
   parseClientJson,
@@ -147,7 +147,25 @@ describe("token exchange", () => {
       clientId: client.clientId,
       obtainedAt: "2026-10-22T00:00:00.000Z",
     });
-    expect(decodeToken(encodeToken(token))).toEqual(token);
+    const stored = { clientId: token.clientId, clientSecret: "s" };
+    expect(decodeCredentials(encodeCredentials({ client: stored, token }))).toEqual({
+      client: stored,
+      token,
+    });
+    expect(decodeCredentials(encodeCredentials({ client: stored, token: null }))).toEqual({
+      client: stored,
+      token: null,
+    });
+    // A token from another client is never accepted as a pair.
+    expect(
+      decodeCredentials(
+        encodeCredentials({
+          client: { ...stored, clientId: "other.apps.googleusercontent.com" },
+          token,
+        }),
+      ),
+    ).toBeNull();
+    expect(decodeCredentials(new TextEncoder().encode("{"))).toBeNull();
   });
 
   it("fails without a refresh token or with missing scopes, without echoing secrets", async () => {
