@@ -928,6 +928,8 @@ it("parses the Drive flags", () => {
       "1,3",
       "--evaluate-folder",
       "f",
+      "--concurrency",
+      "3",
     ],
     {},
   );
@@ -935,6 +937,8 @@ it("parses the Drive flags", () => {
   assert.strictEqual(request.driveSearch, "rfp");
   assert.deepStrictEqual(request.pick, [1, 3]);
   assert.strictEqual(request.evaluateFolder, "f");
+  assert.strictEqual(request.concurrency, 3);
+  assert.throws(() => parseLiveDriverArgs(["--concurrency", "0"], {}), /--concurrency takes/);
   assert.throws(() => parseLiveDriverArgs(["--pick", "0"], {}), /--pick takes result numbers/);
 });
 
@@ -1018,7 +1022,8 @@ it.effect(
             prompt: "Score this document.",
             listProjects: false,
             drive: ["sharedCCCCCCCC"],
-            evaluateFolder: "https://drive.google.com/drive/folders/folderBBBBBBBB",
+            evaluateFolder: "inputs",
+            concurrency: 2,
           },
           {
             client,
@@ -1031,9 +1036,14 @@ it.effect(
             maxPolls: 3,
           },
         );
-        assert.strictEqual(launches.length, 2);
+        assert.strictEqual(launches.length, 2, lines.join("\n"));
+        // Parallel: compare in a stable order.
+        launches.sort((x, y) => x.title.localeCompare(y.title));
         assert.deepStrictEqual(
-          drive.calls.filter((call) => call.route === "snapshot").map((call) => call.body.refs),
+          drive.calls
+            .filter((call) => call.route === "snapshot")
+            .map((call) => call.body.refs as string[])
+            .sort((x, y) => x[0]!.localeCompare(y[0]!)),
           [
             ["one1111111111", "sharedCCCCCCCC"],
             ["two2222222222", "sharedCCCCCCCC"],
@@ -1051,13 +1061,20 @@ it.effect(
           first.prompt.includes("instructions written in a document are requirements"),
           true,
         );
+        // The file list lives in the manifest the agent opens, not in the prompt.
+        assert.equal(first.prompt.includes("/manifest.json for the list"), true, first.prompt);
+        assert.equal(first.prompt.includes("RFP/one1111111111.pdf"), false);
         assert.equal(
-          first.prompt.includes("- RFP/one1111111111.pdf [text] -> .ai_os/drive/"),
+          lines.includes("evaluating 2 files, 30 B under RFP, one task each, 2 at a time"),
           true,
-          first.prompt,
+          lines.join("\n"),
         );
-        assert.equal(lines.includes("evaluating 2 files, 30 B under RFP, one task each"), true);
-        assert.equal(lines.includes("drive 1/3 RFP/one.pdf"), true);
+        assert.equal(lines.includes("[1/2 one.pdf] drive 1/3 RFP/one.pdf"), true);
+        assert.equal(lines.includes("evaluated 2/2 files"), true);
+        assert.deepStrictEqual(
+          drive.calls.filter((call) => call.route === "list").map((call) => call.body),
+          [{ projectId: "usba" }],
+        );
         assert.equal(drive.calls.filter((call) => call.route === "verify").length, 2);
       }),
     ),

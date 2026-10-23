@@ -14,6 +14,7 @@ import {
   type SequenceState,
   type UsageMeasurementV1,
 } from "@t3tools/ai-os-contracts";
+import * as Semaphore from "effect/Semaphore";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 
@@ -94,12 +95,7 @@ const renderDriveSection = (context: ContextPackageSnapshotV1): string[] => {
     "",
     `Drive documents (reference only; ${size}${drive.failedFiles > 0 ? `, ${drive.failedFiles} without text` : ""})`,
     ...DRIVE_DOCUMENT_GUARD,
-    `Folder: ${drive.root} (full list with Drive links: ${drive.root}/manifest.json)`,
-    ...drive.files.map((file) => {
-      const where = file.text ?? file.original ?? "not downloadable";
-      const note = file.error === undefined ? "" : ` (${file.error})`;
-      return `- ${file.drivePath} [${file.kind}] -> ${where}${note}`;
-    }),
+    `Files: ${drive.root}/. Open ${drive.root}/manifest.json for the list: each entry gives the Drive path, the kind, the extracted text file ("text"), the original copy ("original"), the Drive link, and any reading error.`,
   ];
 };
 
@@ -336,6 +332,9 @@ export const createGrokT3Adapter = (input: {
   readonly instanceId?: string;
 }): GrokT3Adapter => {
   const store = input.store ?? memorySessionStore();
+  // Tasks driven side by side share one board; publish it one change at a time
+  // so each publish carries the revisions the last one returned.
+  const boardLock = Semaphore.makeUnsafe(1);
   const workerId = input.workerId ?? "codex-t3";
   // A hardcoded slug is rejected by a pinned provider. Callers pass a model the server offers.
   const model = input.model?.trim() ?? "";
@@ -357,10 +356,11 @@ export const createGrokT3Adapter = (input: {
     publishedEvents += 1;
     return `${name}-${taskId}-${publishedEvents}`;
   };
-  const cardsReplacing = (session: AttemptSession): readonly AdapterBoardCard[] => {
-    const next = boardCard(session);
-    return [...readAdapterBoard().filter((card) => card.taskId !== session.taskId), next];
-  };
+  // The server upserts by task, so only this task's card is sent: a card another
+  // task moved meanwhile is never sent back stale.
+  const cardsReplacing = (session: AttemptSession): readonly AdapterBoardCard[] => [
+    boardCard(session),
+  ];
   const remember = (session: AttemptSession, accepted: readonly AdapterBoardCard[]) => {
     for (const card of accepted) {
       if (card.taskId === session.taskId) continue;
@@ -387,7 +387,7 @@ export const createGrokT3Adapter = (input: {
         return yield* fail("t3_rejected", "The board server did not accept this task.");
       }
       return stored;
-    });
+    }).pipe(boardLock.withPermits(1));
   const step = (session: AttemptSession, event: SequenceEvent) =>
     applySequenceEvent(session.state, event).pipe(
       Effect.mapError(contractError),

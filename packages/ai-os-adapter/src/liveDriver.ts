@@ -31,6 +31,9 @@ export const LIVE_DRIVER_PAIRING_ENV = "T3_PAIRING_TOKEN";
 export const LIVE_DRIVER_COMMAND =
   "node --experimental-strip-types packages/ai-os-adapter/scripts/live-driver.ts";
 
+/** Folder tasks started at once by --evaluate-folder unless --concurrency says otherwise. */
+export const DEFAULT_FOLDER_CONCURRENCY = 4;
+
 export const LIVE_DRIVER_HELP = `Record one intake on a local T3 server and publish it to /operations.
 
 A loopback origin (localhost, 127.0.0.1, or ::1) needs no pairing token.
@@ -52,15 +55,20 @@ the provider offers it, then the server default, then the provider's default or
 the first available model. An explicit --model that is not offered is an error
 listing the valid models.
 
-Google Drive (the server holds the Drive token; files are read-only copies):
-  --drive <link or id>        Attach a Drive file, or every file under a folder.
-                              Repeat to attach several.
-  --drive-search "<text>"     Print numbered Drive matches and stop.
+Google Drive, for this project only (the server holds the Drive token; files
+are read-only copies; Drive must be on for the project):
+  --drive <link or id>        Attach a Drive file, or every file under a folder,
+                              to this task. Repeat to attach several.
+  --drive-search "<text>"     Print numbered Drive matches (names only) to pick
+                              from, and stop.
   --drive-search "<text>" --pick 1,3
-                              Attach those matches.
-  --evaluate-folder <link>    One task per file under the folder (all depths),
-                              run one after another. --title and --prompt apply
-                              to each; the file path is added to the title.
+                              Attach those matches to this task.
+  --evaluate-folder inputs    One task per file in the project's Drive inputs
+                              folder (all depths), or pass a folder link inside
+                              the project's aios/projects/<name>/ folders.
+                              --title and --prompt apply to each; the file path
+                              is added to the title.
+  --concurrency <n>           Folder tasks run at once (default ${DEFAULT_FOLDER_CONCURRENCY}).
 The task title shows the Drive total, e.g. "[Drive: 3 files, 1.2 MB]".`;
 
 export class LiveDriverUsageError extends Schema.TaggedError<LiveDriverUsageError>()(
@@ -84,7 +92,9 @@ export interface LiveDriverRequest {
   readonly drive?: readonly string[];
   readonly driveSearch?: string | undefined;
   readonly pick?: readonly number[];
+  /** A folder link, or "inputs" for the project's Drive inputs folder. */
   readonly evaluateFolder?: string | undefined;
+  readonly concurrency?: number | undefined;
 }
 
 export interface LiveDriverDependencies {
@@ -124,6 +134,7 @@ export const parseLiveDriverArgs = (
   let driveSearch: string | undefined;
   let pick: number[] = [];
   let evaluateFolder: string | undefined;
+  let concurrency: number | undefined;
 
   for (let index = 0; index < argv.length; index += 1) {
     const flag = argv[index];
@@ -179,6 +190,17 @@ export const parseLiveDriverArgs = (
         }
         break;
       }
+      case "--concurrency": {
+        const raw = take(argv, index, flag);
+        concurrency = Number(raw);
+        if (!/^\d+$/.test(raw) || concurrency < 1) {
+          throw new LiveDriverUsageError({
+            detail: `--concurrency takes a whole number of tasks, 1 or more.\n\n${LIVE_DRIVER_HELP}`,
+          });
+        }
+        index += 1;
+        break;
+      }
       case "--evaluate-folder":
         evaluateFolder = take(argv, index, flag);
         index += 1;
@@ -202,6 +224,7 @@ export const parseLiveDriverArgs = (
     driveSearch,
     pick,
     evaluateFolder,
+    concurrency,
   };
 };
 
@@ -401,8 +424,17 @@ export const runLiveDriver = (
   Effect.gen(function* () {
     const picked: string[] = [];
     if (request.driveSearch !== undefined) {
+      // Search only picks files to attach to this project's task.
+      if (request.projectId === undefined) {
+        return yield* new LiveDriverUsageError({
+          detail:
+            "--drive-search needs --project-id: Drive files are attached to a project's task.",
+        });
+      }
       const call = yield* driveClient(deps.client);
-      const found = filesOf(yield* call("search", { query: request.driveSearch }));
+      const found = filesOf(
+        yield* call("search", { projectId: request.projectId, query: request.driveSearch }),
+      );
       if ((request.pick ?? []).length === 0) {
         if (found.length === 0) deps.write("No Drive matches.");
         found.forEach((file, index) => {
@@ -475,27 +507,33 @@ export const runLiveDriver = (
       return yield* new LiveDriverUsageError({ detail: resolved.error });
     }
 
-    const runOne = (taskTitle: string, idSeed: string, refs: readonly string[]) =>
+    // One board for this run: folder tasks run side by side and all stay listed.
+    clearAdapterBoard();
+    const adapter = createGrokT3Adapter({
+      client: deps.client,
+      clock: deps.clock,
+      model: resolved.model,
+      instanceId: resolved.instanceId,
+    });
+    const runOne = (
+      taskTitle: string,
+      idSeed: string,
+      refs: readonly string[],
+      write: (line: string) => void = deps.write,
+    ) =>
       Effect.gen(function* () {
         const stamp = deps.clock();
         const taskId = liveTaskId(idSeed, stamp);
         let driveManifest: DriveManifestRefV1 | undefined;
         let shownTitle = taskTitle;
         if (refs.length > 0) {
-          driveManifest = yield* snapshotDrive(deps, project.id, taskId, refs);
+          driveManifest = yield* snapshotDrive({ ...deps, write }, project.id, taskId, refs);
           const size = describeDriveSize(driveManifest.totalFiles, driveManifest.totalBytes);
           shownTitle = `${taskTitle} [Drive: ${size}]`;
-          deps.write(
+          write(
             `drive snapshot ${driveManifest.root}: ${size}${driveManifest.failedFiles > 0 ? `, ${driveManifest.failedFiles} without text` : ""}`,
           );
         }
-        clearAdapterBoard();
-        const adapter = createGrokT3Adapter({
-          client: deps.client,
-          clock: deps.clock,
-          model: resolved.model,
-          instanceId: resolved.instanceId,
-        });
         const recorded = yield* adapter.record({
           taskId,
           title: shownTitle,
@@ -519,8 +557,8 @@ export const runLiveDriver = (
           },
         });
         const started = yield* adapter.launch(recorded.taskId);
-        deps.write(`task ${started.taskId}`);
-        if (started.threadId !== null) deps.write(`thread ${started.threadId}`);
+        write(`task ${started.taskId}`);
+        if (started.threadId !== null) write(`thread ${started.threadId}`);
 
         const threadId = started.threadId;
         if (threadId === null) {
@@ -537,13 +575,13 @@ export const runLiveDriver = (
         for (let attempt = 0; attempt < limit; attempt += 1) {
           const view = yield* deps.client.read(threadId);
           if (view.text !== null && view.text !== lastText) {
-            deps.write(view.text);
+            write(view.text);
             lastText = view.text;
           }
           const session = yield* adapter.observe(recorded.taskId);
           const label = phaseLabel(session);
           if (label !== lastLabel) {
-            deps.write(label);
+            write(label);
             lastLabel = label;
           }
           // Recovery stays with this driver. Leaving here is what let a board pause
@@ -553,29 +591,58 @@ export const runLiveDriver = (
           }
           yield* deps.sleep(interval);
         }
-        deps.write("still executing");
+        write("still executing");
       });
 
     const shared = [...(request.drive ?? []), ...picked];
     if (request.evaluateFolder !== undefined) {
       const call = yield* driveClient(deps.client);
-      const listing = yield* call("list", { ref: request.evaluateFolder });
+      const folder = request.evaluateFolder.trim();
+      // "inputs": the server uses the project's Drive inputs folder.
+      const listing = yield* call("list", {
+        projectId: project.id,
+        ...(folder === "inputs" ? {} : { ref: folder }),
+      });
       const root = isRecord(listing) && isRecord(listing.root) ? listing.root : null;
       if (root === null) return yield* unreadable("folder listing");
       if (root.mimeType !== FOLDER_MIME) {
         return yield* new LiveDriverUsageError({
-          detail: "--evaluate-folder needs a folder link. Use --drive for a single file.",
+          detail: "--evaluate-folder needs a folder. Use --drive for a single file.",
         });
       }
       const files = filesOf(listing);
       const totalBytes = files.reduce((sum, file) => sum + (file.size ?? 0), 0);
+      const concurrency = request.concurrency ?? DEFAULT_FOLDER_CONCURRENCY;
       deps.write(
-        `evaluating ${describeDriveSize(files.length, totalBytes)} under ${String(root.name)}, one task each`,
+        `evaluating ${describeDriveSize(files.length, totalBytes)} under ${String(root.name)}, one task each, ${concurrency} at a time`,
       );
-      for (const [index, file] of files.entries()) {
-        const path = file.path ?? file.name;
-        deps.write(`--- ${index + 1}/${files.length} ${path}`);
-        yield* runOne(`${title}: ${path}`, `${title}-${index + 1}`, [file.id, ...shared]);
+      const results = yield* Effect.forEach(
+        files.entries(),
+        ([index, file]) => {
+          const path = file.path ?? file.name;
+          const tag = `[${index + 1}/${files.length} ${path}]`;
+          const write = (line: string) => deps.write(`${tag} ${line}`);
+          return runOne(
+            `${title}: ${path}`,
+            `${title}-${index + 1}`,
+            [file.id, ...shared],
+            write,
+          ).pipe(
+            Effect.tapError((error) => Effect.sync(() => write(`failed: ${error.message}`))),
+            Effect.result,
+          );
+        },
+        { concurrency },
+      );
+      const failed = results.filter((result) => result._tag === "Failure").length;
+      deps.write(
+        `evaluated ${files.length - failed}/${files.length} files${failed > 0 ? `, ${failed} failed` : ""}`,
+      );
+      if (failed > 0) {
+        return yield* new GrokT3Error({
+          reason: "invalid_task",
+          detail: `${failed} of ${files.length} folder tasks failed; see the lines marked failed.`,
+        });
       }
       return;
     }
