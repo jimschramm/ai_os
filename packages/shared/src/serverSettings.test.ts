@@ -677,6 +677,26 @@ describe("serverSettings helpers", () => {
     });
   });
 
+  it("keeps a project's drive setting when a patch entry omits the key", () => {
+    const projectId = ProjectId.make("project-a");
+    const drive = { enabled: true, outputFolderId: "1AbCdEfGhIjKlMnOpQrStUvWxYz_-12345" };
+    const current = {
+      ...DEFAULT_SERVER_SETTINGS,
+      projectSettingsOverrides: { [projectId]: { newWorktreesStartFromOrigin: true, drive } },
+    };
+    const kept = applyServerSettingsPatch(current, {
+      projectSettingsOverrides: { [projectId]: { newWorktreesStartFromOrigin: false } },
+    });
+    expect(kept.projectSettingsOverrides[projectId]).toEqual({
+      newWorktreesStartFromOrigin: false,
+      drive,
+    });
+    const replaced = applyServerSettingsPatch(current, {
+      projectSettingsOverrides: { [projectId]: { drive: { enabled: false } } },
+    });
+    expect(replaced.projectSettingsOverrides[projectId]).toEqual({ drive: { enabled: false } });
+  });
+
   it("clears a project's providerInstances override when a patch entry sends an empty map", () => {
     const instanceId = ProviderInstanceId.make("codex_work");
     const projectId = ProjectId.make("project-a");
