@@ -289,6 +289,31 @@ describe("ensureProjectFolders", () => {
     expect(calls.some((call) => call.includes("root"))).toBe(false);
   });
 
+  it("settles on the existing folder when a create fails after it happened", async () => {
+    const { api, calls } = aios();
+    const uncertain = {
+      ...api,
+      createFolder: async (parentId: string, name: string) => {
+        await api.createFolder(parentId, name);
+        throw new Error("Drive request failed (HTTP 503)");
+      },
+    };
+    const made = await ensureProjectFolders(uncertain, "Tournament");
+    expect(made.outputFolderId).not.toBe("");
+    expect(calls.filter((call) => call.startsWith("create"))).toEqual(["create existing/outputs"]);
+  });
+
+  it("gives concurrent runs the same folders", async () => {
+    const { api } = aios();
+    const [a, b] = await Promise.all([
+      ensureProjectFolders(api, "Parallel"),
+      ensureProjectFolders(api, "Parallel"),
+    ]);
+    expect(a.projectFolderId).toBe(b.projectFolderId);
+    expect(a.inputFolderId).toBe(b.inputFolderId);
+    expect(a.outputFolderId).toBe(b.outputFolderId);
+  });
+
   it("creates the project folder with inputs and outputs under aios/projects", async () => {
     const { api, calls } = aios();
     const made = await ensureProjectFolders(api, " New one ");

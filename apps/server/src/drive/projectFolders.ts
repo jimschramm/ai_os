@@ -36,11 +36,26 @@ export const ensureProjectFolders = async (
     );
   }
   const created: string[] = [];
+  // Creates are not retried. After any create (or a failed one, which may
+  // still have happened), look again and use the oldest folder of that name,
+  // so concurrent or uncertain runs all settle on the same folder.
   const findOrCreate = async (parentId: string, folder: string) => {
     const found = await api.findChildFolder(parentId, folder);
     if (found !== null) return found;
-    created.push(folder);
-    return api.createFolder(parentId, folder);
+    const made = await api.createFolder(parentId, folder).then(
+      (file) => ({ file, error: null }),
+      (error: unknown) => ({ file: null, error }),
+    );
+    const settled = await api.findChildFolder(parentId, folder);
+    if (settled === null) {
+      if (made.file !== null) {
+        created.push(folder);
+        return made.file;
+      }
+      throw made.error;
+    }
+    if (made.file !== null && made.file.id === settled.id) created.push(folder);
+    return settled;
   };
   const project = await findOrCreate(projects.id, name);
   const inputs = await findOrCreate(project.id, "inputs");

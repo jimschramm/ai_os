@@ -125,9 +125,11 @@ export const makeDriveApi = (
       cached = null;
       response = await send();
     }
+    // Only reads are retried: a failed create may still have happened.
+    const retryable = (init.method ?? "GET") === "GET";
     for (
       let attempt = 0;
-      attempt < 4 && [429, 500, 502, 503].includes(response.status);
+      retryable && attempt < 4 && [429, 500, 502, 503].includes(response.status);
       attempt++
     ) {
       await new Promise((done) => setTimeout(done, 500 * 2 ** attempt));

@@ -102,11 +102,26 @@ describe("SST strings across CONTINUE records", () => {
   });
 });
 
-/** A minimal version-3 compound file with one regular-sector stream. */
-const makeCfb = (name: string, stream: Uint8Array) => {
+/** A minimal version-3 compound file with regular-sector streams (each padded to 4096+ bytes). */
+const makeCfb = (
+  name: string,
+  stream: Uint8Array,
+  more: ReadonlyArray<[string, Uint8Array]> = [],
+) => {
   const SECTOR = 512;
-  const data = new Uint8Array(Math.max(4096, Math.ceil(stream.length / SECTOR) * SECTOR));
-  data.set(stream);
+  const blocks = [[name, stream] as const, ...more].map(([blockName, bytes]) => {
+    const padded = new Uint8Array(Math.max(4096, Math.ceil(bytes.length / SECTOR) * SECTOR));
+    padded.set(bytes);
+    return { blockName, padded };
+  });
+  const data = new Uint8Array(blocks.reduce((sum, b) => sum + b.padded.length, 0));
+  const starts: number[] = [];
+  let filled = 0;
+  for (const b of blocks) {
+    starts.push(2 + filled / SECTOR);
+    data.set(b.padded, filled);
+    filled += b.padded.length;
+  }
   const dataSectors = data.length / SECTOR;
   const out = new Uint8Array(SECTOR * (3 + dataSectors));
   const dv = new DataView(out.buffer);
@@ -127,7 +142,8 @@ const makeCfb = (name: string, stream: Uint8Array) => {
   dv.setUint32(fat, 0xfffffffd, true);
   dv.setUint32(fat + 4, 0xfffffffe, true);
   for (let s = 0; s < dataSectors; s += 1) {
-    dv.setUint32(fat + (2 + s) * 4, s === dataSectors - 1 ? 0xfffffffe : 3 + s, true);
+    const last = starts.includes(3 + s) || s === dataSectors - 1;
+    dv.setUint32(fat + (2 + s) * 4, last ? 0xfffffffe : 3 + s, true);
   }
   const dir = SECTOR * 2; // sector 1
   const entry = (index: number, entryName: string, type: number, start: number, size: number) => {
@@ -140,7 +156,7 @@ const makeCfb = (name: string, stream: Uint8Array) => {
     dv.setUint32(base + 120, size, true);
   };
   entry(0, "Root Entry", 5, 0xfffffffe, 0);
-  entry(1, name, 2, 2, data.length);
+  blocks.forEach((b, i) => entry(1 + i, b.blockName, 2, starts[i]!, b.padded.length));
   out.set(data, SECTOR * 3);
   return out;
 };
@@ -193,6 +209,20 @@ describe("Excel 97 records", () => {
 });
 
 describe("record bounds", () => {
+  it("rejects worksheets that share records", () => {
+    // Two sheet entries at distinct BOFs, but the first sheet has no EOF of its own.
+    const bof = record(0x0809, [...u16(0x0600), ...u16(0x10), ...new Array(12).fill(0)]);
+    const cell = record(0x0204, [...u16(0), ...u16(0), ...u16(0), ...u16(1), 0, 0x41]);
+    const base = workbook([...cell, ...bof, ...cell], 2);
+    // Point the second entry at the inner BOF.
+    const second = base.length - 4 - cell.length - bof.length;
+    const bytes = new Uint8Array(base);
+    const firstBound = 4 + 16 + 4; // globals BOF record, then the first BOUNDSHEET header
+    const boundLength = 4 + 6 + 4;
+    new DataView(bytes.buffer).setUint32(firstBound + boundLength, second, true);
+    expect(() => extractXls(makeCfb("Workbook", bytes))).toThrow(/share/);
+  });
+
   it("rejects sheet entries that repeat one worksheet", () => {
     const cells = record(0x0204, [...u16(0), ...u16(0), ...u16(0), ...u16(1), 0, 0x41]);
     expect(extractXls(makeCfb("Workbook", workbook(cells)))).toBe("## Sheet: S1\nA");
@@ -208,6 +238,42 @@ describe("record bounds", () => {
       ...record(0x003c, [0, 0x43, 0x44]),
     ];
     expect(extractXls(makeCfb("Workbook", workbook(cells)))).toBe("## Sheet: S1\nABCD");
+  });
+
+  it("keeps the current-edit slide list inside its document and slide list", () => {
+    const rec = (verInst: number, type: number, body: number[], declared = body.length) => [
+      ...u16(verInst),
+      ...u16(type),
+      declared & 0xff,
+      declared >> 8,
+      0,
+      0,
+      ...body,
+    ];
+    const u32 = (n: number) => [n & 0xff, (n >> 8) & 0xff, (n >> 16) & 0xff, n >>> 24];
+    const build = (docLen: number | undefined, listLen: number | undefined) => {
+      const slideAtom = rec(0, 0x03f3, u32(99));
+      const atom = rec(0, 0x0fa8, [0x61, 0x62, 0x63]);
+      const list = rec(0x0f, 0x0ff0, [...slideAtom, ...atom], listLen);
+      const doc = rec(0x0f, 0x03e8, list, docLen);
+      const dirAt = doc.length;
+      const directory = rec(0, 0x1772, [...u32((1 << 20) | 1), ...u32(0)]);
+      const editAt = dirAt + directory.length;
+      const edit = rec(0, 0x0ff5, [...u32(0), ...u32(0), ...u32(0), ...u32(dirAt), ...u32(1)]);
+      const current = new Uint8Array(20);
+      new DataView(current.buffer).setUint32(16, editAt, true);
+      return extractPpt(
+        makeCfb("PowerPoint Document", new Uint8Array([...doc, ...directory, ...edit]), [
+          ["Current User", current],
+        ]),
+      );
+    };
+    const slideAtomLength = 12;
+    expect(build(undefined, undefined)).toContain("abc");
+    // The list claims more than the document holds.
+    expect(build(8, undefined)).not.toContain("abc");
+    // The atom runs past its slide list.
+    expect(build(undefined, slideAtomLength + 4)).not.toContain("abc");
   });
 
   it("does not let a PowerPoint record run past its container", () => {

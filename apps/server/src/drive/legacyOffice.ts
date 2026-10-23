@@ -397,6 +397,12 @@ export const extractXls = (bytes: Uint8Array) => {
   const byOffset = new Map(records.map((record, index) => [record.offset, index]));
   const out: string[] = [];
   const used = new Set<number>();
+  // Every worksheet record belongs to one sheet at most, so work stays linear.
+  const owner = new Set<number>();
+  const claim = (index: number) => {
+    if (owner.has(index)) throw new Error("Broken workbook: two sheets share records.");
+    owner.add(index);
+  };
   for (const sheet of sheets) {
     // Each sheet entry must point at its own worksheet BOF; repeats would
     // render one large sheet over and over.
@@ -417,7 +423,9 @@ export const extractXls = (bytes: Uint8Array) => {
       line.set(col, value.replace(/[\t\n\r]+/g, " "));
     };
     let pendingFormula: { row: number; col: number } | null = null;
+    claim(start);
     for (let i = start + 1; i < records.length; i += 1) {
+      claim(i);
       const record = records[i]!;
       if (record.type === 0x000a) break;
       if (record.type === 0x0207) {
@@ -595,12 +603,12 @@ export const extractPpt = (bytes: Uint8Array) => {
   };
   for (let at = doc.body; at + 8 <= doc.next;) {
     const list = header(at);
-    if (list === null || list.next <= at) break;
+    if (list === null || list.next <= at || list.next > doc.next) break;
     // SlideListWithText: instance 0 lists slides, 2 lists notes pages.
     if (list.type === 0x0ff0 && (list.instance === 0 || list.instance === 2)) {
       for (let inner = list.body; inner + 8 <= list.next;) {
         const record = header(inner);
-        if (record === null || record.next <= inner) break;
+        if (record === null || record.next <= inner || record.next > list.next) break;
         if (record.type === 0x03f3 && record.body + 4 <= record.next) {
           // Older files keep slide text in this list; newer ones in each slide's drawing.
           const drawn = drawingOf(dv.getUint32(record.body, true));

@@ -146,3 +146,20 @@ describe("makeDriveApi", () => {
     await expect(api.getFile("x")).rejects.toThrow(/Drive login needed/);
   });
 });
+
+describe("writes", () => {
+  it("does not retry a create that failed with a transient error", async () => {
+    let posts = 0;
+    const doFetch = async (input: string | URL | Request, init: RequestInit = {}) => {
+      const url = new URL(String(input));
+      if (url.hostname === "oauth2.googleapis.com") {
+        return new Response(JSON.stringify({ access_token: "access-1", expires_in: 3600 }));
+      }
+      if (init.method === "POST") posts += 1;
+      return new Response("{}", { status: 503 });
+    };
+    const api = makeDriveApi(credentials, doFetch as never);
+    await expect(api.createFolder("parent", "outputs")).rejects.toThrow(/503/);
+    expect(posts).toBe(1);
+  });
+});
