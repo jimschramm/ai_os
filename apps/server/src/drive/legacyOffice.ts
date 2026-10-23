@@ -207,15 +207,18 @@ export const extractDoc = (bytes: Uint8Array) => {
 };
 
 /** BIFF8 reader that follows strings across CONTINUE record boundaries. */
-class BiffReader {
+/** Exported for tests. */
+export class BiffReader {
   pos = 0;
   readonly data: Uint8Array;
   readonly dv: DataView;
   readonly boundaries: readonly number[];
+  readonly boundarySet: ReadonlySet<number>;
   constructor(data: Uint8Array, boundaries: readonly number[]) {
     this.data = data;
     this.dv = view(data);
     this.boundaries = boundaries;
+    this.boundarySet = new Set(boundaries);
   }
   u8() {
     return this.dv.getUint8(this.pos++);
@@ -244,6 +247,11 @@ class BiffReader {
     let out = "";
     let left = count;
     while (left > 0) {
+      // Characters that reach a CONTINUE record go on after its width byte.
+      if (this.boundarySet.has(this.pos)) {
+        flags = this.u8();
+        continue;
+      }
       const wide = (flags & 0x01) !== 0;
       const room = Math.floor((this.nextBoundary() - this.pos) / (wide ? 2 : 1));
       const take = Math.min(left, Math.max(room, 0));

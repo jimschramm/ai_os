@@ -26,6 +26,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
+import * as Semaphore from "effect/Semaphore";
 import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
 
 import { authorize, authResponse } from "../aiOsBoard.ts";
@@ -231,6 +232,8 @@ export const layer = Layer.unwrap(
       }),
     );
 
+    const startLock = Semaphore.makeUnsafe(1);
+
     /** Runs (or resumes) a snapshot job, saving its state as it goes. */
     const runJob = (
       job: DriveJob,
@@ -246,20 +249,26 @@ export const layer = Layer.unwrap(
         refs: job.refs,
         resume,
         onProgress: (done, total, current) => {
-          jobs.save({ ...job, state: "running", done, total, current });
+          // Progress is best effort; the final state is what counts.
+          jobs.save({ ...job, state: "running", done, total, current }).catch(() => undefined);
         },
-      }).then(
-        (result) => jobs.save({ ...job, state: "done", manifest: result.ref }),
-        (cause: unknown) => {
-          const failed = classify(cause);
-          return jobs.save({
-            ...job,
-            state: "failed",
-            error: failed.detail,
-            status: failed.status,
-          });
-        },
-      );
+      })
+        .then(
+          (result) => jobs.save({ ...job, state: "done", manifest: result.ref }),
+          (cause: unknown) => {
+            const failed = classify(cause);
+            return jobs.save({
+              ...job,
+              state: "failed",
+              error: failed.detail,
+              status: failed.status,
+            });
+          },
+        )
+        .catch(() => {
+          // The final state could not be saved: the job stays "running" on disk and
+          // resumes (reusing the finished snapshot) on the next start.
+        });
 
     const snapshot = handle(AuthOrchestrationOperateScope, (input) =>
       Effect.gen(function* () {
@@ -286,7 +295,16 @@ export const layer = Layer.unwrap(
           total: 0,
           current: null,
         };
-        yield* fromPromise(() => jobs.save(job));
+        // One job per task: checked and recorded under one lock.
+        yield* startLock.withPermits(1)(
+          Effect.gen(function* () {
+            const active = yield* fromPromise(() => jobs.running());
+            if (active.some((other) => other.projectId === projectId && other.taskId === taskId)) {
+              return yield* bad(`A Drive snapshot for task ${taskId} is already running.`, 409);
+            }
+            yield* fromPromise(() => jobs.save(job));
+          }),
+        );
         void runJob(job, worktree, drive, false);
         return { jobId };
       }),
@@ -300,8 +318,8 @@ export const layer = Layer.unwrap(
         if (job.state === "running") {
           return { state: job.state, done: job.done, total: job.total, current: job.current };
         }
-        // A finished job is handed over once; its result lives on in the snapshot.
-        yield* fromPromise(() => jobs.remove(job.jobId));
+        // A finished job answers every poll until the client acknowledges it.
+        if (input.ack === true) yield* fromPromise(() => jobs.remove(job.jobId));
         return job.state === "done"
           ? { state: job.state, manifest: job.manifest }
           : { state: job.state, error: job.error, status: job.status };
@@ -311,7 +329,21 @@ export const layer = Layer.unwrap(
     // Jobs that were running when the server stopped pick up where they left off:
     // files already read come from the project's content store.
     const pending = yield* Effect.promise(() => jobs.running().catch(() => [] as DriveJob[]));
+    const resumed = new Set<string>();
     for (const job of pending) {
+      const key = `${job.projectId}\u0000${job.taskId}`;
+      if (resumed.has(key)) {
+        yield* Effect.promise(() =>
+          jobs.save({
+            ...job,
+            state: "failed",
+            error: `Another Drive snapshot for task ${job.taskId} was resumed instead.`,
+            status: 409,
+          }),
+        );
+        continue;
+      }
+      resumed.add(key);
       const worktree = yield* worktreeOf(job.projectId).pipe(Effect.orElseSucceed(() => null));
       const drive = yield* api.pipe(Effect.orElseSucceed(() => null));
       if (worktree === null || drive === null) {

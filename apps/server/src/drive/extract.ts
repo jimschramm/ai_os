@@ -139,6 +139,8 @@ export const extractDocx = async (bytes: Uint8Array) => {
 
 const columnIndex = (ref: string) => {
   const letters = /^[A-Z]+/.exec(ref)?.[0] ?? "A";
+  // XLSX columns run A..XFD; anything longer is a malformed reference.
+  if (letters.length > 3) throw new Error(`Malformed cell reference ${ref}.`);
   let index = 0;
   for (const letter of letters) index = index * 26 + (letter.charCodeAt(0) - 64);
   return index - 1;
@@ -193,6 +195,7 @@ export const extractXlsx = async (bytes: Uint8Array) => {
         else if (type === "b") value = raw === "1" ? "TRUE" : raw === undefined ? "" : "FALSE";
         else value = raw === undefined ? "" : decodeEntities(raw);
         const index = ref === "" ? cells.length : columnIndex(ref);
+        if (index >= 16_384) throw new Error(`Malformed cell reference ${ref}.`);
         while (cells.length < index) cells.push("");
         cells[index] = value.replace(/[\t\n\r]+/g, " ");
       }

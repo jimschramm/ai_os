@@ -3,6 +3,8 @@
  * Reads Drive files into the content store and copies a task's files into the
  * project worktree. Never writes to Drive.
  */
+import { execFile } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
@@ -207,6 +209,7 @@ export const buildSnapshot = async (input: {
   }
   const relRoot = `${DRIVE_SNAPSHOT_DIR}/${input.taskId.replaceAll(":", "_")}`;
   const absRoot = path.join(input.worktree, ...relRoot.split("/"));
+  await assertNoSymlinks(input.worktree, relRoot);
   // A snapshot is immutable: never overwrite one a task already points at.
   if (
     await fs.stat(absRoot).then(
@@ -221,19 +224,24 @@ export const buildSnapshot = async (input: {
     }
     throw new DriveApiError(`A Drive snapshot already exists at ${relRoot}.`);
   }
-  // Leftovers of a run cut short (server restart): only this task's temp folders.
-  const parent = path.dirname(absRoot);
-  for (const entry of await fs.readdir(parent).catch(() => [] as string[])) {
-    if (entry.startsWith(`${path.basename(absRoot)}.tmp-`)) {
-      await fs.rm(path.join(parent, entry), { recursive: true, force: true });
+  // Resuming after a restart: clear what this task's interrupted run left behind.
+  // The server runs one job per task, so no live job owns these folders.
+  if (input.resume === true) {
+    const parent = path.dirname(absRoot);
+    for (const entry of await fs.readdir(parent).catch(() => [] as string[])) {
+      if (entry.startsWith(`${path.basename(absRoot)}.tmp-`)) {
+        await fs.rm(path.join(parent, entry), { recursive: true, force: true });
+      }
     }
   }
   const resolved: ResolvedRef[] = [];
   for (const ref of input.refs) resolved.push(await resolveRef(input.api, ref));
 
   await ensureIgnored(input.worktree);
-  const temporary = `${absRoot}.tmp-${Date.now()}`;
-  await fs.mkdir(temporary, { recursive: true });
+  const temporary = `${absRoot}.tmp-${randomUUID()}`;
+  await fs.mkdir(path.dirname(temporary), { recursive: true });
+  await assertNoSymlinks(input.worktree, relRoot);
+  await fs.mkdir(temporary);
   const seen = new Set<string>();
   const files: DriveManifestFileV1[] = [];
   const full: Array<Record<string, unknown>> = [];
@@ -252,18 +260,21 @@ export const buildSnapshot = async (input: {
         const stem = `${String(index).padStart(4, "0")}-${safeName(file.name)}`;
         let original: string | undefined;
         let text: string | undefined;
+        const hashes: Record<string, string> = {};
         if (stored.originalPath !== null) {
           const ext = path.extname(stored.originalPath);
           const target = stem.toLowerCase().endsWith(ext.toLowerCase()) ? stem : `${stem}${ext}`;
           await fs.copyFile(stored.originalPath, path.join(temporary, target));
           await fs.chmod(path.join(temporary, target), 0o444);
           original = `${relRoot}/${target}`;
+          hashes.originalSha256 = await fileSha(path.join(temporary, target));
         }
         if (stored.textPath !== null) {
           const target = `${stem}.txt`;
           await fs.copyFile(stored.textPath, path.join(temporary, target));
           await fs.chmod(path.join(temporary, target), 0o444);
           text = `${relRoot}/${target}`;
+          hashes.textSha256 = await fileSha(path.join(temporary, target));
         }
         const entry: DriveManifestFileV1 = {
           id: file.id,
@@ -285,6 +296,7 @@ export const buildSnapshot = async (input: {
           sha256: stored.meta.sha256,
           method: stored.meta.method,
           contentStore: `${stored.meta.fileId}/${stored.meta.version}`,
+          ...hashes,
         });
       }
     }
@@ -367,15 +379,42 @@ const loadSnapshot = async (worktree: string, relRoot: string): Promise<Snapshot
   }
 };
 
+const fileSha = async (file: string) => sha256Hex(await fs.readFile(file));
+
+/** Refuses a snapshot path that goes through a symlink, so writes and cleanup stay in the worktree. */
+const assertNoSymlinks = async (worktree: string, relRoot: string) => {
+  let current = worktree;
+  for (const segment of relRoot.split("/")) {
+    current = path.join(current, segment);
+    const stat = await fs.lstat(current).catch(() => null);
+    if (stat === null) return;
+    if (stat.isSymbolicLink() || !stat.isDirectory()) {
+      throw new DriveApiError(
+        `${path.relative(worktree, current)} is not a plain folder; the Drive snapshot was not written.`,
+      );
+    }
+  }
+};
+
+/** The repo's info/exclude path as git resolves it (linked worktrees included); null outside git. */
+const gitExcludePath = (worktree: string) =>
+  new Promise<string | null>((resolve) => {
+    execFile(
+      "git",
+      ["rev-parse", "--path-format=absolute", "--git-path", "info/exclude"],
+      { cwd: worktree, timeout: 10_000 },
+      (error, stdout) => resolve(error === null ? stdout.trim() || null : null),
+    );
+  });
+
 /** Keeps snapshots out of git without touching the project's .gitignore. */
 const ensureIgnored = async (worktree: string) => {
-  const exclude = path.join(worktree, ".git", "info", "exclude");
+  const exclude = await gitExcludePath(worktree);
+  // Not a git checkout: there is nothing to keep the snapshot out of.
+  if (exclude === null) return;
   const line = "/.ai_os/drive/";
-  const current = await fs.readFile(exclude, "utf8").catch(() => null);
-  if (current === null) {
-    // Not a plain git checkout (or a linked worktree): the agent sees the folder untracked.
-    return;
-  }
+  await fs.mkdir(path.dirname(exclude), { recursive: true });
+  const current = await fs.readFile(exclude, "utf8").catch(() => "");
   if (!current.split("\n").includes(line)) {
     await fs.appendFile(
       exclude,
@@ -391,5 +430,27 @@ export const verifySnapshot = async (worktree: string, ref: DriveManifestRefV1) 
     .catch(() => null);
   if (text === null) return `The Drive snapshot ${ref.root} is missing.`;
   if (sha256Hex(text) !== ref.manifestSha256) return `The Drive snapshot ${ref.root} was changed.`;
+  // Every copied file must still be there, byte for byte.
+  let files: Array<Record<string, unknown>> = [];
+  try {
+    files = (JSON.parse(text) as { files?: Array<Record<string, unknown>> }).files ?? [];
+  } catch {
+    return `The Drive snapshot ${ref.root} has an unreadable manifest.`;
+  }
+  for (const file of files) {
+    for (const [pathKey, shaKey] of [
+      ["original", "originalSha256"],
+      ["text", "textSha256"],
+    ] as const) {
+      const rel = file[pathKey];
+      if (typeof rel !== "string") continue;
+      if (!rel.startsWith(`${ref.root}/`) || rel.includes("..")) {
+        return `The Drive snapshot ${ref.root} lists a file outside the snapshot.`;
+      }
+      const actual = await fileSha(path.join(worktree, ...rel.split("/"))).catch(() => null);
+      if (actual === null) return `The Drive snapshot file ${rel} is missing.`;
+      if (actual !== file[shaKey]) return `The Drive snapshot file ${rel} was changed.`;
+    }
+  }
   return null;
 };

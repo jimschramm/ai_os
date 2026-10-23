@@ -135,9 +135,23 @@ export const makeContentStore = (root: string) => {
       await fs.writeFile(path.join(temporary, "meta.json"), `${JSON.stringify(meta, null, 2)}\n`, {
         mode: 0o600,
       });
-      // Replace a stale entry (failed sha check) with the fresh one.
-      await fs.rm(dir, { recursive: true, force: true });
-      await fs.rename(temporary, dir);
+      const published = await fs.rename(temporary, dir).then(
+        () => true,
+        () => false,
+      );
+      if (!published) {
+        // Another task stored this version first: use its entry when it checks out.
+        const existing = await get(input.fileId, input.version);
+        if (existing !== null) {
+          await fs.rm(temporary, { recursive: true, force: true });
+          return existing;
+        }
+        // A stale entry (failed sha check): move it aside, then publish the fresh one.
+        const stale = `${dir}.${randomUUID()}.stale`;
+        await fs.rename(dir, stale).catch(() => undefined);
+        await fs.rename(temporary, dir);
+        await fs.rm(stale, { recursive: true, force: true });
+      }
       await fs.appendFile(path.join(root, "index.jsonl"), `${JSON.stringify(meta)}\n`, {
         mode: 0o600,
       });

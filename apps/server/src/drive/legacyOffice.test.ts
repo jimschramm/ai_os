@@ -5,7 +5,7 @@ import * as path from "node:path";
 import { describe, expect, it } from "vite-plus/test";
 
 import { extractContent } from "./extract.ts";
-import { extractDoc, extractPpt, extractXls } from "./legacyOffice.ts";
+import { BiffReader, extractDoc, extractPpt, extractXls } from "./legacyOffice.ts";
 
 const fixture = (name: string) =>
   new Uint8Array(fs.readFileSync(path.join(import.meta.dirname, "fixtures", name)));
@@ -66,5 +66,38 @@ describe("legacy Office text", () => {
     });
     expect(truncated.kind).toBe("file");
     expect(truncated.error).toBeDefined();
+  });
+});
+
+describe("SST strings across CONTINUE records", () => {
+  // Builds one SST string split at `cut` characters, with the CONTINUE width byte.
+  const split = (text: string, cut: number, firstWide: boolean, secondWide: boolean) => {
+    const enc = (s: string, wide: boolean) =>
+      wide
+        ? [...s].flatMap((ch) => [ch.charCodeAt(0) & 0xff, ch.charCodeAt(0) >> 8])
+        : [...s].map((ch) => ch.charCodeAt(0));
+    const head = [text.length & 0xff, text.length >> 8, firstWide ? 1 : 0];
+    const first = [...head, ...enc(text.slice(0, cut), firstWide)];
+    const second = [
+      secondWide ? 1 : 0,
+      ...enc(text.slice(cut), secondWide),
+      2,
+      0,
+      0,
+      ...enc("ok", false),
+    ];
+    return new BiffReader(new Uint8Array([...first, ...second]), [first.length]);
+  };
+
+  it("reads a compressed string ending its first part exactly at the boundary", () => {
+    const reader = split("abcdef", 3, false, false);
+    expect(reader.string(2)).toBe("abcdef");
+    expect(reader.string(2)).toBe("ok");
+  });
+
+  it("follows a width change from compressed to UTF-16", () => {
+    const reader = split("abcdé€", 4, false, true);
+    expect(reader.string(2)).toBe("abcdé€");
+    expect(reader.string(2)).toBe("ok");
   });
 });

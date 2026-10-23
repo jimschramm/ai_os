@@ -1,4 +1,5 @@
 // @effect-diagnostics nodeBuiltinImport:off globalDate:off - uses a temp dir as the content store and worktree.
+import { execFileSync } from "node:child_process";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -17,6 +18,9 @@ import {
   projectRoots,
 } from "./projectFolders.ts";
 import { makeZip } from "./testZip.ts";
+
+const git = (cwd: string, ...args: string[]) =>
+  execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
 
 const temps: string[] = [];
 const temp = async () => {
@@ -185,7 +189,7 @@ describe("buildSnapshot", () => {
   it("copies a folder (all depths) read-only into the worktree with a manifest and totals", async () => {
     const { api, calls } = tree();
     const worktree = await temp();
-    await fs.mkdir(path.join(worktree, ".git", "info"), { recursive: true });
+    git(worktree, "init", "-q");
     await fs.writeFile(path.join(worktree, ".git", "info", "exclude"), "# local\n");
     const store = makeContentStore(await temp());
     const progress: string[] = [];
@@ -225,6 +229,13 @@ describe("buildSnapshot", () => {
     // Read-only toward Drive.
     expect(calls.some((call) => call.startsWith("create"))).toBe(false);
     expect(await verifySnapshot(worktree, ref)).toBeNull();
+    // A changed or missing copy fails the check even with the manifest intact.
+    const textCopy = path.join(worktree, ref.files.find((file) => file.text !== undefined)!.text!);
+    await fs.chmod(textCopy, 0o644);
+    await fs.writeFile(textCopy, "tampered");
+    expect(await verifySnapshot(worktree, ref)).toMatch(/file .* was changed/);
+    await fs.rm(textCopy);
+    expect(await verifySnapshot(worktree, ref)).toMatch(/file .* is missing/);
     await fs.chmod(result.manifestPath, 0o644);
     await fs.appendFile(result.manifestPath, " ");
     expect(await verifySnapshot(worktree, ref)).toMatch(/changed/);
@@ -305,6 +316,79 @@ describe("ensureProjectFolders", () => {
     expect(await isInsideFolders(api, "elsewhere", roots)).toBe(false);
     expect(await isInsideFolders(api, P, roots)).toBe(false);
     expect(await isInsideFolders(api, "missing-id", roots)).toBe(false);
+    // A configured folder outside aios/projects is not a project folder.
+    expect(await projectRoots(api, { inputFolderId: "elsewhere" })).toEqual([]);
+    expect(await projectRoots(api, { inputFolderId: P })).toEqual([]);
+  });
+});
+
+describe("snapshot safety", () => {
+  it("refuses to write through a symlinked .ai_os folder", async () => {
+    const { api } = tree();
+    const worktree = await temp();
+    const outside = await temp();
+    await fs.symlink(outside, path.join(worktree, ".ai_os"));
+    await expect(
+      buildSnapshot({
+        api,
+        store: makeContentStore(await temp()),
+        worktree,
+        taskId: "t1",
+        refs: ["txt1-0000000"],
+      }),
+    ).rejects.toThrow(/not a plain folder/);
+    expect(await fs.readdir(outside)).toEqual([]);
+  });
+
+  it("keeps snapshots out of git in a linked worktree too", async () => {
+    const main = await temp();
+    git(main, "init", "-q");
+    git(
+      main,
+      "-c",
+      "user.name=t",
+      "-c",
+      "user.email=t@t",
+      "commit",
+      "-q",
+      "--allow-empty",
+      "-m",
+      "x",
+    );
+    const linked = path.join(await temp(), "wt");
+    git(main, "worktree", "add", "-q", linked);
+    const { api } = tree();
+    await buildSnapshot({
+      api,
+      store: makeContentStore(await temp()),
+      worktree: linked,
+      taskId: "t1",
+      refs: ["txt1-0000000"],
+    });
+    expect(git(linked, "status", "--porcelain")).toBe("");
+  });
+
+  it("lets parallel tasks store the same file version", async () => {
+    const store = makeContentStore(await temp());
+    const put = (text: string) =>
+      store.put({
+        fileId: "f1",
+        version: "v1",
+        name: "a.txt",
+        mimeType: "text/plain",
+        modifiedTime: null,
+        md5Checksum: null,
+        webViewLink: null,
+        kind: "text",
+        method: "utf8",
+        original: new TextEncoder().encode(text),
+        originalExt: "txt",
+        text,
+        error: null,
+      });
+    const [first, second] = await Promise.all([put("same"), put("same")]);
+    expect(first.meta.sha256).toBe(second.meta.sha256);
+    expect(await store.get("f1", "v1")).not.toBeNull();
   });
 });
 

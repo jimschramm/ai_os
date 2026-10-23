@@ -384,6 +384,10 @@ const snapshotDrive = (
     for (;;) {
       const status = yield* call("snapshot/status", { jobId: started.jobId });
       if (!isRecord(status)) return yield* unreadable("snapshot status");
+      if (status.state === "done" || status.state === "failed") {
+        // Result in hand: the server may drop the job now.
+        yield* call("snapshot/status", { jobId: started.jobId, ack: true }).pipe(Effect.ignore);
+      }
       if (status.state === "done") {
         const manifest = yield* decodeDriveManifestRefV1(status.manifest).pipe(
           Effect.mapError(() => unreadable("manifest")),

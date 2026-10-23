@@ -55,7 +55,9 @@ export const ensureProjectFolders = async (
 
 /**
  * The folders a project owns in Drive: its input and output folders and, when
- * they sit in `aios/projects/<name>/`, that project folder itself.
+ * they sit in `aios/projects/<name>/`, that project folder itself. A configured
+ * folder outside aios/projects is not a project folder; its files can still be
+ * attached to a task one by one.
  */
 export const projectRoots = async (
   api: DriveApi,
@@ -63,7 +65,8 @@ export const projectRoots = async (
 ): Promise<string[]> => {
   const roots = new Set<string>();
   for (const id of [drive.inputFolderId, drive.outputFolderId]) {
-    if (id === undefined) continue;
+    if (id === undefined || id === AIOS_PROJECTS_FOLDER_ID || id === AIOS_ROOT_FOLDER_ID) continue;
+    if (!(await isInsideFolders(api, id, [AIOS_PROJECTS_FOLDER_ID]))) continue;
     roots.add(id);
     const folder = await api.getFile(id).catch(() => null);
     for (const parent of folder?.parents ?? []) {

@@ -120,3 +120,15 @@ describe("extractContent", () => {
     expect(bad.kind).toBe("file");
   });
 });
+
+describe("malformed XLSX", () => {
+  it("rejects a cell reference past column XFD instead of padding forever", async () => {
+    const bad = makeZip({
+      "xl/workbook.xml": '<workbook><sheets><sheet name="S1" r:id="rId1"/></sheets></workbook>',
+      "xl/_rels/workbook.xml.rels":
+        '<Relationships><Relationship Id="rId1" Target="worksheets/sheet1.xml"/></Relationships>',
+      "xl/worksheets/sheet1.xml": `<worksheet><sheetData><row r="1"><c r="${"Z".repeat(400)}1"><v>7</v></c></row></sheetData></worksheet>`,
+    });
+    await expect(extractXlsx(bad)).rejects.toThrow(/Malformed cell reference/);
+  });
+});
