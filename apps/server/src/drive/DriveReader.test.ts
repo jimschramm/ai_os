@@ -444,6 +444,27 @@ describe("snapshot safety", () => {
     expect(names.sort()).toEqual([".tmp", "abc", "abc.tmp-x"]);
   });
 
+  it("keeps long multibyte names within the 255-byte filename limit", async () => {
+    const name = `${"文".repeat(100)}.docx`;
+    const { api } = fakeApi(
+      [{ id: "cjk1-0000000", name, mimeType: "text/plain", size: 2 }],
+      {},
+      { "cjk1-0000000": new TextEncoder().encode("hi") },
+    );
+    const worktree = await temp();
+    const { ref } = await buildSnapshot({
+      api,
+      store: makeContentStore(await temp()),
+      worktree,
+      taskId: "t1",
+      refs: ["cjk1-0000000"],
+    });
+    for (const rel of [ref.files[0]!.original, ref.files[0]!.text].filter((r) => r !== undefined)) {
+      expect(Buffer.byteLength(path.basename(rel))).toBeLessThanOrEqual(255);
+    }
+    expect(await verifySnapshot(worktree, ref)).toBeNull();
+  });
+
   it("verifies a copy whose name has consecutive dots", async () => {
     const { api } = fakeApi(
       [{ id: "dots-0000000", name: "budget..final.txt", mimeType: "text/plain", size: 2 }],

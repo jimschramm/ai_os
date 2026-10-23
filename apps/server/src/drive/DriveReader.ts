@@ -179,12 +179,27 @@ export const resolveRef = async (
   return { ref, root, files: [{ ...root, path: root.name }] };
 };
 
-const safeName = (value: string) =>
-  value
+const utf8 = new TextEncoder();
+
+/**
+ * A file-system-safe name. Filenames are limited to 255 bytes, so the name is
+ * cut at 200 UTF-8 bytes, leaving room for the number prefix and suffixes.
+ */
+const safeName = (value: string) => {
+  const cleaned = value
     .replace(/[^\p{L}\p{N}._ -]+/gu, "_")
     .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, 100) || "file";
+    .trim();
+  let out = "";
+  let bytes = 0;
+  for (const char of cleaned) {
+    const size = utf8.encode(char).length;
+    if (bytes + size > 200) break;
+    out += char;
+    bytes += size;
+  }
+  return out || "file";
+};
 
 export interface SnapshotResult {
   readonly ref: DriveManifestRefV1;

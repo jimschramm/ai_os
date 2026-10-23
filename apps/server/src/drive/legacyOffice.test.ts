@@ -191,3 +191,43 @@ describe("Excel 97 records", () => {
     expect(() => extractXls(makeCfb("Workbook", workbook(number)))).toThrow(/Broken cell record/);
   });
 });
+
+describe("record bounds", () => {
+  it("reads a formula string result that goes on in a CONTINUE record", () => {
+    const cells = [
+      ...formulaString(0, 0),
+      ...record(0x0207, [...u16(4), 0, 0x41, 0x42]),
+      ...record(0x003c, [0, 0x43, 0x44]),
+    ];
+    expect(extractXls(makeCfb("Workbook", workbook(cells)))).toBe("## Sheet: S1\nABCD");
+  });
+
+  it("does not let a PowerPoint record run past its container", () => {
+    const atom = (text: string) => [
+      0,
+      0,
+      0xa8,
+      0x0f,
+      text.length,
+      0,
+      0,
+      0,
+      ...[...text].map((ch) => ch.charCodeAt(0)),
+    ];
+    const container = (declared: number, body: number[]) => [
+      0x0f,
+      0x00,
+      0xf0,
+      0x0f,
+      declared & 0xff,
+      declared >> 8,
+      0,
+      0,
+      ...body,
+    ];
+    const ppt = (bytes: number[]) =>
+      extractPpt(makeCfb("PowerPoint Document", new Uint8Array(bytes)));
+    expect(ppt(container(11, atom("abc")))).toContain("abc");
+    expect(() => ppt(container(4, atom("abc")))).toThrow(/No slide text/);
+  });
+});

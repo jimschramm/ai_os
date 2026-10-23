@@ -314,6 +314,19 @@ interface BiffRecord {
   readonly data: Uint8Array;
 }
 
+/** A record and its CONTINUE records as one buffer, with where each part starts. */
+const joinParts = (parts: readonly Uint8Array[]) => {
+  const joined = new Uint8Array(parts.reduce((sum, part) => sum + part.length, 0));
+  const boundaries: number[] = [];
+  let at = 0;
+  for (const part of parts) {
+    if (at > 0) boundaries.push(at);
+    joined.set(part, at);
+    at += part.length;
+  }
+  return { joined, boundaries };
+};
+
 const biffRecords = (stream: Uint8Array) => {
   const dv = view(stream);
   const records: BiffRecord[] = [];
@@ -371,14 +384,7 @@ export const extractXls = (bytes: Uint8Array) => {
       // SST plus its CONTINUE records, joined with the record boundaries kept.
       const parts = [record.data];
       while (records[i + 1]?.type === 0x003c) parts.push(records[++i]!.data);
-      const joined = new Uint8Array(parts.reduce((sum, part) => sum + part.length, 0));
-      const boundaries: number[] = [];
-      let at = 0;
-      for (const part of parts) {
-        if (at > 0) boundaries.push(at);
-        joined.set(part, at);
-        at += part.length;
-      }
+      const { joined, boundaries } = joinParts(parts);
       const reader = new BiffReader(joined, boundaries);
       reader.u32();
       const unique = reader.u32();
@@ -410,8 +416,12 @@ export const extractXls = (bytes: Uint8Array) => {
       if (record.type === 0x000a) break;
       if (record.type === 0x0207) {
         // STRING: the text result of the formula before it (may be shorter than a cell record).
+        // A long result goes on in CONTINUE records.
+        const parts = [record.data];
+        while (records[i + 1]?.type === 0x003c) parts.push(records[++i]!.data);
         if (pendingFormula !== null && record.data.length >= 3) {
-          const reader = new BiffReader(record.data, []);
+          const { joined, boundaries } = joinParts(parts);
+          const reader = new BiffReader(joined, boundaries);
           put(pendingFormula.row, pendingFormula.col, reader.string(2));
         }
         pendingFormula = null;
@@ -506,7 +516,8 @@ export const extractPpt = (bytes: Uint8Array) => {
     const out: string[] = [];
     for (let at = start; at + 8 <= end && depth < 64;) {
       const record = header(at);
-      if (record === null || record.next <= at) break;
+      // A record may not run past its container.
+      if (record === null || record.next <= at || record.next > end) break;
       if (record.version === 0x0f) out.push(...textsIn(record.body, record.next, depth + 1));
       else if (record.type === 0x0fa0 || record.type === 0x0fa8) {
         const text = textOf(record.type, record.body, record.next);
@@ -552,7 +563,7 @@ export const extractPpt = (bytes: Uint8Array) => {
     const walk = (start: number, end: number, depth: number) => {
       for (let at = start; at + 8 <= end && depth < 64;) {
         const record = header(at);
-        if (record === null || record.next <= at) break;
+        if (record === null || record.next <= at || record.next > end) break;
         if (record.type === 0x03f8 || record.type === 0x0fc8 || record.type === 0x0fc4) {
           // masters: template text, not content
         } else if (record.version === 0x0f) walk(record.body, record.next, depth + 1);
