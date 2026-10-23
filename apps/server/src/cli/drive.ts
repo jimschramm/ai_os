@@ -225,23 +225,31 @@ export const updateUnderLock = <E, R, LE, LR>(
  * With no server reachable, take the same exclusive ownership lock a server
  * takes at start, so no server can write settings while this one does.
  */
+/**
+ * The same exclusive ownership lock a server takes at start. Fails with
+ * "Nothing was changed" while a server holds it. Exported for tests.
+ */
+export const offlineLock = (statePath: string) =>
+  ServerOwnership.acquireServerOwnership(statePath).pipe(
+    Effect.provide(ProcessRunner.layer),
+    Effect.mapError((error) =>
+      error._tag === "ServerAlreadyRunningError"
+        ? userError(
+            "The ai_os server is running but did not answer. Nothing was changed; try again in a moment.",
+          )
+        : userError(error.message),
+    ),
+    Effect.andThen(clearPersistedServerRuntimeState(statePath)),
+  );
+
+/** With no server reachable, write settings under the ownership lock. */
 const updateOffline = (
   config: ServerConfig.ServerConfig["Service"],
   projectId: ProjectId,
   resolved: ResolvedProjectDriveUpdate,
 ) =>
   updateUnderLock(
-    ServerOwnership.acquireServerOwnership(config.serverRuntimeStatePath).pipe(
-      Effect.provide(ProcessRunner.layer),
-      Effect.mapError((error) =>
-        error._tag === "ServerAlreadyRunningError"
-          ? userError(
-              "The ai_os server is running but did not answer. Nothing was changed; try again in a moment.",
-            )
-          : userError(error.message),
-      ),
-      Effect.andThen(clearPersistedServerRuntimeState(config.serverRuntimeStatePath)),
-    ),
+    offlineLock(config.serverRuntimeStatePath),
     ServerSettings.layer.pipe(
       Layer.provide(ServerSecretStore.layer),
       Layer.provide(SqlitePersistence.layerConfig),

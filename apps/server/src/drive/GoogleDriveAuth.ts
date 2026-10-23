@@ -224,7 +224,7 @@ export const runLoopbackLogin = async (input: {
     // The browser tab only hears "signed in" after the token exchange succeeds.
     const { code, respond } = await new Promise<{
       readonly code: string;
-      readonly respond: (ok: boolean) => void;
+      readonly respond: (ok: boolean) => Promise<void>;
     }>((resolve, reject) => {
       const timer = setTimeout(
         () => reject(new DriveAuthError("Timed out waiting for Google sign-in.")),
@@ -239,22 +239,30 @@ export const runLoopbackLogin = async (input: {
         }
         settled = true;
         clearTimeout(timer);
+        // Resolves once the page is fully written, so closing the listener
+        // afterwards never cuts the browser off mid-response.
         const respond = (ok: boolean) =>
-          response
-            .writeHead(ok ? 200 : 400, { "content-type": "text/html; charset=utf-8" })
-            .end(
-              ok
-                ? PAGE(
-                    "Signed in to Google Drive",
-                    "You can close this tab and go back to the terminal.",
-                  )
-                : PAGE("Sign-in failed", "Go back to the terminal for details."),
-            );
+          new Promise<void>((done) => {
+            response.once("close", () => done());
+            response
+              .writeHead(ok ? 200 : 400, {
+                "content-type": "text/html; charset=utf-8",
+                connection: "close",
+              })
+              .end(
+                ok
+                  ? PAGE(
+                      "Signed in to Google Drive",
+                      "You can close this tab and go back to the terminal.",
+                    )
+                  : PAGE("Sign-in failed", "Go back to the terminal for details."),
+                () => done(),
+              );
+          });
         if ("code" in result) {
           resolve({ code: result.code, respond });
         } else {
-          respond(false);
-          reject(new DriveAuthError(result.error));
+          void respond(false).then(() => reject(new DriveAuthError(result.error)));
         }
       });
       input.showUrl(
@@ -275,15 +283,16 @@ export const runLoopbackLogin = async (input: {
         ...(input.fetch === undefined ? {} : { fetch: input.fetch }),
         ...(input.now === undefined ? {} : { now: input.now }),
       });
-      respond(true);
+      await respond(true);
       return token;
     } catch (error) {
-      respond(false);
+      await respond(false);
       throw error;
     }
   } finally {
-    server.closeAllConnections();
+    // Stop accepting first; only idle or finished sockets remain to drop.
     server.close();
+    server.closeAllConnections();
   }
 };
 

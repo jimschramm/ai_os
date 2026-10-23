@@ -4,7 +4,13 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 
 import * as ServerSettings from "../serverSettings.ts";
-import { updateUnderLock } from "./drive.ts";
+import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as FileSystem from "effect/FileSystem";
+import * as Path from "effect/Path";
+
+import * as ProcessRunner from "../processRunner.ts";
+import * as ServerOwnership from "../serverOwnership.ts";
+import { offlineLock, updateUnderLock } from "./drive.ts";
 
 const ID = "1AbCdEfGhIjKlMnOpQrStUvWxYz_-12345";
 const OTHER = "0ZyXwVuTsRqPoNmLkJiHgFeDcBa_-98765";
@@ -95,5 +101,38 @@ describe("offline drive project", () => {
     );
     expect(drive).toEqual({ enabled: true, outputFolderId: ID });
     expect(order).toEqual(["lock", "load settings", "unlock"]);
+  });
+
+  it("refuses to write while a server holds the ownership lock, and touches nothing", async () => {
+    let settingsLoaded = false;
+    const settingsLayer = Layer.effectDiscard(
+      Effect.sync(() => {
+        settingsLoaded = true;
+      }),
+    ).pipe(Layer.provideMerge(ServerSettings.layerTest()));
+    const message = await Effect.runPromise(
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const dir = yield* fs.makeTempDirectoryScoped({ prefix: "drive-lock-" });
+        const statePath = path.join(dir, "server-runtime.json");
+        // Stands in for a running server whose HTTP request failed.
+        yield* ServerOwnership.acquireServerOwnership(statePath);
+        const result = yield* Effect.result(
+          updateUnderLock(offlineLock(statePath), settingsLayer, ProjectId.make("p-held"), {
+            outputFolderId: ID,
+            clearInput: false,
+            clearOutput: false,
+            disable: false,
+          }),
+        );
+        return result._tag === "Failure" ? String(result.failure.message) : "updated";
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(ProcessRunner.layer.pipe(Layer.provideMerge(NodeServices.layer))),
+      ),
+    );
+    expect(message).toContain("Nothing was changed");
+    expect(settingsLoaded).toBe(false);
   });
 });

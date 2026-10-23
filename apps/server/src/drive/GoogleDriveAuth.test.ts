@@ -215,6 +215,8 @@ describe("loopback login", () => {
     const callback = `${redirect}?state=${auth.searchParams.get("state")}&code=abc`;
     const page = await fetch(callback);
     expect(page.status).toBe(200);
+    // The whole page arrives even though the listener closes right after.
+    expect(await page.text()).toContain("Signed in to Google Drive");
     await expect(login).resolves.toMatchObject({ refreshToken: "rt" });
     // The listener is gone after one callback.
     await expect(fetch(callback)).rejects.toThrow();
@@ -231,9 +233,24 @@ describe("loopback login", () => {
     const settled = login.catch((error: Error) => error);
     const page = await fetch(`${redirect}?state=forged&code=abc`);
     expect(page.status).toBe(400);
+    expect(await page.text()).toContain("Sign-in failed");
     expect(String(await settled)).toMatch(/State mismatch/);
     expect(exchanged).toBe(false);
   });
+  it("delivers the full failure page when the token exchange fails", async () => {
+    const { shown, login } = start(
+      async () => new Response(JSON.stringify({ error: "invalid_grant" }), { status: 400 }),
+    );
+    const auth = await shown;
+    const settled = login.catch((error: Error) => error);
+    const page = await fetch(
+      `${auth.searchParams.get("redirect_uri")}?state=${auth.searchParams.get("state")}&code=abc`,
+    );
+    expect(page.status).toBe(400);
+    expect(await page.text()).toContain("Sign-in failed");
+    expect(String(await settled)).toMatch(/invalid_grant/);
+  });
+
   it("never echoes unknown OAuth error text", async () => {
     const evil = "secret-abc\u001b[31m";
     const result = readCallback(`/oauth2callback?state=s&error=${encodeURIComponent(evil)}`, "s");
