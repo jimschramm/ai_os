@@ -6,6 +6,8 @@
  * project folders are reused (never duplicated) and only missing ones are
  * created. Nothing is renamed, moved or deleted.
  */
+import * as path from "node:path";
+import { lock } from "proper-lockfile";
 import { type DriveApi, DriveApiError, FOLDER_MIME } from "./DriveApi.ts";
 
 /** My Drive/aios */
@@ -21,10 +23,32 @@ export interface ProjectFolders {
   readonly created: readonly string[];
 }
 
+/**
+ * `lockDir` (the CLI passes the server secret folder) serializes provisioning
+ * across processes, so two runs never both create the same folder.
+ */
 export const ensureProjectFolders = async (
   api: DriveApi,
   projectName: string,
+  options: { readonly lockDir?: string } = {},
 ): Promise<ProjectFolders> => {
+  if (options.lockDir === undefined) return provision(api, projectName);
+  const release = await lock(path.join(options.lockDir, "drive-project-folders"), {
+    realpath: false,
+    stale: 60_000,
+    update: 10_000,
+    retries: { retries: 120, factor: 1, minTimeout: 500, maxTimeout: 500 },
+  }).catch(() => {
+    throw new DriveApiError("Another run is setting up Drive project folders. Try again.");
+  });
+  try {
+    return await provision(api, projectName);
+  } finally {
+    await release().catch(() => undefined);
+  }
+};
+
+const provision = async (api: DriveApi, projectName: string): Promise<ProjectFolders> => {
   const name = projectName.trim();
   if (name.length === 0) throw new DriveApiError("The project name is empty.");
   if (/[/\\]/.test(name))

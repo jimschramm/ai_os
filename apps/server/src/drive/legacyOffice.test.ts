@@ -251,8 +251,8 @@ describe("record bounds", () => {
       ...body,
     ];
     const u32 = (n: number) => [n & 0xff, (n >> 8) & 0xff, (n >> 16) & 0xff, n >>> 24];
-    const build = (docLen: number | undefined, listLen: number | undefined) => {
-      const slideAtom = rec(0, 0x03f3, u32(99));
+    const build = (docLen: number | undefined, listLen: number | undefined, slideRefs = [99]) => {
+      const slideAtom = slideRefs.flatMap((ref) => rec(0, 0x03f3, u32(ref)));
       const atom = rec(0, 0x0fa8, [0x61, 0x62, 0x63]);
       const list = rec(0x0f, 0x0ff0, [...slideAtom, ...atom], listLen);
       const doc = rec(0x0f, 0x03e8, list, docLen);
@@ -274,6 +274,8 @@ describe("record bounds", () => {
     expect(build(8, undefined)).not.toContain("abc");
     // The atom runs past its slide list.
     expect(build(undefined, slideAtomLength + 4)).not.toContain("abc");
+    // Many slides naming one drawing are refused, not read again and again.
+    expect(() => build(undefined, undefined, new Array(500).fill(1))).toThrow(/share one drawing/);
   });
 
   it("does not let a PowerPoint record run past its container", () => {

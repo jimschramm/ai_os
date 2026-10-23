@@ -92,7 +92,12 @@ const fakeApi = (
       ) ?? null,
     createFolder: async (parent, name) => {
       calls.push(`create ${parent}/${name}`);
-      const folder = { id: `new-${name}`, name, mimeType: FOLDER_MIME, parents: [parent] };
+      const folder = {
+        id: `new-${name}${folders.some((f) => f.id === `new-${name}`) ? `-${folders.length}` : ""}`,
+        name,
+        mimeType: FOLDER_MIME,
+        parents: [parent],
+      };
       folders.push(folder);
       return folder;
     },
@@ -304,10 +309,17 @@ describe("ensureProjectFolders", () => {
   });
 
   it("gives concurrent runs the same folders", async () => {
-    const { api } = aios();
+    const { api, calls } = aios();
+    const lockDir = await temp();
     const [a, b] = await Promise.all([
-      ensureProjectFolders(api, "Parallel"),
-      ensureProjectFolders(api, "Parallel"),
+      ensureProjectFolders(api, "Parallel", { lockDir }),
+      ensureProjectFolders(api, "Parallel", { lockDir }),
+    ]);
+    // Exactly one create per folder, not one per run.
+    expect(calls.filter((call) => call.startsWith("create")).sort()).toEqual([
+      `create ${P}/Parallel`,
+      "create new-Parallel/inputs",
+      "create new-Parallel/outputs",
     ]);
     expect(a.projectFolderId).toBe(b.projectFolderId);
     expect(a.inputFolderId).toBe(b.inputFolderId);

@@ -14,6 +14,7 @@ import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
+import { GrokT3Error } from "./errors.ts";
 import {
   FetchHttpClient,
   HttpClient,
@@ -1155,6 +1156,67 @@ it.effect("does not launch when the Drive snapshot check fails", () =>
       );
       assert.equal(Exit.isFailure(exit), true);
       assert.strictEqual(launched, 0);
+    }),
+  ),
+);
+
+it.effect("stops a folder run when it loses track of a launched task", () =>
+  withServer((origin) =>
+    Effect.gen(function* () {
+      const drive = fakeDriveRoutes();
+      let launches = 0;
+      const real = wsT3LocalClient({ origin, pairingToken: PAIR });
+      const client: T3LocalClient = {
+        listProjectIds: real.listProjectIds,
+        listProviderModels: () => Effect.succeed(CATALOG),
+        publishBoard: real.publishBoard,
+        publishEvent: real.publishEvent,
+        readBoard: real.readBoard,
+        interrupt: () => Effect.die("interrupt is unused"),
+        continueRun: () => Effect.die("continue is unused"),
+        launch: () => {
+          launches += 1;
+          return Effect.succeed({ threadId: `thread-${launches}`, runId: "run-1", resumed: false });
+        },
+        read: () =>
+          Effect.fail(new GrokT3Error({ reason: "t3_unavailable", detail: "read failed" })),
+        driveCall: drive.driveCall,
+      };
+      const lines: string[] = [];
+      let tick = 0;
+      const outcome = yield* runLiveDriver(
+        {
+          origin,
+          pairingToken: PAIR,
+          projectId: "usba",
+          model: undefined,
+          title: "Review",
+          prompt: "Score this document.",
+          listProjects: false,
+          evaluateFolder: "inputs",
+          concurrency: 1,
+        },
+        {
+          client,
+          clock: () => `2026-10-21T19:00:${String(tick++ % 60).padStart(2, "0")}.000Z`,
+          write: (line) => lines.push(line),
+          sleep: () => Effect.void,
+          readRepoCommit: () => Promise.resolve(SHA),
+          pollIntervalMs: 0,
+          maxPolls: 3,
+        },
+      ).pipe(Effect.flip);
+      assert.strictEqual(outcome.message.includes("folder tasks failed"), true, outcome.message);
+      assert.strictEqual(launches, 1, lines.join("\n"));
+      assert.equal(
+        lines.some((line) => line.startsWith("stopping the folder run")),
+        true,
+      );
+      assert.equal(
+        lines.some((line) => line.includes("not started")),
+        true,
+        lines.join("\n"),
+      );
     }),
   ),
 );

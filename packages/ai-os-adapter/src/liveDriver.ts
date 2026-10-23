@@ -530,6 +530,7 @@ export const runLiveDriver = (
       write: (line: string) => void = deps.write,
       // Folder tasks are watched to the end so --concurrency really bounds them.
       untilDone = false,
+      onLaunched: () => void = () => undefined,
     ) =>
       Effect.gen(function* () {
         const stamp = deps.clock();
@@ -567,6 +568,7 @@ export const runLiveDriver = (
           },
         });
         const started = yield* adapter.launch(recorded.taskId);
+        onLaunched();
         write(`task ${started.taskId}`);
         if (started.threadId !== null) write(`thread ${started.threadId}`);
 
@@ -631,20 +633,41 @@ export const runLiveDriver = (
       deps.write(
         `evaluating ${describeDriveSize(files.length, totalBytes)} under ${String(root.name)}, one task each, ${concurrency} at a time`,
       );
+      let halted: string | null = null;
       const results = yield* Effect.forEach(
         files.entries(),
         ([index, file]) => {
           const path = file.path ?? file.name;
           const tag = `[${index + 1}/${files.length} ${path}]`;
           const write = (line: string) => deps.write(`${tag} ${line}`);
+          if (halted !== null) {
+            write(`not started: ${halted}`);
+            return Effect.result(
+              Effect.fail(new GrokT3Error({ reason: "invalid_task", detail: halted })),
+            );
+          }
+          let launched = false;
           return runOne(
             `${title}: ${path}`,
             `${title}-${index + 1}`,
             [file.id, ...shared],
             write,
             true,
+            () => {
+              launched = true;
+            },
           ).pipe(
-            Effect.tapError((error) => Effect.sync(() => write(`failed: ${error.message}`))),
+            Effect.tapError((error) =>
+              Effect.sync(() => {
+                write(`failed: ${error.message}`);
+                // A launched run we lost track of may still be going: it keeps
+                // its slot, so no further tasks start.
+                if (launched && halted === null) {
+                  halted = `${path} may still be running (lost track of it after launch)`;
+                  deps.write(`stopping the folder run: ${halted}`);
+                }
+              }),
+            ),
             Effect.result,
           );
         },

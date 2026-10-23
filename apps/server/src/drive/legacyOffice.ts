@@ -594,8 +594,15 @@ export const extractPpt = (bytes: Uint8Array) => {
   }
   const slides: Array<{ listed: string[]; drawn: string[] }> = [];
   const notes: string[] = [];
+  // Each drawing is read once: a slide list repeating one large drawing
+  // would otherwise multiply the work.
+  const drawn = new Set<number>();
   const drawingOf = (persistId: number) => {
     const offset = persist.get(persistId);
+    if (offset !== undefined) {
+      if (drawn.has(offset)) throw new Error("Broken presentation: two slides share one drawing.");
+      drawn.add(offset);
+    }
     const target = offset === undefined ? null : header(offset);
     return target !== null && (target.type === 0x03ee || target.type === 0x03f0)
       ? textsIn(target.body, target.next)

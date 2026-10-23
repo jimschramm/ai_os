@@ -362,7 +362,9 @@ const projectCommand = Command.make("project", {
           }
           const folders = yield* Effect.gen(function* () {
             const api = yield* driveApi;
-            return yield* viaPromise(() => ensureProjectFolders(api, name));
+            return yield* viaPromise(() =>
+              ensureProjectFolders(api, name, { lockDir: config.secretsDir }),
+            );
           }).pipe(Effect.provide(secretStoreLayer(config)));
           yield* Console.log(
             `Drive folders: aios/projects/${name}/inputs and /outputs (${folders.created.length === 0 ? "already there" : `created ${folders.created.join(", ")}`}).`,
