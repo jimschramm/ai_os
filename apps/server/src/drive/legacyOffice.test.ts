@@ -153,17 +153,17 @@ const record = (type: number, bytes: number[]) => [
   ...bytes,
 ];
 const u16 = (value: number) => [value & 0xff, value >> 8];
-const workbook = (cells: number[]) => {
+const workbook = (cells: number[], sheetCount = 1) => {
   const bof = (kind: number) =>
     record(0x0809, [...u16(0x0600), ...u16(kind), ...new Array(12).fill(0)]);
   const globalsHead = bof(0x05);
   const sheetName = [2, 0, ...[..."S1"].map((ch) => ch.charCodeAt(0))];
   const boundLength = 4 + 6 + sheetName.length;
-  const offset = globalsHead.length + boundLength + 4;
+  const offset = globalsHead.length + sheetCount * boundLength + 4;
   const bound = record(0x0085, [offset & 0xff, (offset >> 8) & 0xff, 0, 0, 0, 0, ...sheetName]);
   return new Uint8Array([
     ...globalsHead,
-    ...bound,
+    ...Array.from({ length: sheetCount }, () => bound).flat(),
     ...record(0x000a, []),
     ...bof(0x10),
     ...cells,
@@ -193,6 +193,14 @@ describe("Excel 97 records", () => {
 });
 
 describe("record bounds", () => {
+  it("rejects sheet entries that repeat one worksheet", () => {
+    const cells = record(0x0204, [...u16(0), ...u16(0), ...u16(0), ...u16(1), 0, 0x41]);
+    expect(extractXls(makeCfb("Workbook", workbook(cells)))).toBe("## Sheet: S1\nA");
+    expect(() => extractXls(makeCfb("Workbook", workbook(cells, 3000)))).toThrow(
+      /share one worksheet/,
+    );
+  });
+
   it("reads a formula string result that goes on in a CONTINUE record", () => {
     const cells = [
       ...formulaString(0, 0),

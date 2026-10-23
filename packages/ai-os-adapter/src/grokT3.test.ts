@@ -1207,3 +1207,57 @@ it.effect("publishes board cards on the T3 origin", () =>
     }),
   ),
 );
+
+it.effect("checks the pinned Drive snapshot before launch and before resume", () =>
+  withFake((fake) =>
+    Effect.gen(function* () {
+      let problem: string | null = null;
+      const checks: unknown[] = [];
+      const adapter = createGrokT3Adapter({
+        client: {
+          ...t3Client(fake.origin),
+          driveCall: (route, body) => {
+            checks.push({ route, body });
+            return Effect.succeed({ problem });
+          },
+        },
+        clock: () => CLOCK,
+        model: TEST_MODEL,
+      });
+      const manifest = {
+        root: ".ai_os/drive/task-drive",
+        manifestSha256: "c".repeat(64),
+        totalFiles: 1,
+        totalBytes: 2,
+        failedFiles: 0,
+        files: [
+          {
+            id: "file-0000001",
+            name: "a.txt",
+            drivePath: "a.txt",
+            kind: "text" as const,
+            bytes: 2,
+            original: ".ai_os/drive/task-drive/0001-a.txt",
+          },
+        ],
+        sources: ["file-0000001"],
+      };
+      const recorded = yield* adapter.record({
+        taskId: "task-drive",
+        title: "Drive task",
+        intake: intakeV2Example,
+        context: { ...context, driveManifest: manifest },
+      });
+      yield* adapter.launch(recorded.taskId);
+      assert.strictEqual(checks.length, 1);
+      const paused = yield* adapter.pause(recorded.taskId);
+      assert.strictEqual(paused.state.phase, "recovery_pending");
+
+      problem = "a.txt changed";
+      const refused = yield* adapter.recover(recorded.taskId).pipe(Effect.flip);
+      assert.strictEqual(refused.reason, "invalid_task");
+      assert.match(refused.detail, /a\.txt changed/);
+      assert.strictEqual(adapter.result(recorded.taskId)?.state.phase, "recovery_pending");
+    }),
+  ),
+);

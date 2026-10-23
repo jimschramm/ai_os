@@ -396,7 +396,14 @@ export const extractXls = (bytes: Uint8Array) => {
   }
   const byOffset = new Map(records.map((record, index) => [record.offset, index]));
   const out: string[] = [];
+  const used = new Set<number>();
   for (const sheet of sheets) {
+    // Each sheet entry must point at its own worksheet BOF; repeats would
+    // render one large sheet over and over.
+    if (used.has(sheet.offset)) throw new Error("Broken workbook: two sheets share one worksheet.");
+    used.add(sheet.offset);
+    const start = byOffset.get(sheet.offset);
+    if (start === undefined || records[start]!.type !== 0x0809) continue;
     const cells = new Map<number, Map<number, string>>();
     const put = (row: number, col: number, value: string) => {
       if (value === "") return;
@@ -410,8 +417,7 @@ export const extractXls = (bytes: Uint8Array) => {
       line.set(col, value.replace(/[\t\n\r]+/g, " "));
     };
     let pendingFormula: { row: number; col: number } | null = null;
-    const start = byOffset.get(sheet.offset);
-    for (let i = start === undefined ? records.length : start + 1; i < records.length; i += 1) {
+    for (let i = start + 1; i < records.length; i += 1) {
       const record = records[i]!;
       if (record.type === 0x000a) break;
       if (record.type === 0x0207) {

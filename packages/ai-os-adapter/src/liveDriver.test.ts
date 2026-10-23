@@ -1106,7 +1106,7 @@ it.effect(
           drive.calls.filter((call) => call.route === "list").map((call) => call.body),
           [{ projectId: "usba" }],
         );
-        assert.equal(drive.calls.filter((call) => call.route === "verify").length, 2);
+        assert.equal(drive.calls.filter((call) => call.route === "verify").length, 4); // after each snapshot and before each launch
       }),
     ),
 );

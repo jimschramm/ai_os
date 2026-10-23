@@ -8,7 +8,7 @@ import { afterEach, describe, expect, it } from "vite-plus/test";
 
 import { makeContentStore } from "./ContentStore.ts";
 import { type DriveApi, type DriveFile, FOLDER_MIME } from "./DriveApi.ts";
-import { buildSnapshot, readDriveFile, verifySnapshot } from "./DriveReader.ts";
+import { buildSnapshot, readDriveFile, snapshotDirName, verifySnapshot } from "./DriveReader.ts";
 import { DriveJobStore, safeProjectDir } from "./DriveJobStore.ts";
 import {
   AIOS_PROJECTS_FOLDER_ID,
@@ -462,6 +462,30 @@ describe("snapshot safety", () => {
     for (const rel of [ref.files[0]!.original, ref.files[0]!.text].filter((r) => r !== undefined)) {
       expect(Buffer.byteLength(path.basename(rel))).toBeLessThanOrEqual(255);
     }
+    expect(await verifySnapshot(worktree, ref)).toBeNull();
+  });
+
+  it("keeps names with long extensions and long task ids within the filename limit", async () => {
+    const name = `${"é".repeat(90)}.${"ü".repeat(110)}`;
+    const { api } = fakeApi(
+      [{ id: "ext1-0000000", name, mimeType: "application/octet-stream", size: 2 }],
+      {},
+      { "ext1-0000000": new TextEncoder().encode("hi") },
+    );
+    const taskId = `a${"_".repeat(127)}`;
+    const worktree = await temp();
+    const { ref } = await buildSnapshot({
+      api,
+      store: makeContentStore(await temp()),
+      worktree,
+      taskId,
+      refs: ["ext1-0000000"],
+    });
+    for (const rel of [ref.root, ...ref.files.flatMap((f) => [f.original, f.text])]) {
+      if (rel === undefined) continue;
+      for (const part of rel.split("/")) expect(Buffer.byteLength(part)).toBeLessThanOrEqual(255);
+    }
+    expect(snapshotDirName(taskId)).not.toBe(snapshotDirName(`a${"_".repeat(126)}b`));
     expect(await verifySnapshot(worktree, ref)).toBeNull();
   });
 

@@ -553,6 +553,30 @@ export const createGrokT3Adapter = (input: {
       }
       return current;
     });
+  /**
+   * The task's pinned Drive snapshot must still be exactly what the manifest
+   * says before any launch or resume; a changed or deleted copy stops the run.
+   */
+  const checkDrive = (session: AttemptSession) =>
+    Effect.gen(function* () {
+      const state = session.state;
+      const context = "assignment" in state ? state.assignment.contextPackage : undefined;
+      const manifest = context?.driveManifest;
+      if (context === undefined || manifest === undefined) return;
+      const call = input.client.driveCall;
+      if (call === undefined) {
+        return yield* fail("invalid_task", "This T3 client cannot check the Drive snapshot.");
+      }
+      const check = yield* call("verify", { projectId: context.authorizationScope, manifest });
+      const problem =
+        typeof check === "object" && check !== null && "problem" in check
+          ? (check as { problem: unknown }).problem
+          : "unreadable check";
+      if (typeof problem === "string") {
+        return yield* fail("invalid_task", `Drive snapshot check failed: ${problem}`);
+      }
+    });
+
   const launch = (taskId: string) =>
     Effect.gen(function* () {
       yield* requireModel;
@@ -562,6 +586,7 @@ export const createGrokT3Adapter = (input: {
       if (session.state.phase !== "assigned") {
         return yield* fail("contract", `Cannot launch from ${session.state.phase}.`);
       }
+      yield* checkDrive(session);
       const attemptId = session.state.assignment.attemptId;
       let view: T3ThreadView | null = null;
       if (session.threadId === null) {
@@ -638,6 +663,9 @@ export const createGrokT3Adapter = (input: {
   const recover = (taskId: string) =>
     Effect.gen(function* () {
       let session = (yield* pullServer(yield* load(taskId))).session;
+      if (session.state.phase === "recovery_pending" || session.state.phase === "assigned") {
+        yield* checkDrive(session);
+      }
       if (session.state.phase === "recovery_pending") {
         if (session.threadId === null || session.runId === null) {
           return yield* fail("not_started", "The interrupted task has no T3 run to continue.");

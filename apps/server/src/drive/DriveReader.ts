@@ -181,24 +181,56 @@ export const resolveRef = async (
 
 const utf8 = new TextEncoder();
 
-/**
- * A file-system-safe name. Filenames are limited to 255 bytes, so the name is
- * cut at 200 UTF-8 bytes, leaving room for the number prefix and suffixes.
- */
-const safeName = (value: string) => {
-  const cleaned = value
-    .replace(/[^\p{L}\p{N}._ -]+/gu, "_")
-    .replace(/\s+/g, " ")
-    .trim();
+const byteLength = (value: string) => utf8.encode(value).length;
+
+/** The longest prefix of `value` that fits in `max` UTF-8 bytes, whole characters only. */
+const cutBytes = (value: string, max: number) => {
   let out = "";
   let bytes = 0;
-  for (const char of cleaned) {
-    const size = utf8.encode(char).length;
-    if (bytes + size > 200) break;
+  for (const char of value) {
+    const size = byteLength(char);
+    if (bytes + size > max) break;
     out += char;
     bytes += size;
   }
-  return out || "file";
+  return out;
+};
+
+/** File systems allow 255 bytes per name. */
+const NAME_BYTES = 255;
+const TEXT_SUFFIX = ".text.txt";
+
+/**
+ * File names for one snapshot entry, each within NAME_BYTES: the `0001-`
+ * prefix, the cleaned Drive name, and the original's extension or the text
+ * suffix. A very long extension is cut to 32 bytes.
+ */
+const entryNames = (index: number, driveName: string, originalExt: string) => {
+  const prefix = `${String(index).padStart(4, "0")}-`;
+  const ext = cutBytes(originalExt.replace(/[^\p{L}\p{N}.]+/gu, "_"), 32);
+  const budget =
+    NAME_BYTES - byteLength(prefix) - Math.max(byteLength(ext), byteLength(TEXT_SUFFIX));
+  const cleaned = driveName
+    .replace(/[^\p{L}\p{N}._ -]+/gu, "_")
+    .replace(/\s+/g, " ")
+    .trim();
+  const stem = `${prefix}${cutBytes(cleaned, budget) || "file"}`;
+  return {
+    original: stem.toLowerCase().endsWith(ext.toLowerCase()) ? stem : `${stem}${ext}`,
+    text: `${stem}${TEXT_SUFFIX}`,
+  };
+};
+
+/**
+ * The snapshot folder for a task: "_" and ":" escaped so no two ids share one.
+ * A long escaped id is cut and given a hash of the full id ("_h" never comes
+ * out of the escaping), so the folder and its `~<uuid>` temp twin stay short.
+ */
+export const snapshotDirName = (taskId: string) => {
+  const escaped = taskId.replaceAll("_", "_5f").replaceAll(":", "_3a");
+  return escaped.length <= 160
+    ? escaped
+    : `${escaped.slice(0, 120)}_h${sha256Hex(taskId).slice(0, 32)}`;
 };
 
 export interface SnapshotResult {
@@ -229,8 +261,8 @@ export const buildSnapshot = async (input: {
   if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(input.taskId)) {
     throw new DriveApiError(`Invalid task id: ${input.taskId}`);
   }
-  // One folder per task id, never shared: "_" and ":" are both escaped.
-  const relRoot = `${DRIVE_SNAPSHOT_DIR}/${input.taskId.replaceAll("_", "_5f").replaceAll(":", "_3a")}`;
+  // One folder per task id, never shared.
+  const relRoot = `${DRIVE_SNAPSHOT_DIR}/${snapshotDirName(input.taskId)}`;
   const absRoot = path.join(input.worktree, ...relRoot.split("/"));
   await assertNoSymlinks(input.worktree, relRoot);
   // A snapshot is immutable: never overwrite one a task already points at.
@@ -302,13 +334,16 @@ export const buildSnapshot = async (input: {
         const stored = await readDriveFile(input.api, input.store, file, {
           ...(input.pdfTimeoutMs === undefined ? {} : { pdfTimeoutMs: input.pdfTimeoutMs }),
         });
-        const stem = `${String(index).padStart(4, "0")}-${safeName(file.name)}`;
+        const names = entryNames(
+          index,
+          file.name,
+          stored.originalPath === null ? "" : path.extname(stored.originalPath),
+        );
         let original: string | undefined;
         let text: string | undefined;
         const hashes: Record<string, string> = {};
         if (stored.originalPath !== null) {
-          const ext = path.extname(stored.originalPath);
-          const target = stem.toLowerCase().endsWith(ext.toLowerCase()) ? stem : `${stem}${ext}`;
+          const target = names.original;
           await fs.copyFile(stored.originalPath, path.join(temporary, target));
           await fs.chmod(path.join(temporary, target), 0o444);
           original = `${relRoot}/${target}`;
@@ -316,7 +351,7 @@ export const buildSnapshot = async (input: {
         }
         if (stored.textPath !== null) {
           // Its own suffix, so it never meets an original named *.txt.
-          const target = `${stem}.text.txt`;
+          const target = names.text;
           await fs.copyFile(stored.textPath, path.join(temporary, target));
           await fs.chmod(path.join(temporary, target), 0o444);
           text = `${relRoot}/${target}`;
