@@ -350,6 +350,22 @@ export const buildSnapshot = async (input: {
   await assertNoSymlinks(input.worktree, `${DRIVE_SNAPSHOT_DIR}/.tmp`);
   await assertNoSymlinks(input.worktree, relRoot);
   await fs.mkdir(temporary);
+  if (inGit) {
+    // Staged copies too: checked (empty folder, so git sees a directory)
+    // before anything is downloaded; git can't re-include files under an
+    // ignored folder, so this covers everything written there.
+    const relTemporary = `${DRIVE_SNAPSHOT_DIR}/.tmp/${path.basename(temporary)}`;
+    try {
+      await assertAllIgnored(input.worktree, [
+        `${DRIVE_SNAPSHOT_DIR}/.tmp`,
+        relTemporary,
+        `${relTemporary}/manifest.json`,
+      ]);
+    } catch (error) {
+      await fs.rm(temporary, { recursive: true, force: true });
+      throw error;
+    }
+  }
   const seen = new Set<string>();
   const files: DriveManifestFileV1[] = [];
   const full: Array<Record<string, unknown>> = [];

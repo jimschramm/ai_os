@@ -586,6 +586,27 @@ describe("snapshot safety", () => {
     expect(git(worktree, "status", "--porcelain", "--untracked-files=all")).toBe("?? .gitignore");
   });
 
+  it("downloads nothing when a .gitignore exposes the staging folder", async () => {
+    const worktree = await temp();
+    git(worktree, "init", "-q");
+    await fs.writeFile(
+      path.join(worktree, ".gitignore"),
+      "!/.ai_os/drive/\n/.ai_os/drive/*\n!/.ai_os/drive/.tmp/\n",
+    );
+    const { api, calls } = tree();
+    await expect(
+      buildSnapshot({
+        api,
+        store: makeContentStore(await temp()),
+        worktree,
+        taskId: "t1",
+        refs: ["txt1-0000000"],
+      }),
+    ).rejects.toThrow(/un-ignores \.ai_os\/drive\/\.tmp/);
+    expect(calls.filter((call) => /^(download|export) /.test(call))).toEqual([]);
+    expect(git(worktree, "status", "--porcelain", "--untracked-files=all")).toBe("?? .gitignore");
+  });
+
   it("keeps snapshots out of git in a linked worktree too", async () => {
     const main = await temp();
     git(main, "init", "-q");
