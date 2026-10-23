@@ -179,6 +179,35 @@ describe("single-quoted attributes", () => {
   });
 });
 
+describe("part references", () => {
+  it("resolves ./ worksheet targets and reports a missing worksheet part", async () => {
+    const book = (target: string) =>
+      makeZip({
+        "xl/workbook.xml": '<workbook><sheet name="S" r:id="rId1"/></workbook>',
+        "xl/_rels/workbook.xml.rels": `<Relationship Id="rId1" Target="${target}"/>`,
+        "xl/worksheets/sheet1.xml": "<worksheet><row><c><v>7</v></c></row></worksheet>",
+      });
+    expect(await extractXlsx(book("./worksheets/../worksheets/sheet1.xml"))).toBe("## Sheet: S\n7");
+    await expect(extractXlsx(book("worksheets/nope.xml"))).rejects.toThrow(/missing part/);
+  });
+
+  it("rejects two slides sharing one notes part", async () => {
+    const rels =
+      '<Relationship Id="rN" Type="x/notesSlide" Target="../notesSlides/notesSlide1.xml"/>';
+    await expect(
+      extractPptx(
+        makeZip({
+          "ppt/slides/slide1.xml": "<a:p>a</a:p>",
+          "ppt/slides/slide2.xml": "<a:p>b</a:p>",
+          "ppt/slides/_rels/slide1.xml.rels": rels,
+          "ppt/slides/_rels/slide2.xml.rels": rels,
+          "ppt/notesSlides/notesSlide1.xml": "<a:p>note</a:p>",
+        }),
+      ),
+    ).rejects.toThrow(/shared by two slides/);
+  });
+});
+
 describe("repeated part references", () => {
   it("rejects a worksheet listed twice and a slide listed twice", async () => {
     const sheet = `<worksheet><sheetData><row><c><v>1</v></c></row></sheetData></worksheet>`;

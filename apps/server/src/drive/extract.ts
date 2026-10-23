@@ -300,14 +300,12 @@ export const extractXlsx = async (bytes: Uint8Array) => {
   );
   const workbook = parts.get("xl/workbook.xml");
   if (workbook === undefined) throw new Error("No xl/workbook.xml in this file.");
-  const rels = new Map<string, string>();
-  for (const attrs of startTags(parts.get("xl/_rels/workbook.xml.rels") ?? "", "Relationship")) {
-    const id = attr(attrs, "Id");
-    const target = attr(attrs, "Target");
-    if (id !== undefined && id !== "" && target !== undefined && target !== "") {
-      rels.set(id, target.replace(/^\/?(xl\/)?/, "xl/"));
-    }
-  }
+  // Targets resolved against xl/ (dot segments and absolute paths included).
+  const rels = new Map(
+    [...relTargets(parts.get("xl/_rels/workbook.xml.rels") ?? "", "xl/")].map(
+      ([id, rel]) => [id, rel.target] as const,
+    ),
+  );
   const shared: string[] = [];
   for (const item of elements(parts.get("xl/sharedStrings.xml") ?? "", "si")) {
     shared.push(
@@ -327,6 +325,9 @@ export const extractXlsx = async (bytes: Uint8Array) => {
       seenSheets.add(target);
     }
     const xml = target === undefined ? undefined : parts.get(target);
+    if (target !== undefined && xml === undefined) {
+      throw new Error(`Malformed workbook: sheet ${name} points to missing part ${target}.`);
+    }
     const rows: string[] = [];
     for (const row of elements(xml ?? "", "row")) {
       const cells: string[] = [];
@@ -398,6 +399,8 @@ export const extractPptx = async (bytes: Uint8Array) => {
   }
   const slides = ordered.length > 0 ? ordered : fileSlides;
   if (slides.length === 0) throw new Error("No slides in this file.");
+  // Each notes part once: slides sharing one would re-render it many times.
+  const seenNotes = new Set<string>();
   return slides
     .map((name, position) => {
       const number = ordered.length > 0 ? position + 1 : numberIn(name);
@@ -410,6 +413,12 @@ export const extractPptx = async (bytes: Uint8Array) => {
         [...slideRels.values()].find((rel) => rel.type.endsWith("/notesSlide"))?.target ??
         `ppt/notesSlides/notesSlide${numberIn(name)}.xml`;
       const notes = parts.get(notesName);
+      if (notes !== undefined) {
+        if (seenNotes.has(notesName)) {
+          throw new Error(`Malformed presentation: ${notesName} is shared by two slides.`);
+        }
+        seenNotes.add(notesName);
+      }
       const noteText =
         notes === undefined ? "" : tidy(drawingXmlToText(notes)).replace(/^\d+$/m, "");
       return `## Slide ${number}\n${tidy(drawingXmlToText(parts.get(name) ?? ""))}${noteText.trim().length > 0 ? `\n### Notes\n${noteText.trim()}` : ""}`;
