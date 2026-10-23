@@ -611,6 +611,10 @@ describe("record bounds", () => {
       extractPpt(makeCfb("PowerPoint Document", new Uint8Array(bytes)));
     expect(ppt(container(11, atom("abc")))).toContain("abc");
     expect(() => ppt(container(4, atom("abc")))).toThrow(/No slide text/);
+    // No depth cutoff: text 200 containers deep is still read.
+    let deep = atom("deep");
+    for (let level = 0; level < 200; level += 1) deep = container(deep.length, deep);
+    expect(ppt(deep)).toContain("deep");
   });
 
   it("reads a container holding more text atoms than a call can take as arguments", () => {

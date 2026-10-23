@@ -599,21 +599,38 @@ export const extractPpt = (bytes: Uint8Array) => {
       .decode(stream.subarray(body, next))
       .replace(/[\r\v]/g, "\n")
       .trim();
-  /** Text atoms inside a container, in order. */
-  // Nested containers append into one array: spreading a large result into
-  // push() would exceed the engine's argument limit.
-  const textsIn = (start: number, end: number, depth = 0, out: string[] = []): string[] => {
-    for (let at = start; at + 8 <= end && depth < 64;) {
-      const record = header(at);
+  type Header = NonNullable<ReturnType<typeof header>>;
+  /**
+   * Every record in [start, end), depth first in file order; `visit` returns
+   * true to enter a container. An explicit stack, so nesting depth has no cap;
+   * each child range lies strictly inside its parent, so every byte is visited
+   * at most once per level and the walk ends.
+   */
+  const eachRecord = (start: number, end: number, visit: (record: Header) => boolean) => {
+    const stack = [{ at: start, end }];
+    while (stack.length > 0) {
+      const frame = stack[stack.length - 1]!;
+      const record = frame.at + 8 <= frame.end ? header(frame.at) : null;
       // A record may not run past its container.
-      if (record === null || record.next <= at || record.next > end) break;
-      if (record.version === 0x0f) textsIn(record.body, record.next, depth + 1, out);
-      else if (record.type === 0x0fa0 || record.type === 0x0fa8) {
+      if (record === null || record.next <= frame.at || record.next > frame.end) {
+        stack.pop();
+        continue;
+      }
+      frame.at = record.next;
+      if (visit(record)) stack.push({ at: record.body, end: record.next });
+    }
+  };
+  /** Text atoms inside a container, in order. */
+  const textsIn = (start: number, end: number): string[] => {
+    const out: string[] = [];
+    eachRecord(start, end, (record) => {
+      if (record.version === 0x0f) return true;
+      if (record.type === 0x0fa0 || record.type === 0x0fa8) {
         const text = textOf(record.type, record.body, record.next);
         if (text.length > 0) out.push(text);
       }
-      at = record.next;
-    }
+      return false;
+    });
     return out;
   };
   // Persist directory of the live edit chain (the newest entry per id wins).
@@ -671,21 +688,16 @@ export const extractPpt = (bytes: Uint8Array) => {
   if (doc === null || doc.type !== 0x03e8) {
     // No usable edit chain: every text atom outside masters, in file order.
     const texts: string[] = [];
-    const walk = (start: number, end: number, depth: number) => {
-      for (let at = start; at + 8 <= end && depth < 64;) {
-        const record = header(at);
-        if (record === null || record.next <= at || record.next > end) break;
-        if (record.type === 0x03f8 || record.type === 0x0fc8 || record.type === 0x0fc4) {
-          // masters: template text, not content
-        } else if (record.version === 0x0f) walk(record.body, record.next, depth + 1);
-        else if (record.type === 0x0fa0 || record.type === 0x0fa8) {
-          const text = textOf(record.type, record.body, record.next);
-          if (text.length > 0 && texts.at(-1) !== text) texts.push(text);
-        }
-        at = record.next;
+    eachRecord(0, stream.length, (record) => {
+      // masters: template text, not content
+      if (record.type === 0x03f8 || record.type === 0x0fc8 || record.type === 0x0fc4) return false;
+      if (record.version === 0x0f) return true;
+      if (record.type === 0x0fa0 || record.type === 0x0fa8) {
+        const text = textOf(record.type, record.body, record.next);
+        if (text.length > 0 && texts.at(-1) !== text) texts.push(text);
       }
-    };
-    walk(0, stream.length, 0);
+      return false;
+    });
     if (texts.length === 0) throw new Error("No slide text found.");
     return tidy(texts.join("\n"));
   }
