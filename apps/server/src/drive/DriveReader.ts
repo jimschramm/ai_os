@@ -4,7 +4,7 @@
  * project worktree. Never writes to Drive.
  */
 import { createHash } from "node:crypto";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -344,7 +344,7 @@ export const buildSnapshot = async (input: {
   const resolved: ResolvedRef[] = [];
   for (const ref of input.refs) resolved.push(await resolveRef(input.api, ref, listOptions));
 
-  await ensureIgnored(input.worktree);
+  const inGit = await ensureIgnored(input.worktree);
   const temporary = path.join(tmpDir, `${path.basename(absRoot)}~${randomUUID()}`);
   await fs.mkdir(tmpDir, { recursive: true });
   await assertNoSymlinks(input.worktree, `${DRIVE_SNAPSHOT_DIR}/.tmp`);
@@ -435,6 +435,15 @@ export const buildSnapshot = async (input: {
     };
     const manifestText = `${JSON.stringify(manifest, null, 2)}\n`;
     await fs.writeFile(path.join(temporary, "manifest.json"), manifestText, { mode: 0o444 });
+    if (inGit) {
+      // Every path the snapshot will have, checked by git itself: a .gitignore
+      // can carve out one task's folder or one file type.
+      const entries = await fs.readdir(temporary, { recursive: true });
+      await assertAllIgnored(input.worktree, [
+        relRoot,
+        ...entries.map((entry) => `${relRoot}/${entry.split(path.sep).join("/")}`),
+      ]);
+    }
     await input.onPublish?.(sha256Hex(manifestText));
     await fs.rename(temporary, absRoot);
     return {
@@ -571,7 +580,7 @@ const ensureIgnored = async (worktree: string) => {
     "--show-prefix",
   ]);
   if (!where.ok) {
-    if (where.code === 128 && /not a git repository/i.test(where.stderr)) return;
+    if (where.code === 128 && /not a git repository/i.test(where.stderr)) return false;
     throw gitProblem(worktree, where.message);
   }
   const [exclude, prefix = ""] = where.stdout.split("\n");
@@ -599,7 +608,37 @@ const ensureIgnored = async (worktree: string) => {
   if (tracked.stdout.trim() !== "") {
     throw gitProblem(worktree, `files under ${DRIVE_SNAPSHOT_DIR}/ are tracked by git.`);
   }
+  return true;
 };
+
+/** Throws unless git ignores every one of `paths` (worktree-relative, `/`-separated). */
+const assertAllIgnored = (worktree: string, paths: readonly string[]) =>
+  new Promise<void>((resolve, reject) => {
+    const child = spawn("git", ["check-ignore", "--no-index", "-z", "--stdin"], {
+      cwd: worktree,
+      timeout: 60_000,
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8").on("data", (chunk: string) => (stdout += chunk));
+    child.stderr.setEncoding("utf8").on("data", (chunk: string) => (stderr += chunk));
+    child.on("error", (error) => reject(gitProblem(worktree, error.message)));
+    child.on("close", (code) => {
+      // 0: some or all ignored; 1: none ignored; anything else is a failure.
+      if (code !== 0 && code !== 1)
+        return reject(gitProblem(worktree, stderr.trim() || `git exited ${code}`));
+      const ignored = new Set(stdout.split("\0"));
+      const exposed = paths.filter((entry) => !ignored.has(entry));
+      if (exposed.length > 0) {
+        return reject(
+          gitProblem(worktree, `a .gitignore rule un-ignores ${exposed.slice(0, 3).join(", ")}.`),
+        );
+      }
+      resolve();
+    });
+    child.stdin.on("error", () => {});
+    child.stdin.end(paths.map((entry) => `${entry}\0`).join(""));
+  });
 
 /** Snapshot still present and unchanged; used before a task launches or resumes. */
 export const verifySnapshot = async (worktree: string, ref: DriveManifestRefV1) => {
