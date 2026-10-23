@@ -97,7 +97,15 @@ export const applyProjectDriveUpdate = (
 ): ProjectDriveSettings => {
   const next: { -readonly [K in keyof ProjectDriveSettings]: ProjectDriveSettings[K] } = {
     ...current,
-    enabled: !update.disable,
+    // Disable turns Drive off; setting a folder (or passing no flags) turns
+    // it on; clearing a folder alone keeps whatever state it was in.
+    enabled: update.disable
+      ? false
+      : (update.clearInput || update.clearOutput) &&
+          update.outputFolderId === undefined &&
+          update.inputFolderId === undefined
+        ? (current?.enabled ?? false)
+        : true,
   };
   if (update.outputFolderId !== undefined) next.outputFolderId = update.outputFolderId;
   if (update.inputFolderId !== undefined) next.inputFolderId = update.inputFolderId;

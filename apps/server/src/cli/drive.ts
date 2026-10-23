@@ -229,13 +229,15 @@ export const updateUnderLock = <E, R, LE, LR>(
  * The same exclusive ownership lock a server takes at start. Fails with
  * "Nothing was changed" while a server holds it. Exported for tests.
  */
-export const offlineLock = (statePath: string) =>
+export const offlineLock = (statePath: string, liveAttempted = false) =>
   ServerOwnership.acquireServerOwnership(statePath).pipe(
     Effect.provide(ProcessRunner.layer),
     Effect.mapError((error) =>
       error._tag === "ServerAlreadyRunningError"
         ? userError(
-            "The ai_os server is running but did not answer. Nothing was changed; try again in a moment.",
+            liveAttempted
+              ? "The ai_os server is running but did not confirm the change, so it may or may not have been saved. Check in the app or run the same command again in a moment (it is safe to repeat)."
+              : "The ai_os server is running but did not answer. Nothing was changed; try again in a moment.",
           )
         : userError(error.message),
     ),
@@ -247,9 +249,10 @@ const updateOffline = (
   config: ServerConfig.ServerConfig["Service"],
   projectId: ProjectId,
   resolved: ResolvedProjectDriveUpdate,
+  liveAttempted: boolean,
 ) =>
   updateUnderLock(
-    offlineLock(config.serverRuntimeStatePath),
+    offlineLock(config.serverRuntimeStatePath, liveAttempted),
     ServerSettings.layer.pipe(
       Layer.provide(ServerSecretStore.layer),
       Layer.provide(SqlitePersistence.layerConfig),
@@ -318,7 +321,7 @@ const projectCommand = Command.make("project", {
             return;
           }
         }
-        const drive = yield* updateOffline(config, projectId, resolved);
+        const drive = yield* updateOffline(config, projectId, resolved, Option.isSome(runtime));
         yield* Console.log(
           describeDrive(projectId, drive, "server not running; saved to settings"),
         );

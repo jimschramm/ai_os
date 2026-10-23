@@ -45,6 +45,14 @@ describe("drive project flags", () => {
     expect(apply(current, { disable: true })).toEqual({ ...current, enabled: false });
   });
 
+  it("clearing a folder on a disabled project keeps it disabled; setting one turns it on", () => {
+    const off = { enabled: false, outputFolderId: ID, inputFolderId: OTHER };
+    expect(apply(off, { clearInput: true })).toEqual({ enabled: false, outputFolderId: ID });
+    expect(apply(off, { clearOutput: true })).toEqual({ enabled: false, inputFolderId: OTHER });
+    expect(apply(off, { input: OTHER })).toEqual({ ...off, enabled: true });
+    expect(apply(off, {})).toEqual({ ...off, enabled: true });
+  });
+
   it("rejects links that are not Drive folders before anything is applied", () => {
     expect(
       resolveProjectDriveUpdate(
@@ -118,21 +126,32 @@ describe("offline drive project", () => {
         const statePath = path.join(dir, "server-runtime.json");
         // Stands in for a running server whose HTTP request failed.
         yield* ServerOwnership.acquireServerOwnership(statePath);
-        const result = yield* Effect.result(
-          updateUnderLock(offlineLock(statePath), settingsLayer, ProjectId.make("p-held"), {
-            outputFolderId: ID,
-            clearInput: false,
-            clearOutput: false,
-            disable: false,
-          }),
-        );
-        return result._tag === "Failure" ? String(result.failure.message) : "updated";
+        const attempt = (liveAttempted: boolean) =>
+          Effect.result(
+            updateUnderLock(
+              offlineLock(statePath, liveAttempted),
+              settingsLayer,
+              ProjectId.make("p-held"),
+              { outputFolderId: ID, clearInput: false, clearOutput: false, disable: false },
+            ),
+          ).pipe(
+            Effect.map((result) =>
+              result._tag === "Failure" ? String(result.failure.message) : "updated",
+            ),
+          );
+        // Server running, never contacted: provably nothing changed.
+        const untouched = yield* attempt(false);
+        // Live request sent but unanswered: the server may have saved it.
+        const unconfirmed = yield* attempt(true);
+        return { untouched, unconfirmed };
       }).pipe(
         Effect.scoped,
         Effect.provide(ProcessRunner.layer.pipe(Layer.provideMerge(NodeServices.layer))),
       ),
     );
-    expect(message).toContain("Nothing was changed");
+    expect(message.untouched).toContain("Nothing was changed");
+    expect(message.unconfirmed).toContain("may or may not have been saved");
+    expect(message.unconfirmed).not.toContain("Nothing was changed");
     expect(settingsLoaded).toBe(false);
   });
 });
