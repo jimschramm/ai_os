@@ -175,7 +175,11 @@ const need = (file: CompoundFile, ...names: string[]) => {
 
 const tidy = (text: string) =>
   text
-    .replace(/[ \t]+\n/g, "\n")
+    // One match per whitespace run (dropped only before a newline): a regex
+    // ending in \n would rescan a long run from every position.
+    .replace(/[ \t]+/g, (run: string, at: number, all: string) =>
+      all[at + run.length] === "\n" ? "" : run,
+    )
     .replace(/\n{3,}/g, "\n\n")
     .trim();
 

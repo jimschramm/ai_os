@@ -152,3 +152,53 @@ describe("PPTX slide order", () => {
     expect(text).toContain("## Slide 2\nWas first");
   });
 });
+
+describe("crafted inputs stay linear", () => {
+  const n = 200_000;
+  const timed = async (run: () => Promise<string>) => {
+    const started = performance.now();
+    const text = await run();
+    expect(performance.now() - started).toBeLessThan(2_000);
+    return text;
+  };
+
+  it("handles long whitespace runs, unclosed tags and unclosed spans quickly", async () => {
+    const docxText = await timed(() =>
+      extractDocx(
+        makeZip({
+          "word/document.xml": `<w:p><w:t>a${" ".repeat(n)}x</w:t></w:p>${"<w:tc>".repeat(n / 10)}${"<w:instrText>".repeat(n / 20)}${"<".repeat(n)}`,
+        }),
+      ),
+    );
+    expect(docxText.startsWith(`a${" ".repeat(n)}x`)).toBe(true);
+    const xlsxText = await timed(() =>
+      extractXlsx(
+        makeZip({
+          "xl/workbook.xml": `<workbook><sheet name="S" r:id="rId1"/>${'<sheet name="'.repeat(n / 20)}</workbook>`,
+          "xl/_rels/workbook.xml.rels": `<Relationship Id="rId1" Target="worksheets/sheet1.xml"/>${'<Relationship Id="'.repeat(n / 20)}`,
+          "xl/sharedStrings.xml": `<si><t>ok</t></si>${"<si><t>".repeat(n / 10)}`,
+          "xl/worksheets/sheet1.xml": `<row><c t="s"><v>0</v>${"<v>".repeat(n / 10)}</c>${"<c ".repeat(n / 10)}</row>${"<row>".repeat(n / 10)}`,
+        }),
+      ),
+    );
+    expect(xlsxText).toContain("ok");
+    await timed(() =>
+      extractPptx(
+        makeZip({
+          "ppt/slides/slide1.xml": `<a:p>a${"\t".repeat(n)}b</a:p>${"<".repeat(n)}`,
+          "ppt/presentation.xml": '<p:sldId r:id="'.repeat(n / 20),
+        }),
+      ),
+    );
+  });
+
+  it("keeps docx table cells, field codes and literal '<' as before", async () => {
+    const text = await extractDocx(
+      makeZip({
+        "word/document.xml":
+          "<w:tbl><w:tr><w:tc><w:tcPr/><w:p><w:t>a</w:t></w:p><w:p><w:t>b</w:t></w:p></w:tc><w:tc><w:p><w:t>c</w:t></w:p></w:tc></w:tr></w:tbl><w:p><w:instrText>PAGE</w:instrText><w:t>1 &lt; 2 <> 3</w:t></w:p>",
+      }),
+    );
+    expect(text).toBe("a b | c |\n1 < 2 <> 3");
+  });
+});

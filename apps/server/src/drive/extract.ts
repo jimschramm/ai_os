@@ -62,11 +62,122 @@ const decodeEntities = (text: string) =>
     }
   });
 
-const stripTags = (xml: string) => decodeEntities(xml.replace(/<[^>]+>/g, ""));
+/**
+ * Linear scans (each byte is looked at a bounded number of times); regexes
+ * like <[^>]+> or lazy spans rescan the rest of the text from every unclosed
+ * opener, which a crafted file can turn quadratic.
+ */
+const stripTags = (xml: string) => {
+  let out = "";
+  let at = 0;
+  for (;;) {
+    const open = xml.indexOf("<", at);
+    if (open === -1) {
+      out += xml.slice(at);
+      break;
+    }
+    out += xml.slice(at, open);
+    const close = xml.indexOf(">", open + 1);
+    // An unclosed "<" is text, as with the old /<[^>]+>/ (and "<>" too).
+    if (close === -1) {
+      out += xml.slice(open);
+      break;
+    }
+    if (close === open + 1) out += "<>";
+    at = close + 1;
+  }
+  return decodeEntities(out);
+};
+
+const isWordChar = (ch: string | undefined) => ch !== undefined && /\w/.test(ch);
+
+/** Start-tag attributes of every `<name ...>` (`name` whole), in order. */
+function* startTags(xml: string, name: string): Generator<string> {
+  const open = `<${name}`;
+  let at = 0;
+  for (;;) {
+    let start = xml.indexOf(open, at);
+    while (start !== -1 && isWordChar(xml[start + open.length])) {
+      start = xml.indexOf(open, start + open.length);
+    }
+    if (start === -1) return;
+    const end = xml.indexOf(">", start + open.length);
+    if (end === -1) return;
+    const attrs = xml.slice(start + open.length, end);
+    yield attrs.endsWith("/") ? attrs.slice(0, -1) : attrs;
+    at = end + 1;
+  }
+}
+
+/** Every `<name ...>inner</name>` (inner null when self-closed), in order; nesting of one name is not supported. */
+function* elements(xml: string, name: string): Generator<{ attrs: string; inner: string | null }> {
+  const open = `<${name}`;
+  const close = `</${name}>`;
+  let at = 0;
+  for (;;) {
+    let start = xml.indexOf(open, at);
+    while (start !== -1 && isWordChar(xml[start + open.length])) {
+      start = xml.indexOf(open, start + open.length);
+    }
+    if (start === -1) return;
+    const tagEnd = xml.indexOf(">", start + open.length);
+    if (tagEnd === -1) return;
+    const attrs = xml.slice(start + open.length, tagEnd);
+    if (attrs.endsWith("/")) {
+      yield { attrs: attrs.slice(0, -1), inner: null };
+      at = tagEnd + 1;
+      continue;
+    }
+    const end = xml.indexOf(close, tagEnd + 1);
+    if (end === -1) return;
+    yield { attrs, inner: xml.slice(tagEnd + 1, end) };
+    at = end + close.length;
+  }
+}
+
+const firstInner = (xml: string, name: string) => {
+  for (const element of elements(xml, name)) return element.inner ?? "";
+  return undefined;
+};
+
+/** The value of `key="..."` (key starting at a word boundary) in a tag's attributes. */
+const attr = (attrs: string, key: string): string | undefined => {
+  const needle = `${key}="`;
+  let at = attrs.indexOf(needle);
+  while (at > 0 && isWordChar(attrs[at - 1])) at = attrs.indexOf(needle, at + 1);
+  if (at === -1) return undefined;
+  const end = attrs.indexOf('"', at + needle.length);
+  return end === -1 ? undefined : attrs.slice(at + needle.length, end);
+};
+
+/**
+ * Replaces each span from `open` (a whole tag name) to the first `close`
+ * after it. Without a close, the rest is left as it is.
+ */
+const replaceSpans = (xml: string, open: string, close: string, fn: (span: string) => string) => {
+  let out = "";
+  let at = 0;
+  for (;;) {
+    let start = xml.indexOf(open, at);
+    while (start !== -1 && isWordChar(xml[start + open.length])) {
+      start = xml.indexOf(open, start + open.length);
+    }
+    if (start === -1) break;
+    const end = xml.indexOf(close, start + open.length);
+    if (end === -1) break;
+    out += xml.slice(at, start) + fn(xml.slice(start, end + close.length));
+    at = end + close.length;
+  }
+  return out + xml.slice(at);
+};
 
 const tidy = (text: string) =>
   text
-    .replace(/[ \t]+\n/g, "\n")
+    // One match per whitespace run (dropped only before a newline): a regex
+    // ending in \n would rescan a long run from every position.
+    .replace(/[ \t]+/g, (run: string, at: number, all: string) =>
+      all[at + run.length] === "\n" ? "" : run,
+    )
     .replace(/\n{3,}/g, "\n\n")
     .trim();
 
@@ -106,21 +217,24 @@ export const readZipText = (bytes: Uint8Array, want: (name: string) => boolean) 
 
 const numberIn = (name: string) => Number(/(\d+)\.xml$/.exec(name)?.[1] ?? 0);
 
-const wordXmlToText = (xml: string) =>
-  stripTags(
-    xml
-      .replace(/<w:tab\/>/g, "\t")
-      .replace(/<w:(?:br|cr)\/>/g, "\n")
-      // Paragraphs inside a table cell stay on the cell's line.
-      .replace(/<w:tc\b[\s\S]*?<\/w:tc>/g, (cell) =>
-        cell.replace(/<\/w:p>(?![\s\S]*<\/w:p>)/, "").replace(/<\/w:p>/g, " "),
-      )
-      .replace(/<\/w:tc>/g, " | ")
-      .replace(/<\/w:tr>/g, "\n")
-      .replace(/<\/w:p>/g, "\n")
-      // Only run text; drop instructions such as field codes.
-      .replace(/<w:instrText[^>]*>[\s\S]*?<\/w:instrText>/g, ""),
-  );
+const wordXmlToText = (xml: string) => {
+  const marked = xml.replace(/<w:tab\/>/g, "\t").replace(/<w:(?:br|cr)\/>/g, "\n");
+  // Paragraphs inside a table cell stay on the cell's line.
+  const cells = replaceSpans(marked, "<w:tc", "</w:tc>", (cell) => {
+    const last = cell.lastIndexOf("</w:p>");
+    const kept = last === -1 ? cell : cell.slice(0, last) + cell.slice(last + "</w:p>".length);
+    return kept.split("</w:p>").join(" ");
+  });
+  const lines = cells
+    .split("</w:tc>")
+    .join(" | ")
+    .split("</w:tr>")
+    .join("\n")
+    .split("</w:p>")
+    .join("\n");
+  // Only run text; drop instructions such as field codes.
+  return stripTags(replaceSpans(lines, "<w:instrText", "</w:instrText>", () => ""));
+};
 
 export const extractDocx = async (bytes: Uint8Array) => {
   const parts = await readZipText(bytes, (name) =>
@@ -156,42 +270,37 @@ export const extractXlsx = async (bytes: Uint8Array) => {
   const workbook = parts.get("xl/workbook.xml");
   if (workbook === undefined) throw new Error("No xl/workbook.xml in this file.");
   const rels = new Map<string, string>();
-  for (const match of (parts.get("xl/_rels/workbook.xml.rels") ?? "").matchAll(
-    /<Relationship\b[^>]*>/g,
-  )) {
-    const id = /\bId="([^"]+)"/.exec(match[0])?.[1];
-    const target = /\bTarget="([^"]+)"/.exec(match[0])?.[1];
-    if (id !== undefined && target !== undefined) {
+  for (const attrs of startTags(parts.get("xl/_rels/workbook.xml.rels") ?? "", "Relationship")) {
+    const id = attr(attrs, "Id");
+    const target = attr(attrs, "Target");
+    if (id !== undefined && id !== "" && target !== undefined && target !== "") {
       rels.set(id, target.replace(/^\/?(xl\/)?/, "xl/"));
     }
   }
   const shared: string[] = [];
-  for (const match of (parts.get("xl/sharedStrings.xml") ?? "").matchAll(/<si>([\s\S]*?)<\/si>/g)) {
+  for (const item of elements(parts.get("xl/sharedStrings.xml") ?? "", "si")) {
     shared.push(
-      decodeEntities(
-        [...(match[1] ?? "").matchAll(/<t[^>]*>([\s\S]*?)<\/t>/g)].map((t) => t[1] ?? "").join(""),
-      ),
+      decodeEntities([...elements(item.inner ?? "", "t")].map((t) => t.inner ?? "").join("")),
     );
   }
   const sheets: string[] = [];
-  for (const match of workbook.matchAll(/<sheet\b[^>]*>/g)) {
-    const name = decodeEntities(/\bname="([^"]*)"/.exec(match[0])?.[1] ?? "Sheet");
-    const relId = /\br:id="([^"]+)"/.exec(match[0])?.[1];
-    const state = /\bstate="([^"]+)"/.exec(match[0])?.[1];
+  for (const attrs of startTags(workbook, "sheet")) {
+    const name = decodeEntities(attr(attrs, "name") ?? "Sheet");
+    const relId = attr(attrs, "r:id") || undefined;
+    const state = attr(attrs, "state") || undefined;
     const xml = relId === undefined ? undefined : parts.get(rels.get(relId) ?? "");
     const rows: string[] = [];
-    for (const row of (xml ?? "").matchAll(/<row\b[^>]*>([\s\S]*?)<\/row>/g)) {
+    for (const row of elements(xml ?? "", "row")) {
       const cells: string[] = [];
-      for (const cell of (row[1] ?? "").matchAll(/<c\b([^>]*?)(?:\/>|>([\s\S]*?)<\/c>)/g)) {
-        const attrs = cell[1] ?? "";
-        const inner = cell[2] ?? "";
-        const ref = /\br="([A-Z]+)\d*"/.exec(attrs)?.[1] ?? "";
-        const type = /\bt="([^"]+)"/.exec(attrs)?.[1];
-        const raw = /<v>([\s\S]*?)<\/v>/.exec(inner)?.[1];
+      for (const cell of elements(row.inner ?? "", "c")) {
+        const attrs = cell.attrs;
+        const inner = cell.inner ?? "";
+        const ref = /^([A-Z]+)\d*$/.exec(attr(attrs, "r") ?? "")?.[1] ?? "";
+        const type = attr(attrs, "t") || undefined;
+        const raw = firstInner(inner, "v");
         let value: string;
         if (type === "s") value = shared[Number(raw)] ?? "";
-        else if (type === "inlineStr")
-          value = stripTags(/<is>([\s\S]*?)<\/is>/.exec(inner)?.[1] ?? "");
+        else if (type === "inlineStr") value = stripTags(firstInner(inner, "is") ?? "");
         else if (type === "b") value = raw === "1" ? "TRUE" : raw === undefined ? "" : "FALSE";
         else value = raw === undefined ? "" : decodeEntities(raw);
         const index = ref === "" ? cells.length : columnIndex(ref);
@@ -214,18 +323,17 @@ const drawingXmlToText = (xml: string) =>
 /** Relationship id -> { target part name, type }, with targets resolved against `base`. */
 const relTargets = (xml: string, base: string) => {
   const out = new Map<string, { target: string; type: string }>();
-  for (const match of xml.matchAll(/<Relationship\b([^>]*)\/?>/g)) {
-    const attrs = match[1] ?? "";
-    const id = /\bId="([^"]+)"/.exec(attrs)?.[1];
-    const target = /\bTarget="([^"]+)"/.exec(attrs)?.[1];
-    if (id === undefined || target === undefined) continue;
+  for (const attrs of startTags(xml, "Relationship")) {
+    const id = attr(attrs, "Id");
+    const target = attr(attrs, "Target");
+    if (id === undefined || id === "" || target === undefined || target === "") continue;
     const parts = (target.startsWith("/") ? target.slice(1) : `${base}${target}`).split("/");
     const resolved: string[] = [];
     for (const part of parts) {
       if (part === "..") resolved.pop();
       else if (part !== "." && part !== "") resolved.push(part);
     }
-    out.set(id, { target: resolved.join("/"), type: /\bType="([^"]+)"/.exec(attrs)?.[1] ?? "" });
+    out.set(id, { target: resolved.join("/"), type: attr(attrs, "Type") ?? "" });
   }
   return out;
 };
@@ -241,10 +349,10 @@ export const extractPptx = async (bytes: Uint8Array) => {
     .sort((a, b) => numberIn(a) - numberIn(b));
   // Show order comes from presentation.xml; file numbers change when slides move.
   const presentationRels = relTargets(parts.get("ppt/_rels/presentation.xml.rels") ?? "", "ppt/");
-  const ordered = [
-    ...(parts.get("ppt/presentation.xml") ?? "").matchAll(/<p:sldId\b[^>]*\br:id="([^"]+)"/g),
-  ]
-    .map((match) => presentationRels.get(match[1]!)?.target)
+  const ordered = [...startTags(parts.get("ppt/presentation.xml") ?? "", "p:sldId")]
+    .map((attrs) => attr(attrs, "r:id"))
+    .filter((id): id is string => id !== undefined && id !== "")
+    .map((id) => presentationRels.get(id)?.target)
     .filter((name): name is string => name !== undefined && parts.has(name));
   const slides = ordered.length > 0 ? ordered : fileSlides;
   if (slides.length === 0) throw new Error("No slides in this file.");
