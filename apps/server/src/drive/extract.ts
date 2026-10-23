@@ -10,6 +10,8 @@ import { Worker } from "node:worker_threads";
 
 import * as yauzl from "yauzl";
 
+import { extractDoc, extractPpt, extractXls } from "./legacyOffice.ts";
+
 export type ExtractKind = "text" | "image" | "file";
 
 export interface Extracted {
@@ -316,6 +318,20 @@ export const extractContent = async (input: {
     return attempt("xlsx", () => extractXlsx(bytes));
   }
   if (mimeType === PPTX || ext === "pptx") return attempt("pptx", () => extractPptx(bytes));
+  if (mimeType === "application/msword" || ext === "doc" || ext === "dot") {
+    return attempt("doc", async () => extractDoc(bytes));
+  }
+  if (mimeType === "application/vnd.ms-excel" || ext === "xls" || ext === "xlt") {
+    return attempt("xls", async () => extractXls(bytes));
+  }
+  if (
+    mimeType === "application/vnd.ms-powerpoint" ||
+    ext === "ppt" ||
+    ext === "pps" ||
+    ext === "pot"
+  ) {
+    return attempt("ppt", async () => extractPpt(bytes));
+  }
   if (mimeType === "application/pdf" || ext === "pdf") {
     return attempt("pdf", () => extractPdf(bytes, input.pdfTimeoutMs));
   }

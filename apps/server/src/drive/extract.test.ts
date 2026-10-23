@@ -97,8 +97,8 @@ describe("extractContent", () => {
     expect(
       (
         await extractContent({
-          name: "old.doc",
-          mimeType: "application/msword",
+          name: "old.wpd",
+          mimeType: "application/vnd.wordperfect",
           bytes: new Uint8Array([0xd0, 0xcf]),
         })
       ).method,
