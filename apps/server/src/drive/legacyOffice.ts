@@ -106,35 +106,63 @@ export const readCompoundFile = (bytes: Uint8Array): CompoundFile => {
   }
   const dirView = view(directory);
   const entries = Math.floor(directory.length / 128);
-  // The root entry (always first) holds the mini stream.
-  let miniStream = new Uint8Array(0);
-  const streams = new Map<string, Uint8Array>();
-  for (let i = 0; i < entries; i += 1) {
+  const NOSTREAM = 0xffffffff;
+  const entryAt = (i: number) => {
     const base = i * 128;
-    const type = directory[base + 66];
     const nameLength = dirView.getUint16(base + 64, true);
-    if (nameLength < 2 || nameLength > 64) continue;
     let name = "";
-    for (let c = 0; c < nameLength / 2 - 1; c += 1) {
-      name += String.fromCharCode(dirView.getUint16(base + c * 2, true));
-    }
-    const start = dirView.getUint32(base + 116, true);
-    const size = dirView.getUint32(base + 120, true);
-    if (type === 5) {
-      if (start <= MAX_REGULAR_SECTOR) miniStream = readRegular(start, size);
-    } else if (type === 2 && !streams.has(name)) {
-      if (size === 0) streams.set(name, new Uint8Array(0));
-      else if (size < cutoff) {
-        const ids = chain(start, miniFat, Math.floor(miniStream.length / miniSize));
-        claim(ids, ownedMini);
-        const out = new Uint8Array(ids.length * miniSize);
-        ids.forEach((id, index) =>
-          out.set(miniStream.subarray(id * miniSize, (id + 1) * miniSize), index * miniSize),
-        );
-        streams.set(name, out.subarray(0, size));
-      } else {
-        streams.set(name, readRegular(start, size));
+    if (nameLength >= 2 && nameLength <= 64) {
+      for (let c = 0; c < nameLength / 2 - 1; c += 1) {
+        name += String.fromCharCode(dirView.getUint16(base + c * 2, true));
       }
+    }
+    return {
+      name,
+      type: directory[base + 66],
+      left: dirView.getUint32(base + 68, true),
+      right: dirView.getUint32(base + 72, true),
+      child: dirView.getUint32(base + 76, true),
+      start: dirView.getUint32(base + 116, true),
+      size: dirView.getUint32(base + 120, true),
+    };
+  };
+  // The root entry (always first) holds the mini stream.
+  const root = entries > 0 ? entryAt(0) : undefined;
+  if (root === undefined || root.type !== 5) throw new Error("No root storage in this file.");
+  const miniStream =
+    root.start <= MAX_REGULAR_SECTOR ? readRegular(root.start, root.size) : new Uint8Array(0);
+  // Only the root storage's own streams: an embedded document (in a child
+  // storage) can carry streams with the same names. The root's children form a
+  // tree through left/right sibling links; each entry may be visited once.
+  const topLevel: number[] = [];
+  const visited = new Set<number>([0]);
+  const pending = root.child === NOSTREAM ? [] : [root.child];
+  while (pending.length > 0) {
+    const index = pending.pop()!;
+    if (index >= entries || visited.has(index)) throw new Error("Broken directory tree.");
+    visited.add(index);
+    topLevel.push(index);
+    const entry = entryAt(index);
+    if (entry.left !== NOSTREAM) pending.push(entry.left);
+    if (entry.right !== NOSTREAM) pending.push(entry.right);
+  }
+  topLevel.sort((x, y) => x - y);
+  const streams = new Map<string, Uint8Array>();
+  for (const index of topLevel) {
+    const { name, type, start, size } = entryAt(index);
+    if (type !== 2 || name === "") continue;
+    if (streams.has(name)) throw new Error(`Two root streams named ${name}.`);
+    if (size === 0) streams.set(name, new Uint8Array(0));
+    else if (size < cutoff) {
+      const ids = chain(start, miniFat, Math.floor(miniStream.length / miniSize));
+      claim(ids, ownedMini);
+      const out = new Uint8Array(ids.length * miniSize);
+      ids.forEach((id, index) =>
+        out.set(miniStream.subarray(id * miniSize, (id + 1) * miniSize), index * miniSize),
+      );
+      streams.set(name, out.subarray(0, size));
+    } else {
+      streams.set(name, readRegular(start, size));
     }
   }
   return { streams };

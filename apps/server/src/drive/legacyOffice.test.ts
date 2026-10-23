@@ -107,13 +107,17 @@ const makeCfb = (
   name: string,
   stream: Uint8Array,
   more: ReadonlyArray<[string, Uint8Array]> = [],
+  /** A stream inside an embedded "ObjectPool" storage, listed before the root's own. */
+  nested?: [string, Uint8Array],
 ) => {
   const SECTOR = 512;
-  const blocks = [[name, stream] as const, ...more].map(([blockName, bytes]) => {
-    const padded = new Uint8Array(Math.max(4096, Math.ceil(bytes.length / SECTOR) * SECTOR));
-    padded.set(bytes);
-    return { blockName, padded };
-  });
+  const blocks = [...(nested === undefined ? [] : [nested]), [name, stream] as const, ...more].map(
+    ([blockName, bytes]) => {
+      const padded = new Uint8Array(Math.max(4096, Math.ceil(bytes.length / SECTOR) * SECTOR));
+      padded.set(bytes);
+      return { blockName, padded };
+    },
+  );
   const data = new Uint8Array(blocks.reduce((sum, b) => sum + b.padded.length, 0));
   const dataSectors = data.length / SECTOR;
   // As many FAT sectors as the file needs (up to the 109 the header lists).
@@ -154,8 +158,19 @@ const makeCfb = (
     dv.setUint32(fat + sector * 4, last ? 0xfffffffe : sector + 1, true);
   }
   const dir = SECTOR * (1 + dirSector);
-  const entry = (index: number, entryName: string, type: number, start: number, size: number) => {
+  const NONE = 0xffffffff;
+  const entry = (
+    index: number,
+    entryName: string,
+    type: number,
+    start: number,
+    size: number,
+    links: { right?: number; child?: number } = {},
+  ) => {
     const base = dir + index * 128;
+    dv.setUint32(base + 68, NONE, true);
+    dv.setUint32(base + 72, links.right ?? NONE, true);
+    dv.setUint32(base + 76, links.child ?? NONE, true);
     for (let c = 0; c < entryName.length; c += 1)
       dv.setUint16(base + c * 2, entryName.charCodeAt(c), true);
     dv.setUint16(base + 64, (entryName.length + 1) * 2, true);
@@ -163,8 +178,27 @@ const makeCfb = (
     dv.setUint32(base + 116, start, true);
     dv.setUint32(base + 120, size, true);
   };
-  entry(0, "Root Entry", 5, 0xfffffffe, 0);
-  blocks.forEach((b, i) => entry(1 + i, b.blockName, 2, starts[i]!, b.padded.length));
+  // Root's children chained through right-sibling links.
+  const top = blocks.length - (nested === undefined ? 0 : 1);
+  const firstTop = nested === undefined ? 1 : 3;
+  if (firstTop + top > 4) throw new Error("test directory holds four entries");
+  entry(0, "Root Entry", 5, 0xfffffffe, 0, { child: nested === undefined ? 1 : 2 });
+  if (nested !== undefined) {
+    entry(1, nested[0], 2, starts[0]!, blocks[0]!.padded.length);
+    entry(2, "ObjectPool", 1, 0, 0, { child: 1, right: 3 });
+  }
+  blocks.slice(nested === undefined ? 0 : 1).forEach((b, i) =>
+    entry(
+      firstTop + i,
+      b.blockName,
+      2,
+      starts[i + (nested === undefined ? 0 : 1)]!,
+      b.padded.length,
+      {
+        ...(i + 1 < top ? { right: firstTop + i + 1 } : {}),
+      },
+    ),
+  );
   out.set(data, SECTOR * (1 + firstData));
   return out;
 };
@@ -208,6 +242,20 @@ describe("Excel 97 records", () => {
       ...record(0x0207, [...u16(2), 0, 0x42, 0x43]),
     ];
     expect(extractXls(makeCfb("Workbook", workbook(cells)))).toBe("## Sheet: S1\nA\t\tBC");
+  });
+
+  it("reads the root storage's Workbook, not an embedded document's", () => {
+    const cell = (text: string) => [
+      ...formulaString(0, 0),
+      ...record(0x0207, [...u16(text.length), 0, ...[...text].map((ch) => ch.charCodeAt(0))]),
+    ];
+    const bytes = makeCfb(
+      "Workbook",
+      workbook(cell("ROOT")),
+      [],
+      ["Workbook", workbook(cell("EMBED"))],
+    );
+    expect(extractXls(bytes)).toBe("## Sheet: S1\nROOT");
   });
 
   it("rejects a cell past column 255 instead of padding the row", () => {

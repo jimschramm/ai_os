@@ -284,11 +284,18 @@ export const extractXlsx = async (bytes: Uint8Array) => {
     );
   }
   const sheets: string[] = [];
+  // Each worksheet once: repeated references would re-render one part many times.
+  const seenSheets = new Set<string>();
   for (const attrs of startTags(workbook, "sheet")) {
     const name = decodeEntities(attr(attrs, "name") ?? "Sheet");
     const relId = attr(attrs, "r:id") || undefined;
     const state = attr(attrs, "state") || undefined;
-    const xml = relId === undefined ? undefined : parts.get(rels.get(relId) ?? "");
+    const target = relId === undefined ? undefined : rels.get(relId);
+    if (target !== undefined) {
+      if (seenSheets.has(target)) throw new Error(`Malformed workbook: ${target} is listed twice.`);
+      seenSheets.add(target);
+    }
+    const xml = target === undefined ? undefined : parts.get(target);
     const rows: string[] = [];
     for (const row of elements(xml ?? "", "row")) {
       const cells: string[] = [];
@@ -354,6 +361,10 @@ export const extractPptx = async (bytes: Uint8Array) => {
     .filter((id): id is string => id !== undefined && id !== "")
     .map((id) => presentationRels.get(id)?.target)
     .filter((name): name is string => name !== undefined && parts.has(name));
+  // Each slide once: repeated references would re-render one part many times.
+  if (new Set(ordered).size !== ordered.length) {
+    throw new Error("Malformed presentation: a slide is listed twice.");
+  }
   const slides = ordered.length > 0 ? ordered : fileSlides;
   if (slides.length === 0) throw new Error("No slides in this file.");
   return slides

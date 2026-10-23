@@ -153,6 +153,32 @@ describe("PPTX slide order", () => {
   });
 });
 
+describe("repeated part references", () => {
+  it("rejects a worksheet listed twice and a slide listed twice", async () => {
+    const sheet = `<worksheet><sheetData><row><c><v>1</v></c></row></sheetData></worksheet>`;
+    await expect(
+      extractXlsx(
+        makeZip({
+          "xl/workbook.xml": `<workbook>${'<sheet name="S" r:id="rId1"/><sheet name="T" r:id="rId2"/>'.repeat(2)}</workbook>`,
+          "xl/_rels/workbook.xml.rels":
+            '<Relationship Id="rId1" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Target="/xl/worksheets/sheet1.xml"/>',
+          "xl/worksheets/sheet1.xml": sheet,
+        }),
+      ),
+    ).rejects.toThrow(/listed twice/);
+    await expect(
+      extractPptx(
+        makeZip({
+          "ppt/slides/slide1.xml": "<a:p>a</a:p>",
+          "ppt/presentation.xml": '<p:sldId r:id="rId1"/><p:sldId r:id="rId2"/>',
+          "ppt/_rels/presentation.xml.rels":
+            '<Relationship Id="rId1" Target="slides/slide1.xml"/><Relationship Id="rId2" Target="/ppt/slides/slide1.xml"/>',
+        }),
+      ),
+    ).rejects.toThrow(/listed twice/);
+  });
+});
+
 describe("crafted inputs stay linear", () => {
   const n = 200_000;
   const timed = async (run: () => Promise<string>) => {
