@@ -512,6 +512,27 @@ describe("snapshot safety", () => {
     expect(await fs.readdir(outside)).toEqual([]);
   });
 
+  it("publishes no snapshot when git cannot be asked about the checkout", async () => {
+    const worktree = await temp();
+    const { api } = tree();
+    const savedPath = process.env.PATH;
+    process.env.PATH = path.join(worktree, "no-such-bin");
+    try {
+      await expect(
+        buildSnapshot({
+          api,
+          store: makeContentStore(await temp()),
+          worktree,
+          taskId: "t1",
+          refs: ["txt1-0000000"],
+        }),
+      ).rejects.toThrow(/Could not check whether .* is a git checkout/);
+    } finally {
+      process.env.PATH = savedPath;
+    }
+    await expect(fs.stat(path.join(worktree, ".ai_os"))).rejects.toThrow();
+  });
+
   it("keeps snapshots out of git in a linked worktree too", async () => {
     const main = await temp();
     git(main, "init", "-q");

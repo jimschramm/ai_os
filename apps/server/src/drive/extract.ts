@@ -91,6 +91,19 @@ const stripTags = (xml: string) => {
 
 const isWordChar = (ch: string | undefined) => ch !== undefined && /\w/.test(ch);
 
+/** Index of the `>` ending a tag, skipping quoted attribute values (which may hold `>`); -1 if none. */
+const endOfTag = (xml: string, from: number) => {
+  let quote: string | null = null;
+  for (let i = from; i < xml.length; i += 1) {
+    const ch = xml[i];
+    if (quote !== null) {
+      if (ch === quote) quote = null;
+    } else if (ch === '"' || ch === "'") quote = ch;
+    else if (ch === ">") return i;
+  }
+  return -1;
+};
+
 /** Start-tag attributes of every `<name ...>` (`name` whole), in order. */
 function* startTags(xml: string, name: string): Generator<string> {
   const open = `<${name}`;
@@ -101,7 +114,7 @@ function* startTags(xml: string, name: string): Generator<string> {
       start = xml.indexOf(open, start + open.length);
     }
     if (start === -1) return;
-    const end = xml.indexOf(">", start + open.length);
+    const end = endOfTag(xml, start + open.length);
     if (end === -1) return;
     const attrs = xml.slice(start + open.length, end);
     yield attrs.endsWith("/") ? attrs.slice(0, -1) : attrs;
@@ -120,7 +133,7 @@ function* elements(xml: string, name: string): Generator<{ attrs: string; inner:
       start = xml.indexOf(open, start + open.length);
     }
     if (start === -1) return;
-    const tagEnd = xml.indexOf(">", start + open.length);
+    const tagEnd = endOfTag(xml, start + open.length);
     if (tagEnd === -1) return;
     const attrs = xml.slice(start + open.length, tagEnd);
     if (attrs.endsWith("/")) {
@@ -143,23 +156,29 @@ const firstInner = (xml: string, name: string) => {
 const isSpace = (ch: string | undefined) => ch === " " || ch === "\t" || ch === "\n" || ch === "\r";
 
 /**
- * The value of `key="..."` or `key='...'` (XML allows either quote and space
- * around `=`; key whole) in a tag's attributes.
+ * The value of attribute `key` in a tag's attributes. Parsed name by name, so
+ * attribute-like text inside a quoted value never matches; XML allows either
+ * quote and space around `=`.
  */
 const attr = (attrs: string, key: string): string | undefined => {
-  for (let at = attrs.indexOf(key); at !== -1; at = attrs.indexOf(key, at + 1)) {
-    if (at > 0 && !isSpace(attrs[at - 1])) continue;
-    let i = at + key.length;
+  let i = 0;
+  for (;;) {
     while (isSpace(attrs[i])) i += 1;
-    if (attrs[i] !== "=") continue;
+    const nameStart = i;
+    while (i < attrs.length && !isSpace(attrs[i]) && attrs[i] !== "=") i += 1;
+    if (i === nameStart) return undefined;
+    const name = attrs.slice(nameStart, i);
+    while (isSpace(attrs[i])) i += 1;
+    if (attrs[i] !== "=") return undefined;
     i += 1;
     while (isSpace(attrs[i])) i += 1;
     const quote = attrs[i];
     if (quote !== '"' && quote !== "'") return undefined;
     const end = attrs.indexOf(quote, i + 1);
-    return end === -1 ? undefined : attrs.slice(i + 1, end);
+    if (end === -1) return undefined;
+    if (name === key) return attrs.slice(i + 1, end);
+    i = end + 1;
   }
-  return undefined;
 };
 
 /**

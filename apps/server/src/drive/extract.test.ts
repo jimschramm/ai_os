@@ -157,14 +157,15 @@ describe("single-quoted attributes", () => {
   it("reads single-quoted XLSX and PPTX attributes, values and slide order", async () => {
     const sheets = await extractXlsx(
       makeZip({
-        "xl/workbook.xml": "<workbook><sheet name='Q &amp; A' r:id = 'rId1'/></workbook>",
+        "xl/workbook.xml":
+          "<workbook><sheet name='Q &amp; A r:id=\"missing\" >' r:id = 'rId1'/></workbook>",
         "xl/_rels/workbook.xml.rels": "<Relationship Id='rId1' Target='worksheets/sheet1.xml'/>",
         "xl/sharedStrings.xml": "<sst><si><t>shared</t></si></sst>",
         "xl/worksheets/sheet1.xml":
           "<worksheet><sheetData><row r='1'><c r='A1' t='s'><v>0</v></c><c r='C1' t='b'><v>1</v></c></row></sheetData></worksheet>",
       }),
     );
-    expect(sheets).toBe("## Sheet: Q & A\nshared\t\tTRUE");
+    expect(sheets).toBe('## Sheet: Q & A r:id="missing" >\nshared\t\tTRUE');
     const slides = await extractPptx(
       makeZip({
         "ppt/slides/slide1.xml": "<a:p>one</a:p>",

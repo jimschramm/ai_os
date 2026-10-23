@@ -529,14 +529,32 @@ const plainPath = async (worktree: string, rel: string) => {
   return true;
 };
 
-/** The repo's info/exclude path as git resolves it (linked worktrees included); null outside git. */
+/**
+ * The repo's info/exclude path as git resolves it (linked worktrees included);
+ * null only when git confirms this is not a checkout. Any other failure (git
+ * missing, a timeout, a broken repo) is an error: the snapshot must not be
+ * written where it could be committed.
+ */
 const gitExcludePath = (worktree: string) =>
-  new Promise<string | null>((resolve) => {
+  new Promise<string | null>((resolve, reject) => {
     execFile(
       "git",
       ["rev-parse", "--path-format=absolute", "--git-path", "info/exclude"],
       { cwd: worktree, timeout: 10_000 },
-      (error, stdout) => resolve(error === null ? stdout.trim() || null : null),
+      (error, stdout, stderr) => {
+        const out = String(stdout).trim();
+        if (error === null && out !== "") return resolve(out);
+        const notRepo =
+          error !== null &&
+          (error as { code?: unknown }).code === 128 &&
+          /not a git repository/i.test(String(stderr));
+        if (notRepo) return resolve(null);
+        reject(
+          new Error(
+            `Could not check whether ${worktree} is a git checkout, so the Drive snapshot was not written: ${error?.message ?? "git printed no path"}`,
+          ),
+        );
+      },
     );
   });
 
