@@ -438,7 +438,7 @@ const decodeEvent = (value: unknown) =>
     }),
   );
 
-const authorize = (
+export const authorize = (
   scope: typeof AuthOrchestrationReadScope | typeof AuthOrchestrationOperateScope,
 ) =>
   Effect.gen(function* () {
@@ -460,7 +460,7 @@ const authorize = (
     }
   });
 
-const authResponse = {
+export const authResponse = {
   EnvironmentAuthInvalidError: HttpServerRespondable.toResponse,
   EnvironmentInternalError: HttpServerRespondable.toResponse,
   EnvironmentScopeRequiredError: HttpServerRespondable.toResponse,

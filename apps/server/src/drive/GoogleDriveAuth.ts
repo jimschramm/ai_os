@@ -144,7 +144,7 @@ export const readCallback = (
   return { code };
 };
 
-type FetchLike = (url: string, init: RequestInit) => Promise<Response>;
+export type FetchLike = (url: string, init: RequestInit) => Promise<Response>;
 
 export const exchangeCode = async (input: {
   readonly client: DriveClient;
@@ -356,4 +356,41 @@ export const revokeToken = async (
   } catch {
     return false;
   }
+};
+
+/**
+ * Trades the stored refresh token for a short-lived access token. The access
+ * token stays in memory only; it is never stored, logged or returned to a client.
+ */
+export const refreshAccessToken = async (
+  credentials: StoredDriveCredentials,
+  doFetch: FetchLike = fetch,
+  timeoutMs = GOOGLE_REQUEST_TIMEOUT_MS,
+): Promise<{ readonly accessToken: string; readonly expiresAt: number }> => {
+  if (credentials.token === null) {
+    throw new DriveAuthError("Drive login needed: run `drive login`.");
+  }
+  const response = await doFetch(TOKEN_ENDPOINT, {
+    method: "POST",
+    redirect: "error",
+    signal: AbortSignal.timeout(timeoutMs),
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      client_id: credentials.client.clientId,
+      client_secret: credentials.client.clientSecret,
+      refresh_token: credentials.token.refreshToken,
+      grant_type: "refresh_token",
+    }).toString(),
+  });
+  const body = (await response.json().catch(() => ({}))) as Record<string, unknown>;
+  if (!response.ok || typeof body.access_token !== "string") {
+    const code = body.error === undefined ? `HTTP ${response.status}` : safeOAuthError(body.error);
+    throw new DriveAuthError(
+      code === "invalid_grant"
+        ? "Drive login needed: the Google grant expired or was revoked. Run `drive login`."
+        : `Drive token refresh failed: ${code}.`,
+    );
+  }
+  const seconds = typeof body.expires_in === "number" ? body.expires_in : 3600;
+  return { accessToken: body.access_token, expiresAt: Date.now() + seconds * 1000 };
 };

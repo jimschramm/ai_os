@@ -183,6 +183,15 @@ export interface T3LocalClient {
   readonly readBoard: () => Effect.Effect<readonly AdapterBoardCard[], GrokT3Error>;
   readonly listProjectIds: () => Effect.Effect<readonly T3ProjectSummary[], GrokT3Error>;
   readonly listProviderModels: () => Effect.Effect<T3ModelCatalog, GrokT3Error>;
+  /**
+   * POST a JSON body to one of the server's `/api/drive/*` routes and return
+   * the JSON answer. The Drive token stays on the server. Optional so test
+   * fakes need not implement it.
+   */
+  readonly driveCall?: (
+    route: "search" | "list" | "snapshot" | "snapshot/status" | "verify",
+    body: Record<string, unknown>,
+  ) => Effect.Effect<unknown, GrokT3Error>;
 }
 
 const unavailable = (detail: string) => new GrokT3Error({ reason: "t3_unavailable", detail });
@@ -682,6 +691,40 @@ export const wsT3LocalClient = (options: T3ClientOptions): T3LocalClient => {
       }
       return catalog;
     });
+  const driveCall = (
+    route: "search" | "list" | "snapshot" | "snapshot/status" | "verify",
+    body: Record<string, unknown>,
+  ) =>
+    http(
+      Effect.gen(function* () {
+        const response = yield* responseFor(() =>
+          HttpClientRequest.post(`${origin}/api/drive/${route}`).pipe(
+            HttpClientRequest.bodyText(
+              Schema.encodeSync(Schema.fromJsonString(Schema.Unknown))(body),
+              "application/json",
+            ),
+          ),
+        );
+        const text = yield* response.text;
+        const parsed = yield* Schema.decodeEffect(Schema.fromJsonString(Schema.Unknown))(text).pipe(
+          Effect.orElseSucceed((): unknown => null),
+        );
+        if (response.status >= 400) {
+          const detail =
+            typeof parsed === "object" &&
+            parsed !== null &&
+            "error" in parsed &&
+            typeof parsed.error === "string"
+              ? parsed.error
+              : `Drive ${route} failed (${response.status}).`;
+          return yield* new GrokT3Error({
+            reason: response.status === 401 ? "unauthenticated" : "t3_rejected",
+            detail,
+          });
+        }
+        return parsed;
+      }),
+    );
   return {
     launch,
     read,
@@ -692,5 +735,6 @@ export const wsT3LocalClient = (options: T3ClientOptions): T3LocalClient => {
     readBoard,
     listProjectIds,
     listProviderModels,
+    driveCall,
   };
 };

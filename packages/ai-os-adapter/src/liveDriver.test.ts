@@ -832,3 +832,281 @@ it.effect("stays with a task the board interrupts, then follows the resume", () 
     }),
   ),
 );
+
+const driveManifestFor = (taskId: string, ids: readonly string[]) => ({
+  root: `.ai_os/drive/${taskId}`,
+  manifestSha256: "c".repeat(64),
+  totalFiles: ids.length,
+  totalBytes: 2048 * ids.length,
+  failedFiles: 0,
+  files: ids.map((id, index) => ({
+    id,
+    name: `${id}.pdf`,
+    drivePath: `RFP/${id}.pdf`,
+    kind: "text" as const,
+    bytes: 2048,
+    original: `.ai_os/drive/${taskId}/000${index + 1}-${id}.pdf`,
+    text: `.ai_os/drive/${taskId}/000${index + 1}-${id}.pdf.txt`,
+  })),
+  sources: [...ids],
+});
+
+/** Fake Drive routes: records calls; snapshot jobs finish on the second poll. */
+const fakeDriveRoutes = (options: { problem?: string } = {}) => {
+  const calls: Array<{ route: string; body: Record<string, unknown> }> = [];
+  const jobs = new Map<string, { taskId: string; refs: string[]; polls: number }>();
+  const driveCall: NonNullable<T3LocalClient["driveCall"]> = (route, body) => {
+    calls.push({ route, body });
+    switch (route) {
+      case "search":
+        return Effect.succeed({
+          files: [
+            { id: "fileAAAAAAAAAA", name: "Brief.pdf", mimeType: "application/pdf", size: 1500 },
+            {
+              id: "folderBBBBBBBB",
+              name: "Annex",
+              mimeType: "application/vnd.google-apps.folder",
+              size: null,
+            },
+          ],
+        });
+      case "list":
+        return Effect.succeed({
+          root: {
+            id: "folderBBBBBBBB",
+            name: "RFP",
+            mimeType: "application/vnd.google-apps.folder",
+          },
+          files: [
+            {
+              id: "one1111111111",
+              name: "one.pdf",
+              mimeType: "application/pdf",
+              size: 10,
+              path: "one.pdf",
+            },
+            {
+              id: "two2222222222",
+              name: "two.docx",
+              mimeType: "x",
+              size: 20,
+              path: "Sub/two.docx",
+            },
+          ],
+        });
+      case "snapshot": {
+        const jobId = `job-${jobs.size + 1}`;
+        jobs.set(jobId, { taskId: String(body.taskId), refs: body.refs as string[], polls: 0 });
+        return Effect.succeed({ jobId });
+      }
+      case "snapshot/status": {
+        const job = jobs.get(String(body.jobId))!;
+        job.polls += 1;
+        return Effect.succeed(
+          job.polls < 2
+            ? { state: "running", done: 1, total: job.refs.length + 1, current: "RFP/one.pdf" }
+            : { state: "done", manifest: driveManifestFor(job.taskId, job.refs) },
+        );
+      }
+      case "verify":
+        return Effect.succeed({ problem: options.problem ?? null });
+    }
+  };
+  return { calls, driveCall };
+};
+
+it("parses the Drive flags", () => {
+  const request = parseLiveDriverArgs(
+    [
+      "--drive",
+      "a1",
+      "--drive",
+      "b2",
+      "--drive-search",
+      "rfp",
+      "--pick",
+      "1,3",
+      "--evaluate-folder",
+      "f",
+    ],
+    {},
+  );
+  assert.deepStrictEqual(request.drive, ["a1", "b2"]);
+  assert.strictEqual(request.driveSearch, "rfp");
+  assert.deepStrictEqual(request.pick, [1, 3]);
+  assert.strictEqual(request.evaluateFolder, "f");
+  assert.throws(() => parseLiveDriverArgs(["--pick", "0"], {}), /--pick takes result numbers/);
+});
+
+it.effect("prints Drive search results and launches nothing without --pick", () =>
+  Effect.gen(function* () {
+    const drive = fakeDriveRoutes();
+    const lines: string[] = [];
+    const client = {
+      driveCall: drive.driveCall,
+      listProjectIds: () => Effect.die("not reached"),
+    } as unknown as T3LocalClient;
+    yield* runLiveDriver(
+      {
+        origin: "http://127.0.0.1:1",
+        pairingToken: undefined,
+        projectId: "usba",
+        model: undefined,
+        title: "x",
+        prompt: "y",
+        listProjects: false,
+        driveSearch: "brief",
+      },
+      {
+        client,
+        clock: () => CLOCK,
+        write: (line) => lines.push(line),
+        sleep: () => Effect.void,
+        readRepoCommit: () => Promise.resolve(SHA),
+      },
+    );
+    assert.deepStrictEqual(lines, [
+      "1\tBrief.pdf (1.5 KB)\tfileAAAAAAAAAA",
+      "2\tAnnex (folder)\tfolderBBBBBBBB",
+    ]);
+  }),
+);
+
+it.effect(
+  "evaluates a folder as one task per file, each with its own read-only Drive snapshot",
+  () =>
+    withServer((origin) =>
+      Effect.gen(function* () {
+        const drive = fakeDriveRoutes();
+        const launches: T3LaunchRequest[] = [];
+        const real = wsT3LocalClient({ origin, pairingToken: PAIR });
+        const client: T3LocalClient = {
+          listProjectIds: real.listProjectIds,
+          listProviderModels: () => Effect.succeed(CATALOG),
+          publishBoard: real.publishBoard,
+          publishEvent: real.publishEvent,
+          readBoard: real.readBoard,
+          interrupt: () => Effect.die("interrupt is unused"),
+          continueRun: () => Effect.die("continue is unused"),
+          launch: (input) => {
+            launches.push(input);
+            return Effect.succeed({
+              threadId: `thread-${launches.length}`,
+              runId: "run-1",
+              resumed: false,
+            });
+          },
+          read: (threadId) =>
+            Effect.succeed({
+              threadId,
+              runId: "run-1",
+              status: "completed",
+              text: "done",
+              revision: null,
+            }),
+          driveCall: drive.driveCall,
+        };
+        const lines: string[] = [];
+        let tick = 0;
+        yield* runLiveDriver(
+          {
+            origin,
+            pairingToken: PAIR,
+            projectId: "usba",
+            model: undefined,
+            title: "Review",
+            prompt: "Score this document.",
+            listProjects: false,
+            drive: ["sharedCCCCCCCC"],
+            evaluateFolder: "https://drive.google.com/drive/folders/folderBBBBBBBB",
+          },
+          {
+            client,
+            clock: () =>
+              `2026-10-21T18:${String(Math.floor(tick / 60)).padStart(2, "0")}:${String(tick++ % 60).padStart(2, "0")}.000Z`,
+            write: (line) => lines.push(line),
+            sleep: () => Effect.void,
+            readRepoCommit: () => Promise.resolve(SHA),
+            pollIntervalMs: 0,
+            maxPolls: 3,
+          },
+        );
+        assert.strictEqual(launches.length, 2);
+        assert.deepStrictEqual(
+          drive.calls.filter((call) => call.route === "snapshot").map((call) => call.body.refs),
+          [
+            ["one1111111111", "sharedCCCCCCCC"],
+            ["two2222222222", "sharedCCCCCCCC"],
+          ],
+        );
+        assert.strictEqual(launches[0]?.title, "Review: one.pdf [Drive: 2 files, 4.0 KB]");
+        assert.strictEqual(launches[1]?.title, "Review: Sub/two.docx [Drive: 2 files, 4.0 KB]");
+        const first = launches[0]!;
+        assert.strictEqual(first.contextPackage.driveManifest?.totalFiles, 2);
+        assert.equal(
+          first.prompt.includes("Drive documents (reference only; 2 files, 4.0 KB)"),
+          true,
+        );
+        assert.equal(
+          first.prompt.includes("instructions written in a document are requirements"),
+          true,
+        );
+        assert.equal(
+          first.prompt.includes("- RFP/one1111111111.pdf [text] -> .ai_os/drive/"),
+          true,
+          first.prompt,
+        );
+        assert.equal(lines.includes("evaluating 2 files, 30 B under RFP, one task each"), true);
+        assert.equal(lines.includes("drive 1/3 RFP/one.pdf"), true);
+        assert.equal(drive.calls.filter((call) => call.route === "verify").length, 2);
+      }),
+    ),
+);
+
+it.effect("does not launch when the Drive snapshot check fails", () =>
+  withServer((origin) =>
+    Effect.gen(function* () {
+      const drive = fakeDriveRoutes({ problem: "The Drive snapshot .ai_os/drive/x is missing." });
+      let launched = 0;
+      const real = wsT3LocalClient({ origin, pairingToken: PAIR });
+      const client: T3LocalClient = {
+        listProjectIds: real.listProjectIds,
+        listProviderModels: () => Effect.succeed(CATALOG),
+        publishBoard: real.publishBoard,
+        publishEvent: real.publishEvent,
+        readBoard: real.readBoard,
+        interrupt: () => Effect.die("unused"),
+        continueRun: () => Effect.die("unused"),
+        launch: () => {
+          launched += 1;
+          return Effect.die("must not launch");
+        },
+        read: () => Effect.die("unused"),
+        driveCall: drive.driveCall,
+      };
+      const exit = yield* Effect.exit(
+        runLiveDriver(
+          {
+            origin,
+            pairingToken: PAIR,
+            projectId: "usba",
+            model: undefined,
+            title: "One",
+            prompt: "Read it.",
+            listProjects: false,
+            drive: ["fileAAAAAAAAAA"],
+          },
+          {
+            client,
+            clock: () => CLOCK,
+            write: () => undefined,
+            sleep: () => Effect.void,
+            readRepoCommit: () => Promise.resolve(SHA),
+          },
+        ),
+      );
+      assert.equal(Exit.isFailure(exit), true);
+      assert.strictEqual(launched, 0);
+    }),
+  ),
+);

@@ -2,6 +2,12 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 
+import {
+  decodeDriveManifestRefV1,
+  describeDriveSize,
+  type DriveManifestRefV1,
+} from "@t3tools/ai-os-contracts";
+
 import { GrokT3Error } from "./errors.ts";
 import { clearAdapterBoard, createGrokT3Adapter, type AttemptSession } from "./grokT3.ts";
 import {
@@ -44,7 +50,18 @@ Pass --list-projects together with --project-id, --title, and --prompt to list
 and launch in one run. Omit --model to use the project's configured model when
 the provider offers it, then the server default, then the provider's default or
 the first available model. An explicit --model that is not offered is an error
-listing the valid models.`;
+listing the valid models.
+
+Google Drive (the server holds the Drive token; files are read-only copies):
+  --drive <link or id>        Attach a Drive file, or every file under a folder.
+                              Repeat to attach several.
+  --drive-search "<text>"     Print numbered Drive matches and stop.
+  --drive-search "<text>" --pick 1,3
+                              Attach those matches.
+  --evaluate-folder <link>    One task per file under the folder (all depths),
+                              run one after another. --title and --prompt apply
+                              to each; the file path is added to the title.
+The task title shows the Drive total, e.g. "[Drive: 3 files, 1.2 MB]".`;
 
 export class LiveDriverUsageError extends Schema.TaggedError<LiveDriverUsageError>()(
   "LiveDriverUsageError",
@@ -63,6 +80,11 @@ export interface LiveDriverRequest {
   readonly title: string | undefined;
   readonly prompt: string | undefined;
   readonly listProjects: boolean;
+  /** Drive links or ids to attach. */
+  readonly drive?: readonly string[];
+  readonly driveSearch?: string | undefined;
+  readonly pick?: readonly number[];
+  readonly evaluateFolder?: string | undefined;
 }
 
 export interface LiveDriverDependencies {
@@ -98,6 +120,10 @@ export const parseLiveDriverArgs = (
   let title: string | undefined;
   let prompt: string | undefined;
   let listProjects = false;
+  const drive: string[] = [];
+  let driveSearch: string | undefined;
+  let pick: number[] = [];
+  let evaluateFolder: string | undefined;
 
   for (let index = 0; index < argv.length; index += 1) {
     const flag = argv[index];
@@ -134,6 +160,29 @@ export const parseLiveDriverArgs = (
         prompt = take(argv, index, flag);
         index += 1;
         break;
+      case "--drive":
+        drive.push(take(argv, index, flag));
+        index += 1;
+        break;
+      case "--drive-search":
+        driveSearch = take(argv, index, flag);
+        index += 1;
+        break;
+      case "--pick": {
+        const raw = take(argv, index, flag);
+        index += 1;
+        pick = raw.split(",").map((part) => Number(part.trim()));
+        if (pick.some((value) => !Number.isInteger(value) || value < 1)) {
+          throw new LiveDriverUsageError({
+            detail: `--pick takes result numbers such as 1,3.\n\n${LIVE_DRIVER_HELP}`,
+          });
+        }
+        break;
+      }
+      case "--evaluate-folder":
+        evaluateFolder = take(argv, index, flag);
+        index += 1;
+        break;
       default:
         throw new LiveDriverUsageError({
           detail: `Unknown argument ${flag ?? ""}.\n\n${LIVE_DRIVER_HELP}`,
@@ -149,6 +198,10 @@ export const parseLiveDriverArgs = (
     title,
     prompt,
     listProjects,
+    drive,
+    driveSearch,
+    pick,
+    evaluateFolder,
   };
 };
 
@@ -249,6 +302,92 @@ const phaseLabel = (session: AttemptSession): string =>
     ? `executing ${session.state.run.progress?.status ?? "starting"}`
     : session.state.phase;
 
+interface DriveListedFile {
+  readonly id: string;
+  readonly name: string;
+  readonly mimeType: string;
+  readonly size: number | null;
+  readonly path?: string;
+  readonly webViewLink?: string | null;
+}
+
+const FOLDER_MIME = "application/vnd.google-apps.folder";
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+
+const filesOf = (value: unknown): DriveListedFile[] =>
+  isRecord(value) && Array.isArray(value.files)
+    ? value.files.filter(
+        (file): file is DriveListedFile =>
+          isRecord(file) && typeof file.id === "string" && typeof file.name === "string",
+      )
+    : [];
+
+const unreadable = (what: string) =>
+  new GrokT3Error({
+    reason: "t3_rejected",
+    detail: `The server returned an unreadable Drive ${what}.`,
+  });
+
+const driveClient = (client: T3LocalClient) =>
+  client.driveCall === undefined
+    ? Effect.fail(
+        new LiveDriverUsageError({ detail: "This T3 client cannot reach the Drive routes." }),
+      )
+    : Effect.succeed(client.driveCall);
+
+const sizeLabel = (bytes: number | null) =>
+  bytes === null ? "" : ` (${describeDriveSize(1, bytes).replace(/^1 file, /, "")})`;
+
+/**
+ * Snapshot the Drive refs into the project worktree on the server, wait for
+ * it, and check it is in place. Returns the manifest for the context package.
+ */
+const snapshotDrive = (
+  deps: LiveDriverDependencies,
+  projectId: string,
+  taskId: string,
+  refs: readonly string[],
+) =>
+  Effect.gen(function* () {
+    const call = yield* driveClient(deps.client);
+    const started = yield* call("snapshot", { projectId, taskId, refs });
+    if (!isRecord(started) || typeof started.jobId !== "string") {
+      return yield* unreadable("snapshot job");
+    }
+    let lastDone = -1;
+    const interval = deps.pollIntervalMs ?? 1_000;
+    for (;;) {
+      const status = yield* call("snapshot/status", { jobId: started.jobId });
+      if (!isRecord(status)) return yield* unreadable("snapshot status");
+      if (status.state === "done") {
+        const manifest = yield* decodeDriveManifestRefV1(status.manifest).pipe(
+          Effect.mapError(() => unreadable("manifest")),
+        );
+        const check = yield* call("verify", { projectId, manifest });
+        const problem = isRecord(check) ? check.problem : "unreadable check";
+        if (typeof problem === "string") {
+          return yield* new GrokT3Error({ reason: "invalid_task", detail: problem });
+        }
+        return manifest;
+      }
+      if (status.state === "failed") {
+        return yield* new GrokT3Error({
+          reason: status.status === 401 ? "unauthenticated" : "t3_rejected",
+          detail: typeof status.error === "string" ? status.error : "Drive snapshot failed.",
+        });
+      }
+      if (typeof status.done === "number" && status.done !== lastDone) {
+        lastDone = status.done;
+        deps.write(
+          `drive ${status.done}/${typeof status.total === "number" ? status.total : "?"}${typeof status.current === "string" ? ` ${status.current}` : ""}`,
+        );
+      }
+      yield* deps.sleep(interval);
+    }
+  });
+
 /**
  * Record, launch, and poll one intake.
  *
@@ -260,6 +399,32 @@ export const runLiveDriver = (
   deps: LiveDriverDependencies,
 ): Effect.Effect<void, GrokT3Error | LiveDriverUsageError> =>
   Effect.gen(function* () {
+    const picked: string[] = [];
+    if (request.driveSearch !== undefined) {
+      const call = yield* driveClient(deps.client);
+      const found = filesOf(yield* call("search", { query: request.driveSearch }));
+      if ((request.pick ?? []).length === 0) {
+        if (found.length === 0) deps.write("No Drive matches.");
+        found.forEach((file, index) => {
+          deps.write(
+            `${index + 1}\t${file.name}${file.mimeType === FOLDER_MIME ? " (folder)" : sizeLabel(file.size)}\t${file.id}`,
+          );
+        });
+        return;
+      }
+      for (const number of request.pick ?? []) {
+        const file = found[number - 1];
+        if (file === undefined) {
+          return yield* new LiveDriverUsageError({
+            detail: `--pick ${number}: the search returned ${found.length} matches.`,
+          });
+        }
+        picked.push(file.id);
+      }
+    } else if ((request.pick ?? []).length > 0) {
+      return yield* new LiveDriverUsageError({ detail: "--pick needs --drive-search." });
+    }
+
     const projects = yield* deps.client.listProjectIds();
     const title = request.title?.trim() ?? "";
     const prompt = request.prompt?.trim() ?? "";
@@ -309,72 +474,112 @@ export const runLiveDriver = (
     if ("error" in resolved) {
       return yield* new LiveDriverUsageError({ detail: resolved.error });
     }
-    const stamp = deps.clock();
-    const taskId = liveTaskId(title, stamp);
-    clearAdapterBoard();
-    const adapter = createGrokT3Adapter({
-      client: deps.client,
-      clock: deps.clock,
-      model: resolved.model,
-      instanceId: resolved.instanceId,
-    });
-    const recorded = yield* adapter.record({
-      taskId,
-      title,
-      intake: {
-        version: "v1",
-        workspaceId: "personal",
-        projectId: project.id,
-        request: prompt,
-        constraints: [],
-        acceptanceCriteria: [prompt],
-        authorization: { kind: "explicit", scope: project.id },
-        originatingConversationId: "live-driver",
-      },
-      context: {
-        requirements: prompt,
-        memoryVersions: [],
-        repoCommit,
-        authorizationScope: project.id,
-        createdAt: stamp,
-      },
-    });
-    const started = yield* adapter.launch(recorded.taskId);
-    deps.write(`task ${started.taskId}`);
-    if (started.threadId !== null) deps.write(`thread ${started.threadId}`);
 
-    const threadId = started.threadId;
-    if (threadId === null) {
-      return yield* new GrokT3Error({
-        reason: "not_started",
-        detail: "Launch did not return a thread.",
+    const runOne = (taskTitle: string, idSeed: string, refs: readonly string[]) =>
+      Effect.gen(function* () {
+        const stamp = deps.clock();
+        const taskId = liveTaskId(idSeed, stamp);
+        let driveManifest: DriveManifestRefV1 | undefined;
+        let shownTitle = taskTitle;
+        if (refs.length > 0) {
+          driveManifest = yield* snapshotDrive(deps, project.id, taskId, refs);
+          const size = describeDriveSize(driveManifest.totalFiles, driveManifest.totalBytes);
+          shownTitle = `${taskTitle} [Drive: ${size}]`;
+          deps.write(
+            `drive snapshot ${driveManifest.root}: ${size}${driveManifest.failedFiles > 0 ? `, ${driveManifest.failedFiles} without text` : ""}`,
+          );
+        }
+        clearAdapterBoard();
+        const adapter = createGrokT3Adapter({
+          client: deps.client,
+          clock: deps.clock,
+          model: resolved.model,
+          instanceId: resolved.instanceId,
+        });
+        const recorded = yield* adapter.record({
+          taskId,
+          title: shownTitle,
+          intake: {
+            version: "v1",
+            workspaceId: "personal",
+            projectId: project.id,
+            request: prompt,
+            constraints: [],
+            acceptanceCriteria: [prompt],
+            authorization: { kind: "explicit", scope: project.id },
+            originatingConversationId: "live-driver",
+          },
+          context: {
+            requirements: prompt,
+            memoryVersions: [],
+            repoCommit,
+            authorizationScope: project.id,
+            createdAt: stamp,
+            ...(driveManifest === undefined ? {} : { driveManifest }),
+          },
+        });
+        const started = yield* adapter.launch(recorded.taskId);
+        deps.write(`task ${started.taskId}`);
+        if (started.threadId !== null) deps.write(`thread ${started.threadId}`);
+
+        const threadId = started.threadId;
+        if (threadId === null) {
+          return yield* new GrokT3Error({
+            reason: "not_started",
+            detail: "Launch did not return a thread.",
+          });
+        }
+
+        let lastText = "";
+        let lastLabel = "";
+        const limit = deps.maxPolls ?? 600;
+        const interval = deps.pollIntervalMs ?? 1_000;
+        for (let attempt = 0; attempt < limit; attempt += 1) {
+          const view = yield* deps.client.read(threadId);
+          if (view.text !== null && view.text !== lastText) {
+            deps.write(view.text);
+            lastText = view.text;
+          }
+          const session = yield* adapter.observe(recorded.taskId);
+          const label = phaseLabel(session);
+          if (label !== lastLabel) {
+            deps.write(label);
+            lastLabel = label;
+          }
+          // Recovery stays with this driver. Leaving here is what let a board pause
+          // drop the owner, so a later resume had nobody watching the thread.
+          if (session.state.phase !== "executing" && session.state.phase !== "recovery_pending") {
+            return;
+          }
+          yield* deps.sleep(interval);
+        }
+        deps.write("still executing");
       });
-    }
 
-    let lastText = "";
-    let lastLabel = "";
-    const limit = deps.maxPolls ?? 600;
-    const interval = deps.pollIntervalMs ?? 1_000;
-    for (let attempt = 0; attempt < limit; attempt += 1) {
-      const view = yield* deps.client.read(threadId);
-      if (view.text !== null && view.text !== lastText) {
-        deps.write(view.text);
-        lastText = view.text;
+    const shared = [...(request.drive ?? []), ...picked];
+    if (request.evaluateFolder !== undefined) {
+      const call = yield* driveClient(deps.client);
+      const listing = yield* call("list", { ref: request.evaluateFolder });
+      const root = isRecord(listing) && isRecord(listing.root) ? listing.root : null;
+      if (root === null) return yield* unreadable("folder listing");
+      if (root.mimeType !== FOLDER_MIME) {
+        return yield* new LiveDriverUsageError({
+          detail: "--evaluate-folder needs a folder link. Use --drive for a single file.",
+        });
       }
-      const session = yield* adapter.observe(recorded.taskId);
-      const label = phaseLabel(session);
-      if (label !== lastLabel) {
-        deps.write(label);
-        lastLabel = label;
+      const files = filesOf(listing);
+      const totalBytes = files.reduce((sum, file) => sum + (file.size ?? 0), 0);
+      deps.write(
+        `evaluating ${describeDriveSize(files.length, totalBytes)} under ${String(root.name)}, one task each`,
+      );
+      for (const [index, file] of files.entries()) {
+        const path = file.path ?? file.name;
+        deps.write(`--- ${index + 1}/${files.length} ${path}`);
+        yield* runOne(`${title}: ${path}`, `${title}-${index + 1}`, [file.id, ...shared]);
       }
-      // Recovery stays with this driver. Leaving here is what let a board pause
-      // drop the owner, so a later resume had nobody watching the thread.
-      if (session.state.phase !== "executing" && session.state.phase !== "recovery_pending") {
-        return;
-      }
-      yield* deps.sleep(interval);
+      return;
     }
-    deps.write("still executing");
+    yield* runOne(title, title, shared);
   });
 
 export const isLoopbackDriverOrigin = (origin: string): boolean => {

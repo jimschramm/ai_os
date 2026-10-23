@@ -9,6 +9,7 @@ import {
   ModelRef,
   strictParse,
 } from "./common.ts";
+import { DriveManifestRefV1 } from "./drive.ts";
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
@@ -60,6 +61,8 @@ export const ContextPackageSnapshotV1 = Schema.Struct({
   repoCommit: GitSha,
   authorizationScope: ContractText,
   createdAt: IsoDateTime,
+  /** Drive files copied into the worktree for this task. Absent when none were picked. */
+  driveManifest: Schema.optionalKey(DriveManifestRefV1),
 }).check(freezeDecoded);
 export type ContextPackageSnapshotV1 = typeof ContextPackageSnapshotV1.Type;
 
