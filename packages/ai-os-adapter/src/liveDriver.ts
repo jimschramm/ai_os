@@ -530,7 +530,9 @@ export const runLiveDriver = (
       write: (line: string) => void = deps.write,
       // Folder tasks are watched to the end so --concurrency really bounds them.
       untilDone = false,
-      onLaunched: () => void = () => undefined,
+      // Called just before the launch request: from then on the run may exist
+      // on the server even if the answer is lost.
+      onLaunching: () => void = () => undefined,
     ) =>
       Effect.gen(function* () {
         const stamp = deps.clock();
@@ -567,8 +569,8 @@ export const runLiveDriver = (
             ...(driveManifest === undefined ? {} : { driveManifest }),
           },
         });
+        onLaunching();
         const started = yield* adapter.launch(recorded.taskId);
-        onLaunched();
         write(`task ${started.taskId}`);
         if (started.threadId !== null) write(`thread ${started.threadId}`);
 
@@ -663,7 +665,7 @@ export const runLiveDriver = (
                 // A launched run we lost track of may still be going: it keeps
                 // its slot, so no further tasks start.
                 if (launched && halted === null) {
-                  halted = `${path} may still be running (lost track of it after launch)`;
+                  halted = `${path} may still be running (lost track of it after its launch was sent)`;
                   deps.write(`stopping the folder run: ${halted}`);
                 }
               }),

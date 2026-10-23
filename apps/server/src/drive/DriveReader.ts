@@ -67,6 +67,11 @@ export const readDriveFile = async (
       if (kind === "document" || kind === "presentation") {
         const original = await api.exportAs(file.id, kind === "document" ? DOCX : PPTX);
         const text = decode(await api.exportAs(file.id, "text/plain"));
+        // Two exports: both must come from the version the file is stored under.
+        const after = await api.getFile(file.id);
+        if ((after.modifiedTime ?? null) !== (file.modifiedTime ?? null)) {
+          throw new DriveApiError(`${file.name} changed in Drive while it was read; run it again.`);
+        }
         return await store.put({
           ...base,
           kind: "text",

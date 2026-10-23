@@ -275,6 +275,47 @@ describe("record bounds", () => {
     ).toThrow(/share one drawing/);
   });
 
+  it("reads a thousand separate slide drawings in linear time", () => {
+    const rec = (verInst: number, type: number, body: number[]) => [
+      ...u16(verInst),
+      ...u16(type),
+      body.length & 0xff,
+      (body.length >> 8) & 0xff,
+      (body.length >> 16) & 0xff,
+      0,
+      ...body,
+    ];
+    const u32 = (n: number) => [n & 0xff, (n >> 8) & 0xff, (n >> 16) & 0xff, n >>> 24];
+    // The test compound file has one FAT sector (about 60 KB of streams).
+    const count = 1000;
+    const drawing = rec(0x0f, 0x03ee, rec(0, 0x0fa8, [0x61]));
+    const slides = rec(
+      0x0f,
+      0x0ff0,
+      Array.from({ length: count }, (_, k) => rec(0, 0x03f3, u32(k + 2))).flat(),
+    );
+    const doc = rec(0x0f, 0x03e8, slides);
+    const drawingsAt = doc.length;
+    const drawings = new Array(count).fill(drawing).flat();
+    const dirAt = drawingsAt + drawings.length;
+    const directory = rec(0, 0x1772, [
+      ...u32(((count + 1) << 20) | 1),
+      ...u32(0),
+      ...Array.from({ length: count }, (_, k) => u32(drawingsAt + k * drawing.length)).flat(),
+    ]);
+    const edit = rec(0, 0x0ff5, [...u32(0), ...u32(0), ...u32(0), ...u32(dirAt), ...u32(1)]);
+    const current = new Uint8Array(20);
+    new DataView(current.buffer).setUint32(16, dirAt + directory.length, true);
+    const started = performance.now();
+    const text = extractPpt(
+      makeCfb("PowerPoint Document", new Uint8Array([...doc, ...drawings, ...directory, ...edit]), [
+        ["Current User", current],
+      ]),
+    );
+    expect(text).toContain(`## Slide ${count}\na`);
+    expect(performance.now() - started).toBeLessThan(2_000);
+  });
+
   it("rejects a PowerPoint edit chain that loops", () => {
     const rec = (type: number, body: number[]) => [
       0,

@@ -165,8 +165,35 @@ describe("readDriveFile", () => {
     expect(calls.filter((call) => call === "download txt1-0000000")).toHaveLength(2);
   });
 
+  it("does not store a Google Doc whose version changed between its two exports", async () => {
+    const { api } = tree();
+    const store = makeContentStore(await temp());
+    const file = {
+      id: "doc1",
+      name: "Brief",
+      mimeType: "application/vnd.google-apps.document",
+      modifiedTime: "2026-10-01T00:00:00.000Z",
+    };
+    const edited = {
+      ...api,
+      getFile: async () => ({ ...file, modifiedTime: "2026-10-01T00:00:05.000Z" }),
+    };
+    const read = await readDriveFile(edited, store, file);
+    expect(read.meta.error).toMatch(/changed in Drive while it was read/);
+    expect(read.originalPath).toBeNull();
+    expect(await store.list()).toEqual([]);
+  });
+
   it("exports Google formats: Docs to docx + text, Sheets to xlsx with every tab", async () => {
-    const { api, calls } = tree();
+    const { api: base, calls } = tree();
+    // The version check after the two Doc exports sees an unchanged file.
+    const api = {
+      ...base,
+      getFile: async (id: string) =>
+        id === "doc1"
+          ? { id, name: "Brief", mimeType: "application/vnd.google-apps.document" }
+          : base.getFile(id),
+    };
     const store = makeContentStore(await temp());
     const doc = await readDriveFile(api, store, {
       id: "doc1",
