@@ -254,6 +254,33 @@ describe("record bounds", () => {
     expect(() =>
       extractPpt(makeCfb("PowerPoint Document", stream, [["Current User", current]])),
     ).toThrow(/edit chain loops/);
+    // Thousands of distinct edits sharing one large directory: it is read once.
+    const big = rec(0x1772, [
+      ...u32((4000 << 20) | 1),
+      ...new Array(4000).fill(0).flatMap(() => u32(0)),
+    ]);
+    const edits = 3000;
+    const chainAt = (k: number) => big.length + k * 28;
+    const chainEdits = Array.from({ length: edits }, (_, k) =>
+      rec(0x0ff5, [
+        ...u32(0),
+        ...u32(0),
+        ...u32(k + 1 < edits ? chainAt(k + 1) : 0),
+        ...u32(0),
+        ...u32(1),
+      ]),
+    ).flat();
+    const head = new Uint8Array(20);
+    new DataView(head.buffer).setUint32(16, chainAt(0), true);
+    const started = performance.now();
+    expect(() =>
+      extractPpt(
+        makeCfb("PowerPoint Document", new Uint8Array([...big, ...chainEdits]), [
+          ["Current User", head],
+        ]),
+      ),
+    ).toThrow(/No slide text/);
+    expect(performance.now() - started).toBeLessThan(2_000);
   });
 
   it("rejects worksheets that share records", () => {

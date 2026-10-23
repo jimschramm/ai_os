@@ -560,13 +560,17 @@ export const extractPpt = (bytes: Uint8Array) => {
   if (current !== undefined && current.length >= 20) {
     let edit = view(current).getUint32(16, true);
     const visited = new Set<number>();
+    const scannedDirectories = new Set<number>();
     for (let guard = 0; guard < 4096 && edit > 0; guard += 1) {
       // Each edit once: a cycle would rescan the same directories.
       if (visited.has(edit)) throw new Error("Broken presentation: the edit chain loops.");
       visited.add(edit);
       const record = header(edit);
       if (record === null || record.type !== 0x0ff5 || record.body + 20 > stream.length) break;
-      const directory = header(dv.getUint32(record.body + 12, true));
+      const directoryAt = dv.getUint32(record.body + 12, true);
+      const directory = scannedDirectories.has(directoryAt) ? null : header(directoryAt);
+      // Each persist directory is read once; an older edit naming the same one adds nothing.
+      scannedDirectories.add(directoryAt);
       if (directory !== null && directory.type === 0x1772) {
         for (let at = directory.body; at + 4 <= directory.next;) {
           const word = dv.getUint32(at, true);

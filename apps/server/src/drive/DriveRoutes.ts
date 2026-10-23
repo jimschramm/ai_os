@@ -270,6 +270,19 @@ export const layer = Layer.unwrap(
         taskId: job.taskId,
         refs: job.refs,
         resume,
+        ...(job.state === "running" && job.pinnedManifestSha256 !== undefined
+          ? { expectedManifestSha256: job.pinnedManifestSha256 }
+          : {}),
+        // Pinned in the job file before the snapshot is published.
+        onPublish: (manifestSha256) =>
+          jobs.save({
+            ...job,
+            state: "running",
+            done: 0,
+            total: 0,
+            current: null,
+            pinnedManifestSha256: manifestSha256,
+          }),
         followShortcut,
         onProgress: (done, total, current) => {
           // Progress is best effort; the final state is what counts.

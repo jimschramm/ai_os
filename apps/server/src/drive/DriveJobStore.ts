@@ -21,6 +21,8 @@ export type DriveJob = {
       readonly done: number;
       readonly total: number;
       readonly current: string | null;
+      /** Hash of the manifest about to be published, saved before it is; resume trusts only this. */
+      readonly pinnedManifestSha256?: string;
     }
   | { readonly state: "done"; readonly manifest: unknown }
   | { readonly state: "failed"; readonly error: string; readonly status: number }

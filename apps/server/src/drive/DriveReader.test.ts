@@ -1,4 +1,5 @@
 // @effect-diagnostics nodeBuiltinImport:off globalDate:off - uses a temp dir as the content store and worktree.
+import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -588,6 +589,7 @@ describe("snapshot resume", () => {
     // A run cut short by a restart leaves its temp folder behind.
     const stale = path.join(worktree, ".ai_os", "drive", ".tmp", "task-r~1");
     await fs.mkdir(stale, { recursive: true });
+    let pinned = "";
     const first = await buildSnapshot({
       api,
       store,
@@ -595,7 +597,11 @@ describe("snapshot resume", () => {
       taskId: "task-r",
       refs: ["txt1-0000000"],
       resume: true,
+      onPublish: async (sha) => {
+        pinned = sha;
+      },
     });
+    expect(pinned).toBe(first.ref.manifestSha256);
     expect(
       await fs.stat(stale).then(
         () => true,
@@ -610,7 +616,19 @@ describe("snapshot resume", () => {
       taskId: "task-r",
       refs: ["txt1-0000000"],
       resume: true,
+      expectedManifestSha256: pinned,
     });
+    // Without the pinned hash a finished snapshot is not trusted.
+    await expect(
+      buildSnapshot({
+        api,
+        store,
+        worktree,
+        taskId: "task-r",
+        refs: ["txt1-0000000"],
+        resume: true,
+      }),
+    ).rejects.toThrow(/already exists/);
     expect(again.ref).toEqual(first.ref);
     expect(calls.filter((call) => call.startsWith("download")).length).toBe(downloads);
     await expect(
@@ -638,8 +656,60 @@ describe("snapshot resume", () => {
         taskId: "task-r",
         refs: ["txt1-0000000"],
         resume: true,
+        expectedManifestSha256: pinned,
       }),
     ).rejects.toThrow(/already exists/);
+    // Changing the copy and rewriting its hash in the manifest is caught too.
+    const manifestFile = path.join(worktree, first.ref.root, "manifest.json");
+    const manifest = JSON.parse(await fs.readFile(manifestFile, "utf8"));
+    manifest.files[0].textSha256 = createHash("sha256").update("changed").digest("hex");
+    await fs.chmod(manifestFile, 0o644);
+    await fs.writeFile(manifestFile, `${JSON.stringify(manifest, null, 2)}\n`);
+    await expect(
+      buildSnapshot({
+        api,
+        store,
+        worktree,
+        taskId: "task-r",
+        refs: ["txt1-0000000"],
+        resume: true,
+        expectedManifestSha256: pinned,
+      }),
+    ).rejects.toThrow(/already exists/);
+  });
+
+  it("refuses a snapshot whose folder or file was replaced by a symlink", async () => {
+    const { api } = fakeApi(
+      [{ id: "sym1-0000000", name: "a.txt", mimeType: "text/plain", size: 2 }],
+      {},
+      { "sym1-0000000": new TextEncoder().encode("hi") },
+    );
+    const worktree = await temp();
+    const { ref } = await buildSnapshot({
+      api,
+      store: makeContentStore(await temp()),
+      worktree,
+      taskId: "t-sym",
+      refs: ["sym1-0000000"],
+    });
+    expect(await verifySnapshot(worktree, ref)).toBeNull();
+    const root = path.join(worktree, ref.root);
+    const outside = await temp();
+    await fs.cp(root, outside, { recursive: true });
+    // A file swapped for a symlink to identical bytes elsewhere.
+    const file = path.join(worktree, ref.files[0]!.original!);
+    await fs.chmod(root, 0o755);
+    await fs.rm(file, { force: true });
+    await fs.symlink(path.join(outside, path.basename(file)), file);
+    expect(await verifySnapshot(worktree, ref)).toMatch(/not a plain local copy/);
+    // The whole folder swapped for a symlink.
+    await fs.rm(root, { recursive: true, force: true });
+    await fs.symlink(outside, root);
+    expect(await verifySnapshot(worktree, ref)).toMatch(/not a plain local copy/);
+    // A root outside .ai_os/drive.
+    expect(await verifySnapshot(worktree, { ...ref, root: "elsewhere" })).toMatch(
+      /not a snapshot folder/,
+    );
   });
 });
 

@@ -253,6 +253,13 @@ export const buildSnapshot = async (input: {
   readonly now?: () => Date;
   /** Resuming after a restart: return the finished snapshot if it is already there. */
   readonly resume?: boolean;
+  /**
+   * On resume, the manifest hash the job pinned before publishing. A finished
+   * snapshot is reused only if its manifest still has this hash.
+   */
+  readonly expectedManifestSha256?: string;
+  /** Called (and awaited) with the manifest hash just before the snapshot is published. */
+  readonly onPublish?: (manifestSha256: string) => Promise<void>;
   /** Which shortcut targets inside attached folders to read; the rest are skipped. */
   readonly followShortcut?: (target: DriveFile) => Promise<boolean>;
   /** Called after each file with (done, total, Drive path). */
@@ -278,6 +285,8 @@ export const buildSnapshot = async (input: {
       const existing = await loadSnapshot(input.worktree, relRoot);
       if (
         existing !== null &&
+        input.expectedManifestSha256 !== undefined &&
+        existing.result.ref.manifestSha256 === input.expectedManifestSha256 &&
         existing.taskId === input.taskId &&
         JSON.stringify(existing.result.ref.sources) ===
           JSON.stringify(input.refs.map((ref) => ref.trim())) &&
@@ -404,6 +413,7 @@ export const buildSnapshot = async (input: {
     };
     const manifestText = `${JSON.stringify(manifest, null, 2)}\n`;
     await fs.writeFile(path.join(temporary, "manifest.json"), manifestText, { mode: 0o444 });
+    await input.onPublish?.(sha256Hex(manifestText));
     await fs.rename(temporary, absRoot);
     return {
       manifestPath: path.join(absRoot, "manifest.json"),
@@ -484,6 +494,19 @@ const assertNoSymlinks = async (worktree: string, relRoot: string) => {
   }
 };
 
+/** True when every folder on `rel` is a real folder and the last part a regular file (no symlinks). */
+const plainPath = async (worktree: string, rel: string) => {
+  const segments = rel.split("/");
+  let current = worktree;
+  for (const [index, segment] of segments.entries()) {
+    current = path.join(current, segment);
+    const stat = await fs.lstat(current).catch(() => null);
+    if (stat === null || stat.isSymbolicLink()) return false;
+    if (index < segments.length - 1 ? !stat.isDirectory() : !stat.isFile()) return false;
+  }
+  return true;
+};
+
 /** The repo's info/exclude path as git resolves it (linked worktrees included); null outside git. */
 const gitExcludePath = (worktree: string) =>
   new Promise<string | null>((resolve) => {
@@ -513,6 +536,21 @@ const ensureIgnored = async (worktree: string) => {
 
 /** Snapshot still present and unchanged; used before a task launches or resumes. */
 export const verifySnapshot = async (worktree: string, ref: DriveManifestRefV1) => {
+  // The root is one plain folder under .ai_os/drive, and nothing on the way is a symlink.
+  const rootName = ref.root.slice(DRIVE_SNAPSHOT_DIR.length + 1);
+  if (
+    !ref.root.startsWith(`${DRIVE_SNAPSHOT_DIR}/`) ||
+    rootName.length === 0 ||
+    rootName.includes("/") ||
+    rootName === "." ||
+    rootName === ".." ||
+    rootName === ".tmp"
+  ) {
+    return `The Drive snapshot ${ref.root} is not a snapshot folder.`;
+  }
+  if (!(await plainPath(worktree, `${ref.root}/manifest.json`))) {
+    return `The Drive snapshot ${ref.root} is missing or not a plain local copy.`;
+  }
   const text = await fs
     .readFile(path.join(worktree, ...ref.root.split("/"), "manifest.json"), "utf8")
     .catch(() => null);
@@ -538,6 +576,9 @@ export const verifySnapshot = async (worktree: string, ref: DriveManifestRefV1) 
         segments.some((part) => part === ".." || part === "")
       ) {
         return `The Drive snapshot ${ref.root} lists a file outside the snapshot.`;
+      }
+      if (!(await plainPath(worktree, rel))) {
+        return `The Drive snapshot file ${rel} is missing or not a plain local copy.`;
       }
       const actual = await fileSha(path.join(worktree, ...rel.split("/"))).catch(() => null);
       if (actual === null) return `The Drive snapshot file ${rel} is missing.`;
