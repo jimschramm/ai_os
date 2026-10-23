@@ -320,12 +320,16 @@ export const extractXlsx = async (bytes: Uint8Array) => {
     const relId = attr(attrs, "r:id") || undefined;
     const state = attr(attrs, "state") || undefined;
     const target = relId === undefined ? undefined : rels.get(relId);
-    if (target !== undefined) {
+    // Every listed sheet must resolve: none is shown as empty by mistake.
+    if (target === undefined) {
+      throw new Error(`Malformed workbook: sheet ${name} has no relationship.`);
+    }
+    {
       if (seenSheets.has(target)) throw new Error(`Malformed workbook: ${target} is listed twice.`);
       seenSheets.add(target);
     }
-    const xml = target === undefined ? undefined : parts.get(target);
-    if (target !== undefined && xml === undefined) {
+    const xml = parts.get(target);
+    if (xml === undefined) {
       throw new Error(`Malformed workbook: sheet ${name} points to missing part ${target}.`);
     }
     const rows: string[] = [];

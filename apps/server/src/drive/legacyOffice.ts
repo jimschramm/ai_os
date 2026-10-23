@@ -475,7 +475,15 @@ export const extractXls = (bytes: Uint8Array) => {
     if (used.has(sheet.offset)) throw new Error("Broken workbook: two sheets share one worksheet.");
     used.add(sheet.offset);
     const start = byOffset.get(sheet.offset);
-    if (start === undefined || records[start]!.type !== 0x0809) continue;
+    // The offset must land on a worksheet's BOF (dt 0x0010); a damaged one is
+    // an error, not a sheet quietly left out.
+    const bof = start === undefined ? undefined : records[start];
+    if (start === undefined || bof === undefined || bof.type !== 0x0809) {
+      throw new Error(`Broken workbook: sheet ${sheet.name} points to no worksheet.`);
+    }
+    if (bof.data.length < 4 || (bof.data[2]! | (bof.data[3]! << 8)) !== 0x0010) {
+      throw new Error(`Broken workbook: sheet ${sheet.name} does not point to a worksheet.`);
+    }
     const cells = new Map<number, Map<number, string>>();
     const put = (row: number, col: number, value: string) => {
       if (value === "") return;

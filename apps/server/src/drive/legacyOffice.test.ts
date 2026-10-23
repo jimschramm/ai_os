@@ -244,6 +244,18 @@ describe("Excel 97 records", () => {
     expect(extractXls(makeCfb("Workbook", workbook(cells)))).toBe("## Sheet: S1\nA\t\tBC");
   });
 
+  it("rejects a sheet whose offset does not land on a worksheet BOF", () => {
+    const good = workbook([]);
+    const offsetAt = 20 + 4; // globals BOF, then the BOUNDSHEET record header
+    const offset = good[offsetAt]! | (good[offsetAt + 1]! << 8);
+    const off = good.slice();
+    off[offsetAt] = (offset + 1) & 0xff;
+    expect(() => extractXls(makeCfb("Workbook", off))).toThrow(/points to no worksheet/);
+    const chart = good.slice();
+    chart[offset + 4 + 2] = 0x20; // BOF dt: chart, not a worksheet
+    expect(() => extractXls(makeCfb("Workbook", chart))).toThrow(/does not point to a worksheet/);
+  });
+
   it("reads the root storage's Workbook, not an embedded document's", () => {
     const cell = (text: string) => [
       ...formulaString(0, 0),

@@ -191,6 +191,19 @@ describe("part references", () => {
     await expect(extractXlsx(book("worksheets/nope.xml"))).rejects.toThrow(/missing part/);
   });
 
+  it("records an error for an XLSX sheet with no relationship instead of an empty sheet", async () => {
+    const result = await extractContent({
+      name: "book.xlsx",
+      mimeType: "application/octet-stream",
+      bytes: makeZip({
+        "xl/workbook.xml": '<workbook><sheet name="S" r:id="rId9"/></workbook>',
+        "xl/_rels/workbook.xml.rels": '<Relationship Id="rId1" Target="worksheets/sheet1.xml"/>',
+        "xl/worksheets/sheet1.xml": "<worksheet><row><c><v>7</v></c></row></worksheet>",
+      }),
+    });
+    expect(result.error).toMatch(/sheet S has no relationship/);
+  });
+
   it("rejects a listed slide whose relationship or part is missing", async () => {
     const deck = (rels: string) =>
       extractPptx(
@@ -270,7 +283,7 @@ describe("crafted inputs stay linear", () => {
     const xlsxText = await timed(() =>
       extractXlsx(
         makeZip({
-          "xl/workbook.xml": `<workbook><sheet name="S" r:id="rId1"/>${'<sheet name="'.repeat(n / 20)}</workbook>`,
+          "xl/workbook.xml": `<workbook><sheet name="S" r:id="rId1"/></workbook>${'<sheet name="'.repeat(n / 20)}`,
           "xl/_rels/workbook.xml.rels": `<Relationship Id="rId1" Target="worksheets/sheet1.xml"/>${'<Relationship Id="'.repeat(n / 20)}`,
           "xl/sharedStrings.xml": `<si><t>ok</t></si>${"<si><t>".repeat(n / 10)}`,
           "xl/worksheets/sheet1.xml": `<row><c t="s"><v>0</v>${"<v>".repeat(n / 10)}</c>${"<c ".repeat(n / 10)}</row>${"<row>".repeat(n / 10)}`,
