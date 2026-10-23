@@ -188,6 +188,11 @@ it.layer(NodeServices.layer)("ServerSecretStore.layer", (it) => {
   it.effect("uses restrictive permissions for the secret directory and files", () =>
     Effect.gen(function* () {
       const chmodCalls: Array<{ readonly path: string; readonly mode: number }> = [];
+      const writeCalls: Array<{
+        readonly path: string;
+        readonly flag: string | undefined;
+        readonly mode: number | undefined;
+      }> = [];
       const layerRecordingFileSystem = Layer.effect(
         FileSystem.FileSystem,
         Effect.gen(function* () {
@@ -196,7 +201,10 @@ it.layer(NodeServices.layer)("ServerSecretStore.layer", (it) => {
           return {
             ...fileSystem,
             makeDirectory: () => Effect.void,
-            writeFile: () => Effect.void,
+            writeFile: (path, _data, options) =>
+              Effect.sync(() => {
+                writeCalls.push({ path: String(path), flag: options?.flag, mode: options?.mode });
+              }),
             rename: () => Effect.void,
             chmod: (path, mode) =>
               Effect.sync(() => {
@@ -221,7 +229,55 @@ it.layer(NodeServices.layer)("ServerSecretStore.layer", (it) => {
         chmodCalls.some((call) => call.mode === 0o700 && /[\\/]secrets$/.test(call.path)),
       );
       assert.isAtLeast(chmodCalls.filter((call) => call.mode === 0o600).length, 2);
+      // The temporary file is created owner-only before any bytes land in it.
+      assert.deepEqual(
+        writeCalls.map(({ flag, mode }) => ({ flag, mode })),
+        [{ flag: "wx", mode: 0o600 }],
+      );
+      assert.match(writeCalls[0]!.path, /\.tmp$/);
     }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("never removes a temp file it did not create", () =>
+    Effect.gen(function* () {
+      const removed: Array<string> = [];
+      const layerCollidingFileSystem = Layer.effect(
+        FileSystem.FileSystem,
+        Effect.gen(function* () {
+          const fileSystem = yield* FileSystem.FileSystem;
+          return {
+            ...fileSystem,
+            makeDirectory: () => Effect.void,
+            chmod: () => Effect.void,
+            writeFile: (path) =>
+              Effect.fail(
+                PlatformError.systemError({
+                  _tag: "AlreadyExists",
+                  module: "FileSystem",
+                  method: "writeFile",
+                  pathOrDescriptor: String(path),
+                  description: "Temporary secret file already exists.",
+                }),
+              ),
+            remove: (path) =>
+              Effect.sync(() => {
+                removed.push(String(path));
+              }),
+          } satisfies FileSystem.FileSystem;
+        }),
+      ).pipe(Layer.provide(NodeServices.layer));
+      const secretStore = yield* Effect.service(ServerSecretStore.ServerSecretStore).pipe(
+        Effect.provide(
+          ServerSecretStore.layer.pipe(
+            Layer.provide(layerServerConfig()),
+            Layer.provideMerge(layerCollidingFileSystem),
+          ),
+        ),
+      );
+      const error = yield* Effect.flip(secretStore.set("collide", Uint8Array.from([1])));
+      assert.equal(error._tag, "SecretStorePersistError");
+      assert.deepEqual(removed, []);
+    }),
   );
 
   it.effect("propagates read failures other than missing-file errors", () =>
