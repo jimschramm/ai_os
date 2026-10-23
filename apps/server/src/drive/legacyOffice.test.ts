@@ -209,6 +209,53 @@ describe("Excel 97 records", () => {
 });
 
 describe("record bounds", () => {
+  it("rejects a sector chain that points past the end of the file", () => {
+    const cells = record(0x0204, [...u16(0), ...u16(0), ...u16(0), ...u16(1), 0, 0x41]);
+    const bytes = makeCfb("Workbook", workbook(cells));
+    // FAT entry of the first data sector -> a sector far beyond the file.
+    new DataView(bytes.buffer).setUint32(512 + 2 * 4, 5_000_000, true);
+    expect(() => extractXls(bytes)).toThrow(/Broken sector chain/);
+  });
+
+  it("reads many short strings across many CONTINUE boundaries in linear time", () => {
+    const count = 40_000;
+    const parts: number[] = [];
+    const boundaries: number[] = [];
+    for (let i = 0; i < count; i += 1) {
+      if (i > 0) boundaries.push(parts.length);
+      parts.push(1, 0, 0, 0x61);
+    }
+    const reader = new BiffReader(new Uint8Array(parts), boundaries);
+    const started = performance.now();
+    for (let i = 0; i < count; i += 1) expect(reader.string(2)).toBe("a");
+    expect(performance.now() - started).toBeLessThan(2_000);
+  });
+
+  it("rejects a PowerPoint edit chain that loops", () => {
+    const rec = (type: number, body: number[]) => [
+      0,
+      0,
+      ...u16(type),
+      body.length & 0xff,
+      body.length >> 8,
+      0,
+      0,
+      ...body,
+    ];
+    const u32 = (n: number) => [n & 0xff, (n >> 8) & 0xff, (n >> 16) & 0xff, n >>> 24];
+    const directory = rec(0x1772, [...u32((1 << 20) | 1), ...u32(0)]);
+    const editA = directory.length;
+    const editB = editA + 28;
+    const edit = (previous: number) =>
+      rec(0x0ff5, [...u32(0), ...u32(0), ...u32(previous), ...u32(0), ...u32(1)]);
+    const current = new Uint8Array(20);
+    new DataView(current.buffer).setUint32(16, editA, true);
+    const stream = new Uint8Array([...directory, ...edit(editB), ...edit(editA)]);
+    expect(() =>
+      extractPpt(makeCfb("PowerPoint Document", stream, [["Current User", current]])),
+    ).toThrow(/edit chain loops/);
+  });
+
   it("rejects worksheets that share records", () => {
     // Two sheet entries at distinct BOFs, but the first sheet has no EOF of its own.
     const bof = record(0x0809, [...u16(0x0600), ...u16(0x10), ...new Array(12).fill(0)]);

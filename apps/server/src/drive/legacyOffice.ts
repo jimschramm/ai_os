@@ -62,12 +62,15 @@ export const readCompoundFile = (bytes: Uint8Array): CompoundFile => {
     const data = view(sector(id));
     for (let i = 0; i < data.byteLength / 4; i += 1) fat.push(data.getUint32(i * 4, true));
   }
-  /** Sector ids of a chain; loops and over-long chains are errors. */
-  const chain = (start: number, table: readonly number[]) => {
+  /**
+   * Sector ids of a chain; loops, over-long chains and sectors past the end of
+   * the data (`limit` sectors exist) are errors, found before anything is allocated.
+   */
+  const chain = (start: number, table: readonly number[], limit: number) => {
     const ids: number[] = [];
     const seen = new Set<number>();
     for (let id = start; id !== ENDOFCHAIN; id = table[id] ?? ENDOFCHAIN) {
-      if (id > MAX_REGULAR_SECTOR || seen.has(id) || ids.length > table.length) {
+      if (id > MAX_REGULAR_SECTOR || id >= limit || seen.has(id) || ids.length > table.length) {
         throw new Error("Broken sector chain.");
       }
       seen.add(id);
@@ -86,7 +89,8 @@ export const readCompoundFile = (bytes: Uint8Array): CompoundFile => {
     }
   };
   const readRegular = (start: number, size?: number) => {
-    const ids = chain(start, fat);
+    // Sector n starts at (n + 1) * sectorSize, after the header.
+    const ids = chain(start, fat, Math.ceil(bytes.length / sectorSize) - 1);
     claim(ids, owned);
     const out = new Uint8Array(ids.length * sectorSize);
     ids.forEach((id, index) => out.set(sector(id), index * sectorSize));
@@ -121,7 +125,7 @@ export const readCompoundFile = (bytes: Uint8Array): CompoundFile => {
     } else if (type === 2 && !streams.has(name)) {
       if (size === 0) streams.set(name, new Uint8Array(0));
       else if (size < cutoff) {
-        const ids = chain(start, miniFat);
+        const ids = chain(start, miniFat, Math.floor(miniStream.length / miniSize));
         claim(ids, ownedMini);
         const out = new Uint8Array(ids.length * miniSize);
         ids.forEach((id, index) =>
@@ -271,8 +275,16 @@ export class BiffReader {
     this.pos += 4;
     return value;
   }
+  /** The first boundary after the read position (binary search; boundaries are sorted). */
   nextBoundary() {
-    return this.boundaries.find((boundary) => boundary > this.pos) ?? this.data.length;
+    let low = 0;
+    let high = this.boundaries.length;
+    while (low < high) {
+      const mid = (low + high) >> 1;
+      if (this.boundaries[mid]! > this.pos) high = mid;
+      else low = mid + 1;
+    }
+    return this.boundaries[low] ?? this.data.length;
   }
   /** XLUnicodeRichExtendedString / XLUnicodeString with a 1- or 2-byte length. */
   string(lengthBytes: 1 | 2) {
@@ -547,7 +559,11 @@ export const extractPpt = (bytes: Uint8Array) => {
   const current = file.streams.get("Current User");
   if (current !== undefined && current.length >= 20) {
     let edit = view(current).getUint32(16, true);
+    const visited = new Set<number>();
     for (let guard = 0; guard < 4096 && edit > 0; guard += 1) {
+      // Each edit once: a cycle would rescan the same directories.
+      if (visited.has(edit)) throw new Error("Broken presentation: the edit chain loops.");
+      visited.add(edit);
       const record = header(edit);
       if (record === null || record.type !== 0x0ff5 || record.body + 20 > stream.length) break;
       const directory = header(dv.getUint32(record.body + 12, true));
