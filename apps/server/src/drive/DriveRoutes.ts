@@ -129,8 +129,19 @@ export const layer = Layer.unwrap(
     const settings = yield* ServerSettings.ServerSettingsService;
     const jobs = new DriveJobStore(path.join(config.stateDir, DRIVE_JOBS_DIR));
     /** Content is kept per project so it is reused only by that project. */
-    const storeFor = (projectId: string) =>
-      makeContentStore(path.join(config.stateDir, DRIVE_CONTENT_DIR, safeProjectDir(projectId)));
+    // One store per project for the server's life, so its per-entry write
+    // queue covers every job of that project.
+    const stores = new Map<string, ReturnType<typeof makeContentStore>>();
+    const storeFor = (projectId: string) => {
+      let store = stores.get(projectId);
+      if (store === undefined) {
+        store = makeContentStore(
+          path.join(config.stateDir, DRIVE_CONTENT_DIR, safeProjectDir(projectId)),
+        );
+        stores.set(projectId, store);
+      }
+      return store;
+    };
 
     const api = Effect.gen(function* () {
       const stored = yield* secrets

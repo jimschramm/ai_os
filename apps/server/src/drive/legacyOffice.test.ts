@@ -231,6 +231,50 @@ describe("record bounds", () => {
     expect(performance.now() - started).toBeLessThan(2_000);
   });
 
+  it("reads compressed BIFF bytes 0x80-0x9f as their own code points across a CONTINUE", () => {
+    const first = [...u16(2), 0, 0x80];
+    const second = [0, 0x9f];
+    const reader = new BiffReader(new Uint8Array([...first, ...second]), [first.length]);
+    expect(reader.string(2)).toBe("\u0080\u009f");
+  });
+
+  it("refuses slides whose drawings overlap", () => {
+    const rec = (verInst: number, type: number, body: number[]) => [
+      ...u16(verInst),
+      ...u16(type),
+      body.length & 0xff,
+      body.length >> 8,
+      0,
+      0,
+      ...body,
+    ];
+    const u32 = (n: number) => [n & 0xff, (n >> 8) & 0xff, (n >> 16) & 0xff, n >>> 24];
+    // Drawing B sits inside drawing A; slide 1 names A, slide 2 names B.
+    const inner = rec(0x0f, 0x03ee, rec(0, 0x0fa8, [0x61]));
+    const outer = rec(0x0f, 0x03ee, inner);
+    const slides = rec(0x0f, 0x0ff0, [...rec(0, 0x03f3, u32(2)), ...rec(0, 0x03f3, u32(3))]);
+    const doc = rec(0x0f, 0x03e8, slides);
+    const outerAt = doc.length;
+    const dirAt = outerAt + outer.length;
+    const directory = rec(0, 0x1772, [
+      ...u32((3 << 20) | 1),
+      ...u32(0),
+      ...u32(outerAt),
+      ...u32(outerAt + 8),
+    ]);
+    const editAt = dirAt + directory.length;
+    const edit = rec(0, 0x0ff5, [...u32(0), ...u32(0), ...u32(0), ...u32(dirAt), ...u32(1)]);
+    const current = new Uint8Array(20);
+    new DataView(current.buffer).setUint32(16, editAt, true);
+    expect(() =>
+      extractPpt(
+        makeCfb("PowerPoint Document", new Uint8Array([...doc, ...outer, ...directory, ...edit]), [
+          ["Current User", current],
+        ]),
+      ),
+    ).toThrow(/share one drawing/);
+  });
+
   it("rejects a PowerPoint edit chain that loops", () => {
     const rec = (type: number, body: number[]) => [
       0,

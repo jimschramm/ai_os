@@ -141,6 +141,19 @@ export const readCompoundFile = (bytes: Uint8Array): CompoundFile => {
 };
 
 const cp1252 = new TextDecoder("windows-1252");
+/**
+ * BIFF8 "compressed" strings and PowerPoint TextBytesAtoms store the low byte
+ * of each UTF-16 character, so a byte is its code point (not Windows-1252).
+ */
+const latin1 = {
+  decode: (bytes: Uint8Array) => {
+    let out = "";
+    for (let at = 0; at < bytes.length; at += 8192) {
+      out += String.fromCharCode(...bytes.subarray(at, at + 8192));
+    }
+    return out;
+  },
+};
 const utf16 = new TextDecoder("utf-16le");
 
 const need = (file: CompoundFile, ...names: string[]) => {
@@ -311,7 +324,7 @@ export class BiffReader {
         continue;
       }
       const end = this.pos + take * (wide ? 2 : 1);
-      out += (wide ? utf16 : cp1252).decode(this.data.subarray(this.pos, end));
+      out += (wide ? utf16 : latin1).decode(this.data.subarray(this.pos, end));
       this.pos = end;
       left -= take;
     }
@@ -533,7 +546,7 @@ export const extractPpt = (bytes: Uint8Array) => {
         }
       : null;
   const textOf = (type: number, body: number, next: number) =>
-    (type === 0x0fa0 ? utf16 : cp1252)
+    (type === 0x0fa0 ? utf16 : latin1)
       .decode(stream.subarray(body, next))
       .replace(/[\r\v]/g, "\n")
       .trim();
@@ -622,14 +635,17 @@ export const extractPpt = (bytes: Uint8Array) => {
   const notes: string[] = [];
   // Each drawing is read once: a slide list repeating one large drawing
   // would otherwise multiply the work.
-  const drawn = new Set<number>();
+  const drawn: Array<[number, number]> = [];
   const drawingOf = (persistId: number) => {
     const offset = persist.get(persistId);
-    if (offset !== undefined) {
-      if (drawn.has(offset)) throw new Error("Broken presentation: two slides share one drawing.");
-      drawn.add(offset);
-    }
     const target = offset === undefined ? null : header(offset);
+    if (offset !== undefined && target !== null) {
+      // Drawings may not overlap (or repeat), so all of them together read the stream once.
+      if (drawn.some(([from, to]) => offset < to && from < target.next)) {
+        throw new Error("Broken presentation: two slides share one drawing.");
+      }
+      drawn.push([offset, target.next]);
+    }
     return target !== null && (target.type === 0x03ee || target.type === 0x03f0)
       ? textsIn(target.body, target.next)
       : [];
