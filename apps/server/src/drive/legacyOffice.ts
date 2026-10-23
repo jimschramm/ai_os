@@ -142,25 +142,14 @@ export const readCompoundFile = (bytes: Uint8Array): CompoundFile => {
 
 const cp1252 = new TextDecoder("windows-1252");
 
-/** Byte ranges that may not overlap; each add is a binary search, not a scan. */
-const disjointRanges = (message: string) => {
-  const ranges: Array<[number, number]> = [];
-  return (from: number, to: number) => {
-    let low = 0;
-    let high = ranges.length;
-    while (low < high) {
-      const mid = (low + high) >> 1;
-      if (ranges[mid]![0] < from) low = mid + 1;
-      else high = mid;
-    }
-    const before = ranges[low - 1];
-    const after = ranges[low];
-    if ((before !== undefined && before[1] > from) || (after !== undefined && after[0] < to)) {
-      throw new Error(message);
-    }
-    ranges.splice(low, 0, [from, to]);
-  };
+/** Throws unless no two byte ranges overlap (one sort, then neighbours only). */
+const assertDisjoint = (ranges: ReadonlyArray<readonly [number, number]>, message: string) => {
+  const sorted = [...ranges].sort((x, y) => x[0] - y[0]);
+  for (let i = 1; i < sorted.length; i += 1) {
+    if (sorted[i]![0] < sorted[i - 1]![1]) throw new Error(message);
+  }
 };
+
 /**
  * BIFF8 "compressed" strings and PowerPoint TextBytesAtoms store the low byte
  * of each UTF-16 character, so a byte is its code point (not Windows-1252).
@@ -593,8 +582,9 @@ export const extractPpt = (bytes: Uint8Array) => {
   if (current !== undefined && current.length >= 20) {
     let edit = view(current).getUint32(16, true);
     const visited = new Set<number>();
-    const scannedDirectories = new Set<number>();
-    const addDirectory = disjointRanges("Broken presentation: persist directories overlap.");
+    // First the chain, newest edit first; then its directories.
+    const directories: Array<{ at: number; body: number; next: number }> = [];
+    const named = new Set<number>();
     for (let guard = 0; guard < 4096 && edit > 0; guard += 1) {
       // Each edit once: a cycle would rescan the same directories.
       if (visited.has(edit)) throw new Error("Broken presentation: the edit chain loops.");
@@ -602,12 +592,24 @@ export const extractPpt = (bytes: Uint8Array) => {
       const record = header(edit);
       if (record === null || record.type !== 0x0ff5 || record.body + 20 > stream.length) break;
       const directoryAt = dv.getUint32(record.body + 12, true);
-      const directory = scannedDirectories.has(directoryAt) ? null : header(directoryAt);
       // Each persist directory is read once; an older edit naming the same one adds nothing.
-      scannedDirectories.add(directoryAt);
+      const directory = named.has(directoryAt) ? null : header(directoryAt);
+      named.add(directoryAt);
       if (directory !== null && directory.type === 0x1772) {
-        // Directories may not overlap, so all of them together scan the stream at most once.
-        addDirectory(directoryAt, directory.next);
+        directories.push({ at: directoryAt, body: directory.body, next: directory.next });
+      }
+      if (documentRef === null) documentRef = dv.getUint32(record.body + 16, true);
+      const previous = dv.getUint32(record.body + 8, true);
+      if (previous === 0 || previous === edit) break;
+      edit = previous;
+    }
+    // Directories may not overlap, so all of them together scan the stream at most once.
+    assertDisjoint(
+      directories.map((d) => [d.at, d.next] as const),
+      "Broken presentation: persist directories overlap.",
+    );
+    for (const directory of directories) {
+      {
         for (let at = directory.body; at + 4 <= directory.next;) {
           const word = dv.getUint32(at, true);
           const firstId = word & 0xfffff;
@@ -619,10 +621,6 @@ export const extractPpt = (bytes: Uint8Array) => {
           at += 4 + count * 4;
         }
       }
-      if (documentRef === null) documentRef = dv.getUint32(record.body + 16, true);
-      const previous = dv.getUint32(record.body + 8, true);
-      if (previous === 0 || previous === edit) break;
-      edit = previous;
     }
   }
   const documentOffset = documentRef === null ? undefined : persist.get(documentRef);
@@ -648,21 +646,12 @@ export const extractPpt = (bytes: Uint8Array) => {
     if (texts.length === 0) throw new Error("No slide text found.");
     return tidy(texts.join("\n"));
   }
-  const slides: Array<{ listed: string[]; drawn: string[] }> = [];
-  const notes: string[] = [];
-  // Each drawing is read once: a slide list repeating one large drawing
-  // would otherwise multiply the work.
-  const addDrawing = disjointRanges("Broken presentation: two slides share one drawing.");
-  const drawingOf = (persistId: number) => {
+  // Slides and notes name their drawings; drawings are read after the lists.
+  const slides: Array<{ listed: string[]; drawing: number }> = [];
+  const noteDrawings: number[] = [];
+  const drawingAt = (persistId: number) => {
     const offset = persist.get(persistId);
-    const target = offset === undefined ? null : header(offset);
-    if (offset !== undefined && target !== null) {
-      // Drawings may not overlap (or repeat), so all of them together read the stream once.
-      addDrawing(offset, target.next);
-    }
-    return target !== null && (target.type === 0x03ee || target.type === 0x03f0)
-      ? textsIn(target.body, target.next)
-      : [];
+    return offset === undefined ? null : header(offset);
   };
   for (let at = doc.body; at + 8 <= doc.next;) {
     const list = header(at);
@@ -674,9 +663,9 @@ export const extractPpt = (bytes: Uint8Array) => {
         if (record === null || record.next <= inner || record.next > list.next) break;
         if (record.type === 0x03f3 && record.body + 4 <= record.next) {
           // Older files keep slide text in this list; newer ones in each slide's drawing.
-          const drawn = drawingOf(dv.getUint32(record.body, true));
-          if (list.instance === 2) notes.push(...drawn);
-          else slides.push({ listed: [], drawn });
+          const drawing = dv.getUint32(record.body, true);
+          if (list.instance === 2) noteDrawings.push(drawing);
+          else slides.push({ listed: [], drawing });
         } else if ((record.type === 0x0fa0 || record.type === 0x0fa8) && list.instance === 0) {
           const text = textOf(record.type, record.body, record.next);
           if (text.length > 0) slides.at(-1)?.listed.push(text);
@@ -686,9 +675,26 @@ export const extractPpt = (bytes: Uint8Array) => {
     }
     at = list.next;
   }
+  // Drawings may not overlap (or repeat), so all of them together read the stream once.
+  const targets = new Map<number, ReturnType<typeof header>>();
+  for (const ref of [...slides.map((slide) => slide.drawing), ...noteDrawings]) {
+    if (targets.has(ref)) throw new Error("Broken presentation: two slides share one drawing.");
+    targets.set(ref, drawingAt(ref));
+  }
+  const ranges: Array<readonly [number, number]> = [];
+  for (const target of targets.values())
+    if (target !== null) ranges.push([target.body - 8, target.next]);
+  assertDisjoint(ranges, "Broken presentation: two slides share one drawing.");
+  const textOfDrawing = (ref: number) => {
+    const target = targets.get(ref) ?? null;
+    return target !== null && (target.type === 0x03ee || target.type === 0x03f0)
+      ? textsIn(target.body, target.next)
+      : [];
+  };
+  const notes = noteDrawings.flatMap(textOfDrawing);
   const parts = slides.map(
     (slide, index) =>
-      `## Slide ${index + 1}\n${(slide.listed.length > 0 ? slide.listed : slide.drawn).join("\n")}`,
+      `## Slide ${index + 1}\n${(slide.listed.length > 0 ? slide.listed : textOfDrawing(slide.drawing)).join("\n")}`,
   );
   if (notes.length > 0) parts.push(`## Notes\n${[...new Set(notes)].join("\n")}`);
   return tidy(parts.join("\n\n"));

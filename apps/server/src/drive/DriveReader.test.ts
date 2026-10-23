@@ -184,6 +184,64 @@ describe("readDriveFile", () => {
     expect(await store.list()).toEqual([]);
   });
 
+  it("discards a download whose bytes do not match the Drive checksum", async () => {
+    const { api } = fakeApi([], {}, { pdf1: new TextEncoder().encode("new bytes") });
+    const store = makeContentStore(await temp());
+    const read = await readDriveFile(api, store, {
+      id: "pdf1",
+      name: "Old.txt",
+      mimeType: "text/plain",
+      md5Checksum: "0".repeat(32),
+    });
+    expect(read.meta.error).toMatch(/changed in Drive while it was read/);
+    expect(read.originalPath).toBeNull();
+    expect(await store.list()).toEqual([]);
+  });
+
+  it("keeps a download whose bytes match the Drive checksum", async () => {
+    const data = new TextEncoder().encode("same bytes");
+    const { api } = fakeApi([], {}, { t1: data });
+    const store = makeContentStore(await temp());
+    const md5 = createHash("md5").update(data).digest("hex");
+    const read = await readDriveFile(api, store, {
+      id: "t1",
+      name: "Same.txt",
+      mimeType: "text/plain",
+      md5Checksum: md5,
+    });
+    expect(read.meta.error ?? null).toBeNull();
+    expect(read.originalPath).not.toBeNull();
+  });
+
+  it("discards a download without a checksum, or a Sheets export, if the file changed meanwhile", async () => {
+    for (const file of [
+      {
+        id: "b1",
+        name: "Blob.txt",
+        mimeType: "text/plain",
+        modifiedTime: "2026-10-01T00:00:00.000Z",
+      },
+      {
+        id: "s1",
+        name: "Budget",
+        mimeType: "application/vnd.google-apps.spreadsheet",
+        modifiedTime: "2026-10-01T00:00:00.000Z",
+      },
+    ]) {
+      const { api } = fakeApi(
+        [{ ...file, modifiedTime: "2026-10-02T00:00:00.000Z" }],
+        {},
+        {
+          b1: new TextEncoder().encode("x"),
+        },
+      );
+      const store = makeContentStore(await temp());
+      const read = await readDriveFile(api, store, file);
+      expect(read.meta.error).toMatch(/changed in Drive while it was read/);
+      expect(await store.list()).toEqual([]);
+    }
+  });
+
   it("exports Google formats: Docs to docx + text, Sheets to xlsx with every tab", async () => {
     const { api: base, calls } = tree();
     // The version check after the two Doc exports sees an unchanged file.
@@ -192,7 +250,9 @@ describe("readDriveFile", () => {
       getFile: async (id: string) =>
         id === "doc1"
           ? { id, name: "Brief", mimeType: "application/vnd.google-apps.document" }
-          : base.getFile(id),
+          : id === "sheet1"
+            ? { id, name: "Budget", mimeType: "application/vnd.google-apps.spreadsheet" }
+            : base.getFile(id),
     };
     const store = makeContentStore(await temp());
     const doc = await readDriveFile(api, store, {

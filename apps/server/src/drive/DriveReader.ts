@@ -3,6 +3,7 @@
  * Reads Drive files into the content store and copies a task's files into the
  * project worktree. Never writes to Drive.
  */
+import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
@@ -61,17 +62,25 @@ export const readDriveFile = async (
     md5Checksum: file.md5Checksum ?? null,
     webViewLink: file.webViewLink ?? null,
   };
+  const changed = () =>
+    new DriveApiError(`${file.name} changed in Drive while it was read; run it again.`);
+  /** Exports carry no checksum: the file's version must be the same after reading it. */
+  const unchanged = async () => {
+    const after = await api.getFile(file.id);
+    if (
+      (after.modifiedTime ?? null) !== (file.modifiedTime ?? null) ||
+      (after.md5Checksum ?? null) !== (file.md5Checksum ?? null)
+    ) {
+      throw changed();
+    }
+  };
   try {
     if (file.mimeType.startsWith(GOOGLE)) {
       const kind = file.mimeType.slice(GOOGLE.length);
       if (kind === "document" || kind === "presentation") {
         const original = await api.exportAs(file.id, kind === "document" ? DOCX : PPTX);
         const text = decode(await api.exportAs(file.id, "text/plain"));
-        // Two exports: both must come from the version the file is stored under.
-        const after = await api.getFile(file.id);
-        if ((after.modifiedTime ?? null) !== (file.modifiedTime ?? null)) {
-          throw new DriveApiError(`${file.name} changed in Drive while it was read; run it again.`);
-        }
+        await unchanged();
         return await store.put({
           ...base,
           kind: "text",
@@ -84,6 +93,7 @@ export const readDriveFile = async (
       }
       if (kind === "spreadsheet") {
         const original = await api.exportAs(file.id, XLSX);
+        await unchanged();
         let text: string | null = null;
         let error: string | null = null;
         try {
@@ -103,6 +113,7 @@ export const readDriveFile = async (
       }
       if (kind === "drawing") {
         const original = await api.exportAs(file.id, "image/png");
+        await unchanged();
         return await store.put({
           ...base,
           kind: "image",
@@ -125,6 +136,12 @@ export const readDriveFile = async (
       });
     }
     const original = await api.download(file.id);
+    // The bytes must be the version they are stored under.
+    if (file.md5Checksum != null) {
+      if (createHash("md5").update(original).digest("hex") !== file.md5Checksum) throw changed();
+    } else {
+      await unchanged();
+    }
     const extracted = await extractContent({
       name: file.name,
       mimeType: file.mimeType,

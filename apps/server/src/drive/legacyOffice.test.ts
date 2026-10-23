@@ -314,6 +314,22 @@ describe("record bounds", () => {
     );
     expect(text).toContain(`## Slide ${count}\na`);
     expect(performance.now() - started).toBeLessThan(2_000);
+    // Drawings stored in reverse slide order are checked as fast (one sort, not inserts).
+    const reversed = rec(0, 0x1772, [
+      ...u32(((count + 1) << 20) | 1),
+      ...u32(0),
+      ...Array.from({ length: count }, (_, k) =>
+        u32(drawingsAt + (count - 1 - k) * drawing.length),
+      ).flat(),
+    ]);
+    const startedReverse = performance.now();
+    const reverseText = extractPpt(
+      makeCfb("PowerPoint Document", new Uint8Array([...doc, ...drawings, ...reversed, ...edit]), [
+        ["Current User", current],
+      ]),
+    );
+    expect(reverseText).toContain(`## Slide ${count}\na`);
+    expect(performance.now() - startedReverse).toBeLessThan(2_000);
   });
 
   it("rejects a PowerPoint edit chain that loops", () => {
