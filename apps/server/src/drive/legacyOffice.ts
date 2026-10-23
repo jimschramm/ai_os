@@ -207,23 +207,30 @@ export const extractDoc = (bytes: Uint8Array) => {
   }
   // Field codes: 0x13 instruction 0x14 result 0x15; keep only the result.
   let text = "";
+  // A stack of open fields, plus how many of them are still in their instruction part.
   const fields: Array<{ inResult: boolean }> = [];
+  let hiding = 0;
   for (const char of raw) {
     const code = char.charCodeAt(0);
     if (code === 0x13) {
       fields.push({ inResult: false });
+      hiding += 1;
       continue;
     }
     if (code === 0x14) {
       const top = fields.at(-1);
-      if (top !== undefined) top.inResult = true;
+      if (top !== undefined && !top.inResult) {
+        top.inResult = true;
+        hiding -= 1;
+      }
       continue;
     }
     if (code === 0x15) {
-      fields.pop();
+      const top = fields.pop();
+      if (top !== undefined && !top.inResult) hiding -= 1;
       continue;
     }
-    if (fields.some((field) => !field.inResult)) continue;
+    if (hiding > 0) continue;
     if (code === 0x0d || code === 0x0b || code === 0x0c) text += "\n";
     else if (code === 0x07) text += "\u0007";
     else if (code === 0x09 || code >= 0x20) text += char;
@@ -387,6 +394,8 @@ export const extractXls = (bytes: Uint8Array) => {
     const cells = new Map<number, Map<number, string>>();
     const put = (row: number, col: number, value: string) => {
       if (value === "") return;
+      // BIFF8 has 256 columns; a larger index is a broken record, not a wide sheet.
+      if (col > 0xff) throw new Error("Broken cell record.");
       let line = cells.get(row);
       if (line === undefined) {
         line = new Map();
@@ -399,6 +408,15 @@ export const extractXls = (bytes: Uint8Array) => {
     for (let i = start === undefined ? records.length : start + 1; i < records.length; i += 1) {
       const record = records[i]!;
       if (record.type === 0x000a) break;
+      if (record.type === 0x0207) {
+        // STRING: the text result of the formula before it (may be shorter than a cell record).
+        if (pendingFormula !== null && record.data.length >= 3) {
+          const reader = new BiffReader(record.data, []);
+          put(pendingFormula.row, pendingFormula.col, reader.string(2));
+        }
+        pendingFormula = null;
+        continue;
+      }
       if (record.data.length < 6) continue;
       const dv = view(record.data);
       const row = dv.getUint16(0, true);
@@ -445,13 +463,6 @@ export const extractXls = (bytes: Uint8Array) => {
           } else put(row, col, formatNumber(dv.getFloat64(6, true)));
           break;
         }
-        case 0x0207: // STRING (result of the formula before it)
-          if (pendingFormula !== null) {
-            const reader = new BiffReader(record.data, []);
-            put(pendingFormula.row, pendingFormula.col, reader.string(2));
-            pendingFormula = null;
-          }
-          break;
       }
     }
     const lines = [...cells.keys()]

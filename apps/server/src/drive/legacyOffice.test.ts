@@ -101,3 +101,93 @@ describe("SST strings across CONTINUE records", () => {
     expect(reader.string(2)).toBe("ok");
   });
 });
+
+/** A minimal version-3 compound file with one regular-sector stream. */
+const makeCfb = (name: string, stream: Uint8Array) => {
+  const SECTOR = 512;
+  const data = new Uint8Array(Math.max(4096, Math.ceil(stream.length / SECTOR) * SECTOR));
+  data.set(stream);
+  const dataSectors = data.length / SECTOR;
+  const out = new Uint8Array(SECTOR * (3 + dataSectors));
+  const dv = new DataView(out.buffer);
+  out.set([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]);
+  dv.setUint16(0x18, 0x3e, true);
+  dv.setUint16(0x1a, 3, true);
+  dv.setUint16(0x1c, 0xfffe, true);
+  dv.setUint16(0x1e, 9, true);
+  dv.setUint16(0x20, 6, true);
+  dv.setUint32(0x2c, 1, true);
+  dv.setUint32(0x30, 1, true);
+  dv.setUint32(0x38, 4096, true);
+  dv.setUint32(0x3c, 0xfffffffe, true);
+  dv.setUint32(0x44, 0xfffffffe, true);
+  for (let i = 0; i < 109; i += 1) dv.setUint32(0x4c + i * 4, i === 0 ? 0 : 0xffffffff, true);
+  const fat = SECTOR; // sector 0
+  for (let i = 0; i < 128; i += 1) dv.setUint32(fat + i * 4, 0xffffffff, true);
+  dv.setUint32(fat, 0xfffffffd, true);
+  dv.setUint32(fat + 4, 0xfffffffe, true);
+  for (let s = 0; s < dataSectors; s += 1) {
+    dv.setUint32(fat + (2 + s) * 4, s === dataSectors - 1 ? 0xfffffffe : 3 + s, true);
+  }
+  const dir = SECTOR * 2; // sector 1
+  const entry = (index: number, entryName: string, type: number, start: number, size: number) => {
+    const base = dir + index * 128;
+    for (let c = 0; c < entryName.length; c += 1)
+      dv.setUint16(base + c * 2, entryName.charCodeAt(c), true);
+    dv.setUint16(base + 64, (entryName.length + 1) * 2, true);
+    out[base + 66] = type;
+    dv.setUint32(base + 116, start, true);
+    dv.setUint32(base + 120, size, true);
+  };
+  entry(0, "Root Entry", 5, 0xfffffffe, 0);
+  entry(1, name, 2, 2, data.length);
+  out.set(data, SECTOR * 3);
+  return out;
+};
+
+const record = (type: number, bytes: number[]) => [
+  type & 0xff,
+  type >> 8,
+  bytes.length & 0xff,
+  bytes.length >> 8,
+  ...bytes,
+];
+const u16 = (value: number) => [value & 0xff, value >> 8];
+const workbook = (cells: number[]) => {
+  const bof = (kind: number) =>
+    record(0x0809, [...u16(0x0600), ...u16(kind), ...new Array(12).fill(0)]);
+  const globalsHead = bof(0x05);
+  const sheetName = [2, 0, ...[..."S1"].map((ch) => ch.charCodeAt(0))];
+  const boundLength = 4 + 6 + sheetName.length;
+  const offset = globalsHead.length + boundLength + 4;
+  const bound = record(0x0085, [offset & 0xff, (offset >> 8) & 0xff, 0, 0, 0, 0, ...sheetName]);
+  return new Uint8Array([
+    ...globalsHead,
+    ...bound,
+    ...record(0x000a, []),
+    ...bof(0x10),
+    ...cells,
+    ...record(0x000a, []),
+  ]);
+};
+const formulaString = (row: number, col: number) =>
+  record(0x0006, [...u16(row), ...u16(col), 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0, 0, 0, 0, 0, 0]);
+
+describe("Excel 97 records", () => {
+  it("keeps short formula string results", () => {
+    const cells = [
+      ...formulaString(0, 0),
+      ...record(0x0207, [...u16(1), 0, 0x41]), // "A": four bytes
+      ...formulaString(0, 1),
+      ...record(0x0207, [...u16(0), 0]), // empty result
+      ...formulaString(0, 2),
+      ...record(0x0207, [...u16(2), 0, 0x42, 0x43]),
+    ];
+    expect(extractXls(makeCfb("Workbook", workbook(cells)))).toBe("## Sheet: S1\nA\t\tBC");
+  });
+
+  it("rejects a cell past column 255 instead of padding the row", () => {
+    const number = record(0x0203, [...u16(0), ...u16(300), 0, 0, 0, 0, 0, 0, 0, 0, 0xf0, 0x3f]);
+    expect(() => extractXls(makeCfb("Workbook", workbook(number)))).toThrow(/Broken cell record/);
+  });
+});
