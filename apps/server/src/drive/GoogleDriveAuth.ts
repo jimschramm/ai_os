@@ -27,6 +27,8 @@ const AUTH_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth";
 const TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token";
 const REVOKE_ENDPOINT = "https://oauth2.googleapis.com/revoke";
 const CALLBACK_PATH = "/oauth2callback";
+/** Network deadline for Google token calls, so a stalled request can't hang the CLI. */
+export const GOOGLE_REQUEST_TIMEOUT_MS = 30_000;
 
 export class DriveAuthError extends Error {
   override readonly name = "DriveAuthError";
@@ -105,7 +107,12 @@ export const readCallback = (
   requestUrl: string,
   expectedState: string,
 ): CallbackResult | "ignore" => {
-  const url = new URL(requestUrl, "http://127.0.0.1");
+  let url: URL;
+  try {
+    url = new URL(requestUrl, "http://127.0.0.1");
+  } catch {
+    return "ignore";
+  }
   if (url.pathname !== CALLBACK_PATH) return "ignore";
   const state = url.searchParams.get("state");
   if (state === null || state !== expectedState) {
@@ -127,10 +134,14 @@ export const exchangeCode = async (input: {
   readonly redirectUri: string;
   readonly fetch?: FetchLike;
   readonly now?: () => Date;
+  readonly timeoutMs?: number;
 }): Promise<StoredDriveToken> => {
   const doFetch = input.fetch ?? fetch;
   const response = await doFetch(TOKEN_ENDPOINT, {
     method: "POST",
+    // Never let a redirect forward the secret, code or verifier elsewhere.
+    redirect: "error",
+    signal: AbortSignal.timeout(input.timeoutMs ?? GOOGLE_REQUEST_TIMEOUT_MS),
     headers: { "content-type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({
       code: input.code,
@@ -275,10 +286,16 @@ export const decodeToken = (bytes: Uint8Array): StoredDriveToken | null => {
 };
 
 /** Best effort: revoking at Google can fail offline; the local token is removed regardless. */
-export const revokeToken = async (refreshToken: string, doFetch: FetchLike = fetch) => {
+export const revokeToken = async (
+  refreshToken: string,
+  doFetch: FetchLike = fetch,
+  timeoutMs = GOOGLE_REQUEST_TIMEOUT_MS,
+) => {
   try {
     const response = await doFetch(REVOKE_ENDPOINT, {
       method: "POST",
+      redirect: "error",
+      signal: AbortSignal.timeout(timeoutMs),
       headers: { "content-type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams({ token: refreshToken }).toString(),
     });

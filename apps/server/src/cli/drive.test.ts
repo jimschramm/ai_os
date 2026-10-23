@@ -9,6 +9,7 @@ const flags = (over: Partial<Parameters<typeof nextProjectDriveSettings>[1]> = {
   output: Option.none<string>(),
   input: Option.none<string>(),
   clearInput: false,
+  clearOutput: false,
   disable: false,
   ...over,
 });
@@ -28,6 +29,10 @@ describe("drive project flags", () => {
     expect(nextProjectDriveSettings(current, flags({ clearInput: true }))).toEqual({
       enabled: true,
       outputFolderId: ID,
+    });
+    expect(nextProjectDriveSettings(current, flags({ clearOutput: true }))).toEqual({
+      enabled: true,
+      inputFolderId: OTHER,
     });
     expect(nextProjectDriveSettings(current, flags({ disable: true }))).toEqual({
       ...current,

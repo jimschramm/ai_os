@@ -12,6 +12,7 @@ import {
   makePkce,
   parseClientJson,
   readCallback,
+  revokeToken,
   runLoopbackLogin,
 } from "./GoogleDriveAuth.ts";
 
@@ -54,6 +55,61 @@ describe("callback validation", () => {
       error: "Google returned an error: access_denied",
     });
     expect(readCallback("/favicon.ico", "good")).toBe("ignore");
+  });
+});
+
+describe("hardening", () => {
+  it("ignores malformed request targets instead of throwing", () => {
+    expect(readCallback("//[", "good")).toBe("ignore");
+  });
+
+  it("refuses redirects and sets a deadline on token calls", async () => {
+    let init: RequestInit | undefined;
+    await exchangeCode({
+      client,
+      code: "c",
+      verifier: "v",
+      redirectUri: "r",
+      fetch: (_url, given) => {
+        init = given;
+        return okToken({ refresh_token: "rt", scope: grantedScope });
+      },
+    });
+    expect(init?.redirect).toBe("error");
+    expect(init?.signal).toBeInstanceOf(AbortSignal);
+  });
+
+  it("revoke gives up on a stalled request", async () => {
+    const stalled = (_url: string, given: RequestInit) =>
+      new Promise<Response>((_resolve, reject) =>
+        given.signal?.addEventListener("abort", () => reject(new Error("aborted"))),
+      );
+    await expect(revokeToken("rt", stalled, 50)).resolves.toBe(false);
+  });
+
+  it("survives a malformed request on the real listener", async () => {
+    let resolveUrl!: (url: URL) => void;
+    const shown = new Promise<URL>((resolve) => (resolveUrl = resolve));
+    const login = runLoopbackLogin({
+      client,
+      timeoutMs: 5_000,
+      showUrl: (url) => resolveUrl(new URL(url)),
+      fetch: () => okToken({ refresh_token: "rt", scope: grantedScope }),
+    });
+    const auth = await shown;
+    const redirect = new URL(auth.searchParams.get("redirect_uri")!);
+    const { request } = await import("node:http");
+    const status = await new Promise<number>((resolve, reject) => {
+      const req = request({ host: "127.0.0.1", port: redirect.port, path: "//[" }, (res) => {
+        res.resume();
+        resolve(res.statusCode ?? 0);
+      });
+      req.on("error", reject);
+      req.end();
+    });
+    expect(status).toBe(404);
+    await fetch(`${redirect}?state=${auth.searchParams.get("state")}&code=abc`);
+    await expect(login).resolves.toMatchObject({ refreshToken: "rt" });
   });
 });
 

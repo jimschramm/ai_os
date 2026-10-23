@@ -164,6 +164,7 @@ export const nextProjectDriveSettings = (
     readonly output: Option.Option<string>;
     readonly input: Option.Option<string>;
     readonly clearInput: boolean;
+    readonly clearOutput: boolean;
     readonly disable: boolean;
   },
 ): ProjectDriveSettings | string => {
@@ -181,6 +182,7 @@ export const nextProjectDriveSettings = (
     next[key] = id;
   }
   if (input.clearInput) delete next.inputFolderId;
+  if (input.clearOutput) delete next.outputFolderId;
   return next;
 };
 
@@ -195,6 +197,10 @@ const projectCommand = Command.make("project", {
     Flag.withDescription("Remove the default input folder."),
     Flag.withDefault(false),
   ),
+  clearOutput: Flag.Boolean("clear-output").pipe(
+    Flag.withDescription("Remove the output folder."),
+    Flag.withDefault(false),
+  ),
   disable: Flag.Boolean("disable").pipe(
     Flag.withDescription("Turn Drive off for this project (keeps the folders)."),
     Flag.withDefault(false),
@@ -206,6 +212,8 @@ const projectCommand = Command.make("project", {
       Effect.gen(function* () {
         const projectId = ProjectId.make(flags.projectId);
         const settings = yield* ServerSettings.ServerSettingsService;
+        // Read-modify-write of one project entry; a running server picks the
+        // file change up through its settings watcher.
         const current = yield* settings.getSettings;
         const entry = current.projectSettingsOverrides[projectId] ?? {};
         const drive = nextProjectDriveSettings(entry.drive, flags);
