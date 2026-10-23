@@ -125,8 +125,8 @@ export const isInsideFolders = async (
   const wanted = new Set(roots);
   const seen = new Set<string>();
   let frontier = [id];
-  // Drive folders are shallow in practice; 64 levels guards against loops.
-  for (let depth = 0; depth < 64 && frontier.length > 0; depth += 1) {
+  // No depth cap: `seen` visits each ancestor once, which ends any loop.
+  while (frontier.length > 0) {
     const next: string[] = [];
     for (const current of frontier) {
       if (wanted.has(current)) return true;

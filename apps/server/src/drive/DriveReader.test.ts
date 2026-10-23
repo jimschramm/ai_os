@@ -465,6 +465,20 @@ describe("ensureProjectFolders", () => {
     expect(calls.filter((call) => call.startsWith("create"))).toEqual([]);
   });
 
+  it("finds a project folder more than 64 levels up, and ends a parent loop", async () => {
+    const parentOf = (id: string) => {
+      const depth = Number(id.slice(1));
+      if (id === "loopA") return ["loopB"];
+      if (id === "loopB") return ["loopA"];
+      return depth === 100 ? ["root"] : [`d${depth + 1}`];
+    };
+    const api = {
+      getFile: async (id: string) => ({ id, parents: id === "root" ? [] : parentOf(id) }),
+    } as unknown as Parameters<typeof isInsideFolders>[0];
+    expect(await isInsideFolders(api, "d0", ["root"])).toBe(true);
+    expect(await isInsideFolders(api, "loopA", ["root"])).toBe(false);
+  });
+
   it("scopes folder evaluation to the project's own folders", async () => {
     const { api } = aios();
     const roots = await projectRoots(api, { inputFolderId: "existingIn" });

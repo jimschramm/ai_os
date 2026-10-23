@@ -618,7 +618,9 @@ export const extractPpt = (bytes: Uint8Array) => {
     // First the chain, newest edit first; then its directories.
     const directories: Array<{ at: number; body: number; next: number }> = [];
     const named = new Set<number>();
-    for (let guard = 0; guard < 4096 && edit > 0; guard += 1) {
+    // No length cap: older edits can hold entries the current slides need. The
+    // visited set ends a loop, and distinct offsets bound the walk by the stream.
+    while (edit > 0) {
       // Each edit once: a cycle would rescan the same directories.
       if (visited.has(edit)) throw new Error("Broken presentation: the edit chain loops.");
       visited.add(edit);

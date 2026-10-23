@@ -525,6 +525,53 @@ describe("record bounds", () => {
     expect(() => build(undefined, undefined, new Array(500).fill(1))).toThrow(/share one drawing/);
   });
 
+  it("follows a long PowerPoint edit chain to the directory that resolves the document", () => {
+    const rec = (verInst: number, type: number, body: number[]) => [
+      ...u16(verInst),
+      ...u16(type),
+      body.length & 0xff,
+      body.length >> 8,
+      0,
+      0,
+      ...body,
+    ];
+    const u32 = (n: number) => [n & 0xff, (n >> 8) & 0xff, (n >> 16) & 0xff, n >>> 24];
+    const atom = rec(0, 0x0fa8, [0x61, 0x62, 0x63]);
+    const doc = rec(0x0f, 0x03e8, rec(0x0f, 0x0ff0, [...rec(0, 0x03f3, u32(99)), ...atom]));
+    // Text no current record reaches: only a fallback scan would show it.
+    const stale = rec(0x0f, 0x0ff0, rec(0, 0x0fa8, [0x6f, 0x6c, 0x64]));
+    const dirAt = doc.length + stale.length;
+    const directory = rec(0, 0x1772, [...u32((1 << 20) | 1), ...u32(0)]);
+    const emptyAt = dirAt + directory.length;
+    const empty = rec(0, 0x1772, []);
+    const firstEdit = emptyAt + empty.length;
+    const count = 5_000;
+    const edits: number[] = [];
+    for (let k = 0; k < count; k += 1) {
+      const previous = k === 0 ? 0 : firstEdit + (k - 1) * 28;
+      edits.push(
+        ...rec(0, 0x0ff5, [
+          ...u32(0),
+          ...u32(0),
+          ...u32(previous),
+          ...u32(k === 0 ? dirAt : emptyAt),
+          ...u32(1),
+        ]),
+      );
+    }
+    const current = new Uint8Array(20);
+    new DataView(current.buffer).setUint32(16, firstEdit + (count - 1) * 28, true);
+    const text = extractPpt(
+      makeCfb(
+        "PowerPoint Document",
+        new Uint8Array([...doc, ...stale, ...directory, ...empty, ...edits]),
+        [["Current User", current]],
+      ),
+    );
+    expect(text).toContain("abc");
+    expect(text).not.toContain("old");
+  });
+
   it("does not let a PowerPoint record run past its container", () => {
     const atom = (text: string) => [
       0,
