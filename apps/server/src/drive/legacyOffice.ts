@@ -561,6 +561,7 @@ export const extractPpt = (bytes: Uint8Array) => {
     let edit = view(current).getUint32(16, true);
     const visited = new Set<number>();
     const scannedDirectories = new Set<number>();
+    const directoryRanges: Array<[number, number]> = [];
     for (let guard = 0; guard < 4096 && edit > 0; guard += 1) {
       // Each edit once: a cycle would rescan the same directories.
       if (visited.has(edit)) throw new Error("Broken presentation: the edit chain loops.");
@@ -572,6 +573,11 @@ export const extractPpt = (bytes: Uint8Array) => {
       // Each persist directory is read once; an older edit naming the same one adds nothing.
       scannedDirectories.add(directoryAt);
       if (directory !== null && directory.type === 0x1772) {
+        // Directories may not overlap, so all of them together scan the stream at most once.
+        if (directoryRanges.some(([from, to]) => directoryAt < to && from < directory.next)) {
+          throw new Error("Broken presentation: persist directories overlap.");
+        }
+        directoryRanges.push([directoryAt, directory.next]);
         for (let at = directory.body; at + 4 <= directory.next;) {
           const word = dv.getUint32(at, true);
           const firstId = word & 0xfffff;

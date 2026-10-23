@@ -566,6 +566,12 @@ describe("snapshot safety", () => {
     const [first, second] = await Promise.all([put("same"), put("same")]);
     expect(first.meta.sha256).toBe(second.meta.sha256);
     expect(await store.get("f1", "v1")).not.toBeNull();
+    // A corrupt entry repaired by several tasks at once: every one succeeds.
+    await fs.writeFile(first.originalPath!, "corrupt");
+    expect(await store.get("f1", "v1")).toBeNull();
+    const repaired = await Promise.all([put("same"), put("same"), put("same"), put("same")]);
+    expect(new Set(repaired.map((entry) => entry.meta.sha256)).size).toBe(1);
+    expect(await store.get("f1", "v1")).not.toBeNull();
   });
 });
 

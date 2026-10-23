@@ -254,6 +254,22 @@ describe("record bounds", () => {
     expect(() =>
       extractPpt(makeCfb("PowerPoint Document", stream, [["Current User", current]])),
     ).toThrow(/edit chain loops/);
+    // Two edits naming overlapping directories (one starts inside the other).
+    const innerBody = new Array(64).fill(0);
+    const outer = rec(0x1772, [0, 0, 0x72, 0x17, 56, 0, 0, 0, ...innerBody.slice(8)]);
+    const overlapEdits = [
+      rec(0x0ff5, [...u32(0), ...u32(0), ...u32(outer.length + 28), ...u32(0), ...u32(1)]),
+      rec(0x0ff5, [...u32(0), ...u32(0), ...u32(0), ...u32(8), ...u32(1)]),
+    ].flat();
+    const top = new Uint8Array(20);
+    new DataView(top.buffer).setUint32(16, outer.length, true);
+    expect(() =>
+      extractPpt(
+        makeCfb("PowerPoint Document", new Uint8Array([...outer, ...overlapEdits]), [
+          ["Current User", top],
+        ]),
+      ),
+    ).toThrow(/directories overlap/);
     // Thousands of distinct edits sharing one large directory: it is read once.
     const big = rec(0x1772, [
       ...u32((4000 << 20) | 1),

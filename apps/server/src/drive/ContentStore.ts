@@ -149,8 +149,18 @@ export const makeContentStore = (root: string) => {
         // A stale entry (failed sha check): move it aside, then publish the fresh one.
         const stale = `${dir}.${randomUUID()}.stale`;
         await fs.rename(dir, stale).catch(() => undefined);
-        await fs.rename(temporary, dir);
+        const replaced = await fs.rename(temporary, dir).then(
+          () => true,
+          () => false,
+        );
         await fs.rm(stale, { recursive: true, force: true });
+        if (!replaced) {
+          // A parallel repair published first: use its entry when it checks out.
+          const winner = await get(input.fileId, input.version);
+          await fs.rm(temporary, { recursive: true, force: true });
+          if (winner !== null) return winner;
+          throw new Error(`Could not store ${input.fileId} version ${input.version}.`);
+        }
       }
       await fs.appendFile(path.join(root, "index.jsonl"), `${JSON.stringify(meta)}\n`, {
         mode: 0o600,
