@@ -1,4 +1,5 @@
 // @effect-diagnostics nodeBuiltinImport:off
+import * as NodeChildProcess from "node:child_process";
 import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
@@ -3135,6 +3136,9 @@ describe("ai-os request route", () => {
       readonly status?: "running" | "completed";
       readonly text?: string | null;
     } | null,
+    submitted: { readonly revision: string; readonly cwd?: string | null } = {
+      revision: SUBMITTED,
+    },
   ) => {
     const launches: Array<{ model: string; instanceId: string; prompt: string }> = [];
     const runs: AiOsBoard.BoardRuns["Service"] = {
@@ -3170,7 +3174,8 @@ describe("ai-os request route", () => {
                 runId: "run-impl",
                 status: "completed" as const,
                 text: "Shipped the page.",
-                revision: SUBMITTED,
+                revision: submitted.revision,
+                cwd: submitted.cwd ?? null,
                 requestedModel: "gpt-5.6-sol",
                 actualModel: "gpt-5.6-sol",
               },
@@ -3286,6 +3291,83 @@ describe("ai-os request route", () => {
     expect(card.state.recordedVerdict).toBeUndefined();
     expect(card.state.run.reviewerRuntime?.actual ?? null).toBeNull();
     expect(card.qaRun).toMatchObject({ commitSha: SUBMITTED, settled: "rejected" });
+  });
+
+  const expectNoStoredVerdict = async (text: string | null) => {
+    const { runs } = runsFor({
+      actual: "gpt-6-astra",
+      status: "completed",
+      text,
+    });
+    const { handler } = handlerFor(undefined, runs);
+    expect((await configure(handler)).status).toBe(200);
+    const started = await ask(handler);
+    expect(started.status).toBe(409);
+    expect(await started.json()).toMatchObject({
+      detail: "The QA run did not return a verdict.",
+    });
+    const card = await demo(handler);
+    expect(card?.state.phase).toBe("awaiting_qa");
+    if (card?.state.phase !== "awaiting_qa") throw new Error("expected the card to stay in review");
+    expect(card.state.recordedVerdict).toBeUndefined();
+    expect(card.qaRun).toMatchObject({ commitSha: SUBMITTED, settled: "rejected" });
+  };
+
+  it("stores no verdict when the QA run has no text", async () => {
+    await expectNoStoredVerdict(null);
+  });
+
+  it("stores no verdict when the QA run text is empty", async () => {
+    await expectNoStoredVerdict("");
+  });
+
+  it("stores no verdict when the QA run returns prose", async () => {
+    await expectNoStoredVerdict("The page lists Saturday and Sunday.");
+  });
+
+  it("stores no verdict when the QA run returns broken JSON", async () => {
+    await expectNoStoredVerdict("{verdict: rework");
+  });
+
+  it("stores no verdict when the QA run JSON does not decode", async () => {
+    await expectNoStoredVerdict(JSON.stringify({ verdict: "rework" }));
+  });
+
+  it("starts QA on the commit a checkpoint ref points at", async () => {
+    const repo = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "aios-checkpoint-"));
+    dirs.push(repo);
+    const git = (args: readonly string[]) =>
+      NodeChildProcess.execFileSync("git", args, { cwd: repo, encoding: "utf8" }).trim();
+    git(["init"]);
+    git(["config", "user.email", "qa@example.com"]);
+    git(["config", "user.name", "QA"]);
+    NodeFS.writeFileSync(NodePath.join(repo, "page.txt"), "saturday\n");
+    git(["add", "page.txt"]);
+    git(["commit", "-m", "schedule"]);
+    const sha = git(["rev-parse", "HEAD"]);
+    const scopeKey = "0123456789abcdef0123456789abcdef";
+    const ref = `refs/t3/orchestration-v2/checkpoints/${Buffer.from(scopeKey).toString("base64url")}/ordinal/1`;
+    git(["update-ref", ref, sha]);
+
+    const { runs, launches } = runsFor(
+      { actual: null, status: "running" },
+      { revision: ref, cwd: repo },
+    );
+    const { handler } = handlerFor(undefined, runs);
+    expect((await configure(handler)).status).toBe(200);
+    const started = await ask(handler);
+    expect(started.status).toBe(200);
+    const card = await demo(handler);
+    expect(card?.state.phase).toBe("awaiting_qa");
+    if (card?.state.phase !== "awaiting_qa") throw new Error("expected review");
+    expect(card.state.completion.artifactRevision).toEqual({ type: "git", sha });
+    expect(card.state.recordedVerdict).toBeUndefined();
+    expect(card.qaRun).toEqual({ threadId: "thread-qa", runId: "run-qa", commitSha: sha });
+    expect(launches.map((item) => [item.instanceId, item.model])).toEqual([
+      ["codex", "gpt-5.6-sol"],
+      ["codex", "gpt-6-astra"],
+    ]);
+    expect(launches[1]?.prompt).toContain(`Review this exact submitted revision: ${sha}`);
   });
 
   it("records an independent QA verdict and leaves the card in review", async () => {

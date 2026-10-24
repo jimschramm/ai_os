@@ -1,4 +1,5 @@
 // @effect-diagnostics nodeBuiltinImport:off - The production memory file is under the home directory, and tests keep theirs in the temp state dir.
+import * as NodeChildProcess from "node:child_process";
 import * as NodeOS from "node:os";
 
 import {
@@ -43,7 +44,6 @@ import {
   decodeSequenceEvent,
   decodeSequenceState,
   eligibleImplementer,
-  isSolModel,
   executionGeneration,
   executionLaunchKey,
   GitSha,
@@ -580,6 +580,40 @@ const gitArtifact = (
   return sha === null ? null : { type: "git", sha };
 };
 
+/** A checkpoint ref is `refs/t3/orchestration-v2/checkpoints/<scope>/ordinal/<n>`. */
+const CHECKPOINT_REF = /^refs\/t3\/orchestration-v2\/checkpoints\/[A-Za-z0-9_-]+\/ordinal\/[0-9]+$/;
+
+/**
+ * The live thread reports a checkpoint ref, not the commit it names.
+ * QA is bound to that commit, so the ref is resolved before completion is stored.
+ */
+const commitShaForRevision = (
+  revision: string | null | undefined,
+  cwd: string | null | undefined,
+): string | null => {
+  const direct = canonicalGitSha(revision ?? "");
+  if (direct !== null) return direct;
+  if (revision == null || cwd == null || cwd.length === 0 || !CHECKPOINT_REF.test(revision)) {
+    return null;
+  }
+  try {
+    const sha = NodeChildProcess.execFileSync(
+      "git",
+      ["rev-parse", "--verify", `${revision}^{commit}`],
+      { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
+    ).trim();
+    return canonicalGitSha(sha);
+  } catch {
+    return null;
+  }
+};
+
+const withResolvedRevision = (view: T3ThreadView): T3ThreadView => {
+  const sha = commitShaForRevision(view.revision, view.cwd);
+  if (sha === null || sha === view.revision) return view;
+  return { ...view, revision: sha };
+};
+
 /**
  * Record start, then a terminal outcome when the run already finished.
  * The card leaves Ready only after both events apply, in that order.
@@ -1012,11 +1046,12 @@ export const layer = Layer.unwrap(
         if (view === null || !("assignment" in state)) {
           return { state, book, changed, runId: null as string | null };
         }
+        const reported = withResolvedRevision(view);
         const planned = observationEvents({
           taskId,
           threadId,
           state,
-          view,
+          view: reported,
           allowLapse: view.status === "interrupted",
           workerId: state.assignment.workerId,
         });
@@ -1434,6 +1469,7 @@ export const layer = Layer.unwrap(
         const watched = yield* runs
           .watchThread(opened.launched.threadId)
           .pipe(Effect.catchTags({ BoardRunError: () => Effect.succeed(null) }));
+        const reported = watched === null ? null : withResolvedRevision(watched);
         const outcome = yield* recordConfirmedRun({
           state: input.queued,
           taskId: input.queued.assignment.taskId,
@@ -1442,9 +1478,9 @@ export const layer = Layer.unwrap(
           summary: opened.launched.summary,
           ledger: input.book,
           memoryFile: taskMemoryFile(config.stateDir),
-          implementerRequested: watched?.requestedModel ?? null,
-          implementerActual: watched?.actualModel ?? null,
-          revision: watched?.revision ?? null,
+          implementerRequested: reported?.requestedModel ?? null,
+          implementerActual: reported?.actualModel ?? null,
+          revision: reported?.revision ?? null,
         });
         return {
           outcome,
@@ -1464,67 +1500,17 @@ export const layer = Layer.unwrap(
       rejection: null,
       touched: false,
     });
-    const verdictForReview = (
-      state: Extract<BoardSequence, { phase: "awaiting_qa" }>,
-      text: string | null,
-      requestedModel: string | null,
-    ) => {
-      const implementerName = modelSlug(
-        state.run.implementerRuntime?.actual ?? state.assignment.implementerModel,
-      );
-      const requested = requestedModel?.trim() ?? "";
-      const qaName =
-        requested.length > 0 && !sameBaseModel(requested, implementerName)
-          ? requested
-          : isSolModel(implementerName)
-            ? "gpt-6-astra"
-            : "claude-sonnet-5";
-      const synthetic = {
-        version: "v1",
-        taskId: state.acknowledgment.taskId,
-        attemptId: state.assignment.attemptId,
-        availability: "available",
-        qaModel: qaName,
-        implementerModel: implementerName,
-        verdict: "rework",
-        artifactRevision: state.completion.artifactRevision,
-        findings: [
-          {
-            defect: "The reviewer did not report a model.",
-            evidence: "The QA session has no actual model.",
-            expectedBehavior: "QA reports a base model different from the implementer.",
-          },
-        ],
-      };
-      const parsed = (() => {
-        if (text === null || text.trim().length === 0) return null;
-        try {
-          return JSON.parse(text) as unknown;
-        } catch {
-          const start = text.indexOf("{");
-          const end = text.lastIndexOf("}");
-          if (start < 0 || end <= start) return null;
-          try {
-            return JSON.parse(text.slice(start, end + 1)) as unknown;
-          } catch {
-            return null;
-          }
-        }
-      })();
+    const verdictForReview = (text: string | null) => {
+      if (text === null || text.trim().length === 0) return Effect.succeed(null);
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(text);
+      } catch {
+        return Effect.succeed(null);
+      }
       const body = isRecord(parsed) && isRecord(parsed.qa) ? parsed.qa : parsed;
-      const candidate = isRecord(body)
-        ? {
-            ...body,
-            version: "v1",
-            taskId: state.acknowledgment.taskId,
-            attemptId: state.assignment.attemptId,
-            artifactRevision: state.completion.artifactRevision,
-            ...(body.verdict === "accept"
-              ? { acceptedRevision: state.completion.artifactRevision }
-              : {}),
-          }
-        : synthetic;
-      return decodeQaVerdictV1(candidate).pipe(Effect.catch(() => decodeQaVerdictV1(synthetic)));
+      if (!isRecord(body)) return Effect.succeed(null);
+      return decodeQaVerdictV1(body).pipe(Effect.catch(() => Effect.succeed(null)));
     };
     const settleQaVerdict = (
       outcome: KanbanMoveResult & { readonly _tag: "Applied" },
@@ -1534,11 +1520,7 @@ export const layer = Layer.unwrap(
       Effect.gen(function* () {
         if (outcome.state.phase !== "awaiting_qa") return keepQa(outcome, qaRun);
         const waiting = outcome.state;
-        const verdict = yield* verdictForReview(
-          waiting,
-          view.text,
-          view.requestedModel ?? null,
-        ).pipe(Effect.catch(() => Effect.succeed(null)));
+        const verdict = yield* verdictForReview(view.text);
         if (verdict === null || verdict.availability !== "available") {
           return {
             outcome: { ...outcome, changed: true },
