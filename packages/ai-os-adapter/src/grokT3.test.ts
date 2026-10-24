@@ -771,6 +771,38 @@ it.effect("fingerprints the provider launch will use", () =>
   ),
 );
 
+it.effect("sends recorded memory lines in the Codex and Cursor launch prompts", () =>
+  withFake((fake) =>
+    Effect.gen(function* () {
+      const line = "Saturday games start at 7:00.";
+      const launchOne = (instanceId: "codex" | "cursor", taskId: string) =>
+        Effect.gen(function* () {
+          const adapter = createGrokT3Adapter({
+            client: t3Client(fake.origin),
+            clock: () => CLOCK,
+            model: "gpt-5.4",
+            instanceId,
+          });
+          const recorded = yield* adapter.record({
+            taskId,
+            title: "Tournament page",
+            intake: intakeV2Example,
+            context,
+            orientation: [line],
+          });
+          const started = yield* adapter.launch(recorded.taskId);
+          const threadId = started.threadId ?? "";
+          const prompt = fake.prompt(threadId);
+          assert.equal(prompt.includes(line), true);
+          assert.equal(prompt.includes("Orientation"), true);
+          assert.equal(fake.instanceId(threadId), instanceId);
+        });
+      yield* launchOne("codex", "task-codex-memory");
+      yield* launchOne("cursor", "task-cursor-memory");
+    }),
+  ),
+);
+
 it.effect("does not invent gpt-5.4 when no model is selected", () =>
   withFake((fake) =>
     Effect.gen(function* () {

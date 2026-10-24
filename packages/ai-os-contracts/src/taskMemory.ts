@@ -246,6 +246,15 @@ export const orientationText = (memoryPackage: TaskMemoryPackageV1): readonly st
   ...memoryPackage.summaries.map((item) => item.summary),
 ];
 
+/**
+ * True when the text the runtime will see contains this package.
+ * A receipt is stored only after this is true for the launch input.
+ */
+export const promptCarriesMemory = (memoryPackage: TaskMemoryPackageV1, prompt: string): boolean =>
+  prompt.includes(memoryPackage.requirements) &&
+  prompt.includes(memoryPackage.repoCommit) &&
+  orientationText(memoryPackage).every((line) => prompt.includes(line));
+
 export interface PreparedTaskMemory {
   readonly package: TaskMemoryPackageV1;
   readonly receipt: ReadReceiptV1;

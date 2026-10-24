@@ -1,9 +1,11 @@
 import {
+  decodeAttemptMemoryActivityV1,
   packageFacts,
   type AttemptMemoryActivityV1,
   type MemoryFactV1,
   type MemoryNodeKindV1,
 } from "@t3tools/ai-os-contracts";
+import * as Effect from "effect/Effect";
 
 import type { OperationsTask } from "./fixtures";
 import {
@@ -301,6 +303,27 @@ export function contextPackageView(task: OperationsTask): ContextPackageView | n
     versionIds: snapshot.memoryVersions,
     records,
   };
+}
+
+/** Attempts carried on the board snapshot. That is the drawer's source. */
+export function boardAttemptActivity(
+  cards: readonly { readonly attempts?: readonly unknown[] }[],
+): readonly AttemptMemoryActivityV1[] {
+  const seen = new Set<string>();
+  const activity: AttemptMemoryActivityV1[] = [];
+  for (const card of cards) {
+    for (const item of card.attempts ?? []) {
+      try {
+        const decoded = Effect.runSync(decodeAttemptMemoryActivityV1(item));
+        if (seen.has(decoded.attemptId)) continue;
+        seen.add(decoded.attemptId);
+        activity.push(decoded);
+      } catch {
+        // Leave a field that is not an attempt out of the drawer.
+      }
+    }
+  }
+  return activity;
 }
 
 export function attemptActivityFor(

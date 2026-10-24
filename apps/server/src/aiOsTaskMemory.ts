@@ -78,19 +78,27 @@ const storedRead = (
   return { package: memoryPackage, receipt, contextPackage };
 };
 
-/**
- * One read per attempt. A second supply returns the package that was already
- * handed to the run, so the receipt still names what was supplied.
- */
-export const supplyTaskMemorySync = (
+/** Build the package for this attempt. An existing row wins, and nothing is written. */
+export const prepareTaskMemorySync = (
   database: NodeSqlite.DatabaseSync,
   request: unknown,
 ): PreparedTaskMemory => {
   prepareReads(database);
+  const prepared = Effect.runSync(prepareTaskMemory(readMemoryLedger(database), request));
+  return storedRead(database, prepared.receipt.attemptId) ?? prepared;
+};
+
+/**
+ * Store a package that was already placed in the launch input.
+ * A second commit returns the row from the first launch.
+ */
+export const commitTaskReadSync = (
+  database: NodeSqlite.DatabaseSync,
+  prepared: PreparedTaskMemory,
+): PreparedTaskMemory => {
+  prepareReads(database);
   database.exec("BEGIN IMMEDIATE");
   try {
-    const ledger = readMemoryLedger(database);
-    const prepared = Effect.runSync(prepareTaskMemory(ledger, request));
     const existing = storedRead(database, prepared.receipt.attemptId);
     if (existing !== null) {
       database.exec("ROLLBACK");
@@ -121,6 +129,12 @@ export const supplyTaskMemorySync = (
     throw invalid("The memory database could not record the read receipt.");
   }
 };
+
+/** Prepare and commit. Callers that launch must commit only after the prompt includes the package. */
+export const supplyTaskMemorySync = (
+  database: NodeSqlite.DatabaseSync,
+  request: unknown,
+): PreparedTaskMemory => commitTaskReadSync(database, prepareTaskMemorySync(database, request));
 
 export const recordTaskWriteSync = (
   database: NodeSqlite.DatabaseSync,

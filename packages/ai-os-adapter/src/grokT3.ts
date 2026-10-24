@@ -33,6 +33,8 @@ export interface AttemptSession {
   readonly launchKey: string;
   readonly revision: number;
   readonly updatedAt: string;
+  /** Lines included in the launch prompt. Empty when the caller had no package. */
+  readonly memoryLines?: readonly string[];
 }
 
 export interface SessionStore {
@@ -398,6 +400,7 @@ export interface GrokT3Adapter extends WorkerAdapter<AttemptSession, AdapterBoar
     readonly title: string;
     readonly intake: unknown;
     readonly context: unknown;
+    readonly orientation?: readonly string[];
   }) => Effect.Effect<AttemptSession, GrokT3Error>;
   readonly heartbeat: (
     taskId: string,
@@ -559,6 +562,7 @@ export const createGrokT3Adapter = (input: {
     readonly title: string;
     readonly intake: unknown;
     readonly context: unknown;
+    readonly orientation?: readonly string[];
   }) =>
     Effect.gen(function* () {
       yield* requireModel;
@@ -584,7 +588,7 @@ export const createGrokT3Adapter = (input: {
         runtimeMode: T3_LAUNCH_DEFAULTS.runtimeMode,
         interactionMode: T3_LAUNCH_DEFAULTS.interactionMode,
         workspaceStrategy: T3_LAUNCH_DEFAULTS.workspaceStrategy,
-        prompt: renderPrompt(intake, context),
+        prompt: renderSuppliedPrompt(intake, context, request.orientation ?? []),
         attachments: [],
         context,
       });
@@ -607,6 +611,7 @@ export const createGrokT3Adapter = (input: {
         launchKey,
         revision: 0,
         updatedAt: at,
+        memoryLines: request.orientation ?? [],
       };
       const requested = yield* saveEvent(blank, { type: "intake", intake }, `intake-${taskId}`);
       const acknowledged = yield* saveEvent(
@@ -669,7 +674,11 @@ export const createGrokT3Adapter = (input: {
           title: session.title,
           model,
           instanceId: resolvedInstanceId,
-          prompt: renderPrompt(intake, session.state.assignment.contextPackage),
+          prompt: renderSuppliedPrompt(
+            intake,
+            session.state.assignment.contextPackage,
+            session.memoryLines ?? [],
+          ),
           contextPackage: session.state.assignment.contextPackage,
         });
         session = yield* saveSnapshot({

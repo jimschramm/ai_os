@@ -34,6 +34,8 @@ import { HttpRouter, HttpServerRequest } from "effect/http";
 import * as EnvironmentAuth from "./auth/EnvironmentAuth.ts";
 import * as AiOsAntigravity from "./aiOsAntigravity.ts";
 import * as AiOsBoard from "./aiOsBoard.ts";
+import { openMemoryDatabase, submitMemorySync } from "./aiOsMemory.ts";
+import { readAttemptActivitySync } from "./aiOsTaskMemory.ts";
 import * as ServerConfig from "./config.ts";
 
 const activeLaunch = (): AiOsBoard.BoardLaunchResult => ({
@@ -2179,5 +2181,178 @@ describe("ai-os board route", () => {
       "retry-task-agy-2",
     );
     expect(after?.state.phase === "executing" ? after.state.run.progress : "touched").toBeNull();
+  });
+
+  it("sends the memory package in the launch and skips a receipt the launch left out", async () => {
+    const decision = "Saturday games start at 7:00.";
+    const prompts: string[] = [];
+    const orientations: string[][] = [];
+    const { handler, stateDir } = handlerFor(
+      undefined,
+      {
+        ...allowRuns,
+        launch: (input) => {
+          prompts.push(input.prompt);
+          const id = prompts.length;
+          return Effect.succeed({
+            threadId: `thread-${id}`,
+            runId: `run-${id}`,
+            disposition: "active" as const,
+            summary: null,
+          });
+        },
+      },
+      {
+        ...idleReviews,
+        start: (input) => {
+          orientations.push([...(input.orientation ?? [])]);
+          return Effect.succeed({ status: "running" as const, runId: "agy-run-memory" });
+        },
+      },
+    );
+    const database = openMemoryDatabase(NodePath.join(stateDir, "memory.db"));
+    submitMemorySync(
+      database,
+      {
+        version: "v1",
+        submissionId: "submission-start",
+        idempotencyKey: "key-start",
+        projectId: "usba",
+        authorId: "jim",
+        taskId: "task-seed",
+        attemptId: "attempt-seed",
+        evidence: [{ evidenceId: "evidence-start", note: "The schedule file says so." }],
+        expectedVersions: [],
+        intent: "accept",
+        facts: [
+          {
+            identity: "tournament-start",
+            fact: {
+              acceptance: "proposed",
+              factId: "fact-start",
+              projectId: "usba",
+              kind: "Decision",
+              body: decision,
+              provenance: { actorId: "jim", at: "2026-10-24T06:00:00Z" },
+              validity: { from: "2026-10-24T06:00:00Z", until: null },
+            },
+          },
+        ],
+        relationships: [],
+      },
+      "jim",
+    );
+    database.close();
+
+    await reachAssigned(handler);
+    const bare = await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
+      taskId: "task-demo",
+      title: "Demo task",
+      idempotencyKey: "start-without-package",
+      threadId: "thread-bare",
+      runId: "run-bare",
+      event: { type: "start_execution" },
+    });
+    expect(bare.status).toBe(200);
+    expect(prompts).toEqual([]);
+    const skipped = openMemoryDatabase(NodePath.join(stateDir, "memory.db"));
+    expect(readAttemptActivitySync(skipped).some((item) => item.attemptId === "attempt-1")).toBe(
+      false,
+    );
+    skipped.close();
+
+    const assign = async (
+      taskId: string,
+      attemptId: string,
+      instanceId: string,
+      extra: Record<string, string> = {},
+    ) => {
+      expect(
+        (
+          await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
+            taskId,
+            title: taskId,
+            idempotencyKey: `intake-${taskId}`,
+            event: {
+              type: "intake",
+              intake: { ...intakeV2Example, projectId: "usba", workspaceId: "usba" },
+            },
+          })
+        ).status,
+      ).toBe(200);
+      expect(
+        (
+          await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
+            taskId,
+            column: "Ready",
+            idempotencyKey: `ready-${taskId}`,
+          })
+        ).status,
+      ).toBe(200);
+      expect(
+        (
+          await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
+            taskId,
+            title: taskId,
+            idempotencyKey: `assign-${taskId}`,
+            event: {
+              type: "assign",
+              assignment: {
+                ...assignmentExample,
+                taskId,
+                attemptId,
+                assignmentId: `assignment-${taskId}`,
+                instanceId,
+                ...extra,
+              },
+            },
+          })
+        ).status,
+      ).toBe(200);
+      expect(
+        (
+          await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
+            taskId,
+            column: "Running",
+            idempotencyKey: `run-${taskId}`,
+          })
+        ).status,
+      ).toBe(200);
+    };
+
+    await assign("task-codex", "attempt-codex", "codex");
+    await assign("task-cursor", "attempt-cursor", "cursor");
+    await assign("task-agy-memory", "attempt-agy-memory", "antigravity", {
+      role: "advisory",
+      taskType: "advisory",
+    });
+
+    expect(prompts).toHaveLength(2);
+    expect(
+      prompts.every((prompt) => prompt.includes(decision) && prompt.includes("Orientation")),
+    ).toBe(true);
+    expect(orientations).toEqual([[decision]]);
+
+    const saved = openMemoryDatabase(NodePath.join(stateDir, "memory.db"));
+    const activity = readAttemptActivitySync(saved);
+    saved.close();
+    expect(activity.map((item) => item.attemptId).sort()).toEqual([
+      "attempt-agy-memory",
+      "attempt-codex",
+      "attempt-cursor",
+    ]);
+    expect(activity.find((item) => item.attemptId === "attempt-cursor")).toMatchObject({
+      authorId: "t3-codex",
+      runtime: "cursor",
+    });
+    expect(activity.find((item) => item.attemptId === "attempt-codex")?.runtime).toBe("codex");
+    expect(activity.find((item) => item.attemptId === "attempt-agy-memory")?.runtime).toBe(
+      "antigravity",
+    );
+
+    const cards = await readCards(handler);
+    const cursor = cards.find((card) => card.taskId === "task-cursor");
+    expect(cursor?.attempts?.map((item) => item.attemptId)).toEqual(["attempt-cursor"]);
+    expect(cursor?.attempts?.[0]?.authorId).toBe("t3-codex");
   });
 });
