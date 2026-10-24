@@ -347,6 +347,10 @@
       "types": "./src/devHome.ts",
       "import": "./src/devHome.ts"
     },
+    "./aiOsHome": {
+      "types": "./src/aiOsHome.ts",
+      "import": "./src/aiOsHome.ts"
+    },
     "./devProxy": {
       "types": "./src/devProxy.ts",
       "import": "./src/devProxy.ts"

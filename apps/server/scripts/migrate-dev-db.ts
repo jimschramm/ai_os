@@ -4,6 +4,7 @@ import * as NodeRuntime from "@effect/platform-node/NodeRuntime";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as NodeOS from "node:os";
 import * as NodeURL from "node:url";
+import { AI_OS_HOME_DIRECTORY_NAME, T3_CODE_HOME_DIRECTORY_NAME } from "@t3tools/shared/aiOsHome";
 import { resolveWorktreeT3Home } from "@t3tools/shared/devHome";
 import * as Console from "effect/Console";
 import * as Effect from "effect/Effect";
@@ -33,7 +34,7 @@ export class MigrateDevDbSharedHomeError extends Schema.TaggedError<MigrateDevDb
   {},
 ) {
   override get message(): string {
-    return "Refusing to rebuild the shared ~/.t3 database. Use an isolated --base-dir.";
+    return "Refusing to rebuild the shared ~/.ai_os-home or ~/.t3 database. Use an isolated --base-dir.";
   }
 }
 
@@ -122,8 +123,10 @@ export interface RunMigrateDevDbInput {
 }
 
 export interface RunMigrateDevDbOptions {
-  /** Overridable for tests; the directory writes must never target. */
+  /** ai_os home. Writes there are refused. Tests point this at a temp directory. */
   readonly sharedHome?: string | undefined;
+  /** T3 Code home. Writes there are refused even when it is not the ai_os home. */
+  readonly t3CodeHome?: string | undefined;
 }
 
 interface KeptProject {
@@ -420,9 +423,14 @@ export const runMigrateDevDb = Effect.fn("runMigrateDevDb")(function* (
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
 
-  const sharedHome = path.resolve(options.sharedHome ?? path.join(NodeOS.homedir(), ".t3"));
+  const aiOsHome = path.resolve(
+    options.sharedHome ?? path.join(NodeOS.homedir(), AI_OS_HOME_DIRECTORY_NAME),
+  );
+  const t3CodeHome = path.resolve(
+    options.t3CodeHome ?? path.join(NodeOS.homedir(), T3_CODE_HOME_DIRECTORY_NAME),
+  );
   const sourcePath = path.resolve(
-    input.source ?? path.join(sharedHome, "userdata", "statev2.sqlite"),
+    input.source ?? path.join(aiOsHome, "userdata", "statev2.sqlite"),
   );
 
   const baseDir =
@@ -439,12 +447,12 @@ export const runMigrateDevDb = Effect.fn("runMigrateDevDb")(function* (
   if (!(yield* fs.exists(sourcePath))) {
     return yield* new MigrateDevDbSourceMissingError({ sourcePath });
   }
-  const [canonicalBaseDir, canonicalSharedHome] = yield* Effect.all([
-    fs.realPath(baseDir).pipe(Effect.orElseSucceed(() => baseDir)),
-    fs.realPath(sharedHome).pipe(Effect.orElseSucceed(() => sharedHome)),
-  ]);
-  if (canonicalBaseDir === canonicalSharedHome) {
-    return yield* new MigrateDevDbSharedHomeError();
+  const canonicalBaseDir = yield* fs.realPath(baseDir).pipe(Effect.orElseSucceed(() => baseDir));
+  for (const home of [aiOsHome, t3CodeHome]) {
+    const canonicalHome = yield* fs.realPath(home).pipe(Effect.orElseSucceed(() => home));
+    if (canonicalBaseDir === canonicalHome) {
+      return yield* new MigrateDevDbSharedHomeError();
+    }
   }
   // The destination db and snapshot both get deleted below; a --source that
   // resolves to either (e.g. a leftover snapshot file) would be destroyed
@@ -579,7 +587,7 @@ export const migrateDevDbCommand = Command.make(
     ),
     source: Flag.String("source").pipe(
       Flag.optional,
-      Flag.withDescription("Source database. Defaults to ~/.t3/userdata/statev2.sqlite."),
+      Flag.withDescription("Source database. Defaults to ~/.ai_os-home/userdata/statev2.sqlite."),
     ),
   },
   ({ projects, threadsPerProject, baseDir, source }) =>
@@ -606,7 +614,7 @@ export const migrateDevDbCommand = Command.make(
     }),
 ).pipe(
   Command.withDescription(
-    "Rebuild the worktree dev database from a pruned snapshot of the real ~/.t3 data, then run migrations.",
+    "Rebuild the worktree dev database from a pruned snapshot of the real ~/.ai_os-home data, then run migrations.",
   ),
 );
 

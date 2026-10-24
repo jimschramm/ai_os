@@ -29,8 +29,12 @@ Add `--browser` to open a browser automatically.
 ### State and ports
 
 Linked worktrees default to their own `.t3/userdata`, even when `T3CODE_HOME` is set.
-The main checkout defaults to `~/.t3/dev/userdata`. An explicit `--home-dir` wins in both cases.
-Never run a development server against the live `~/.t3/userdata`.
+The main checkout defaults to `~/.ai_os-home/dev/userdata`. An explicit `--home-dir` wins in both cases.
+Never run a development server against the live `~/.ai_os-home/userdata`, and never write `~/.t3/userdata`.
+That directory is T3 Code's live database.
+An install that already used the old `~/.t3` default does not move itself.
+Copy that data into `~/.ai_os-home`, or set `T3CODE_HOME` to keep the old directory.
+There is no automatic migration.
 See [test data](../../AGENTS.md#test-data) for copying a consistent database snapshot.
 
 Read ports from the `[dev-runner]` output. Worktrees derive stable preferences from their paths,
