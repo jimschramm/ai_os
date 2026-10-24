@@ -6,7 +6,6 @@ import {
   describeReadinessCause,
   waitForHttpReady as waitForHttpReadyShared,
 } from "@t3tools/shared/httpReadiness";
-import { AI_OS_HOME_DIRECTORY_NAME } from "@t3tools/shared/aiOsHome";
 import { cliReleaseDownloadBaseUrl } from "@t3tools/shared/cliRelease";
 import * as KeyedLock from "@t3tools/shared/KeyedLock";
 import * as NetService from "@t3tools/shared/Net";
@@ -456,16 +455,16 @@ fi
 # Self-contained release archive: no Node, npm, or compiler on the remote.
 # Unpacked into the pinned-runtime layout so \`t3 service install\` reuses it.
 T3_RELEASE_BASE_URL=@@T3_RELEASE_BASE_URL@@
-T3_RUNTIME_DIR="$HOME/${AI_OS_HOME_DIRECTORY_NAME}/runtime/versions/$T3_ARCHIVE_VERSION"
+T3_RUNTIME_DIR="$HOME/.t3/runtime/versions/$T3_ARCHIVE_VERSION"
 t3_runtime_ready() {
   [ -x "$T3_RUNTIME_DIR/t3" ] && [ "$(cat "$T3_RUNTIME_DIR/.install-complete" 2>/dev/null)" = "$T3_ARCHIVE_VERSION" ]
 }
 if ! t3_runtime_ready; then
-  mkdir -p "$HOME/${AI_OS_HOME_DIRECTORY_NAME}/runtime/versions"
+  mkdir -p "$HOME/.t3/runtime/versions"
   # Concurrent launches (two clients, a retry racing a slow first run) must
   # not both install: mkdir is the atomic lock and the ready check repeats
   # under it.
-  T3_LOCK="$HOME/${AI_OS_HOME_DIRECTORY_NAME}/runtime/versions/.$T3_ARCHIVE_VERSION.install.lock"
+  T3_LOCK="$HOME/.t3/runtime/versions/.$T3_ARCHIVE_VERSION.install.lock"
   # mkdir is the only portable atomic exclusive create (mv would silently
   # nest a candidate inside an existing lock). The owner publishes its pid
   # right after, so a lock with a live owner is never reclaimed however
@@ -512,7 +511,7 @@ if ! t3_runtime_ready; then
     *) printf 'Remote host %s has no t3 release archive.\\n' "$(uname -m)" >&2; exit 1 ;;
   esac
   T3_ARCHIVE="t3-$T3_ARCHIVE_VERSION-$T3_PLATFORM-$T3_ARCH.tar.gz"
-  T3_STAGING="$(mktemp -d "$HOME/${AI_OS_HOME_DIRECTORY_NAME}/runtime/versions/.staging-XXXXXX")"
+  T3_STAGING="$(mktemp -d "$HOME/.t3/runtime/versions/.staging-XXXXXX")"
   trap 'rm -rf "$T3_STAGING" "$T3_LOCK"' EXIT
   t3_fetch() {
     if command -v curl >/dev/null 2>&1; then curl -fsSL --connect-timeout 30 --max-time "$3" "$1" -o "$2"
@@ -552,8 +551,8 @@ exec "$T3_RUNTIME_DIR/t3" "$@"
 const REMOTE_LAUNCH_SCRIPT = `set -eu
 @@T3_NODE_ENV_SCRIPT@@
 STATE_KEY="$1"
-STATE_DIR="$HOME/${AI_OS_HOME_DIRECTORY_NAME}/ssh-launch/$STATE_KEY"
-DEFAULT_SERVER_HOME="$HOME/${AI_OS_HOME_DIRECTORY_NAME}"
+STATE_DIR="$HOME/.t3/ssh-launch/$STATE_KEY"
+DEFAULT_SERVER_HOME="$HOME/.t3"
 DEFAULT_RUNTIME_FILE="$DEFAULT_SERVER_HOME/userdata/server-runtime.json"
 PORT_FILE="$STATE_DIR/port"
 PID_FILE="$STATE_DIR/pid"
@@ -749,8 +748,8 @@ printf '{"remotePort":%s,"serverKind":"%s"}\\n' "$REMOTE_PORT" "\${REMOTE_MANAGE
 `;
 
 const REMOTE_PAIRING_SCRIPT = `set -eu
-STATE_DIR="$HOME/${AI_OS_HOME_DIRECTORY_NAME}/ssh-launch/@@T3_STATE_KEY@@"
-DEFAULT_SERVER_HOME="$HOME/${AI_OS_HOME_DIRECTORY_NAME}"
+STATE_DIR="$HOME/.t3/ssh-launch/@@T3_STATE_KEY@@"
+DEFAULT_SERVER_HOME="$HOME/.t3"
 RUNNER_FILE="$STATE_DIR/run-t3.sh"
 mkdir -p "$STATE_DIR"
 cat >"$RUNNER_FILE" <<'SH'
@@ -762,7 +761,7 @@ PAIRING_BASE_DIR="$DEFAULT_SERVER_HOME"
 `;
 
 const REMOTE_STOP_SCRIPT = `set -eu
-STATE_DIR="$HOME/${AI_OS_HOME_DIRECTORY_NAME}/ssh-launch/@@T3_STATE_KEY@@"
+STATE_DIR="$HOME/.t3/ssh-launch/@@T3_STATE_KEY@@"
 PID_FILE="$STATE_DIR/pid"
 PORT_FILE="$STATE_DIR/port"
 MANAGED_FILE="$STATE_DIR/managed"
@@ -785,7 +784,7 @@ printf '{"stopped":true}\\n'
 `;
 
 const REMOTE_LOG_TAIL_SCRIPT = `set -eu
-STATE_DIR="$HOME/${AI_OS_HOME_DIRECTORY_NAME}/ssh-launch/@@T3_STATE_KEY@@"
+STATE_DIR="$HOME/.t3/ssh-launch/@@T3_STATE_KEY@@"
 LOG_FILE="$STATE_DIR/server.log"
 if [ -f "$LOG_FILE" ]; then
   tail -n 80 "$LOG_FILE" 2>/dev/null || true
