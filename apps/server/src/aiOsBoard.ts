@@ -7,6 +7,7 @@ import {
   ADAPTER_BOARD_EVENTS_PATH,
   ADAPTER_BOARD_MOVE_PATH,
   ADAPTER_BOARD_PATH,
+  ADAPTER_MEMORY_RESOLVE_PATH,
   type AdapterBoardCard,
 } from "@t3tools/ai-os-adapter/board";
 import {
@@ -35,8 +36,10 @@ import {
   ContractTransitionError,
   openBoardTask,
   orientationText,
+  initialMemoryLedger,
   promptCarriesMemory,
   requestKanbanMove,
+  reviewSteward,
   runtimeForAssignment,
   sameModelName,
   SequenceState,
@@ -83,7 +86,8 @@ import {
   applyAdvisoryStop,
   type AdvisoryOpen,
 } from "./aiOsAntigravity.ts";
-import { memoryDatabasePath, openMemoryDatabase } from "./aiOsMemory.ts";
+import { memoryDatabasePath, openMemoryDatabase, readMemoryLedger } from "./aiOsMemory.ts";
+import { resolveMemoryConflictSync } from "./aiOsSteward.ts";
 import {
   commitTaskReadSync,
   prepareTaskMemorySync,
@@ -422,16 +426,21 @@ const memoryRequest = (state: BoardSequence, createdAt: string) => {
   };
 };
 
-const readBoardAttempts = (file: string): readonly AttemptMemoryActivityV1[] => {
+const readBoardMemory = (
+  file: string,
+): {
+  readonly activity: readonly AttemptMemoryActivityV1[];
+  readonly ledger: typeof initialMemoryLedger;
+} => {
   try {
     const database = openMemoryDatabase(file);
     try {
-      return readAttemptActivitySync(database);
+      return { activity: readAttemptActivitySync(database), ledger: readMemoryLedger(database) };
     } finally {
       database.close();
     }
   } catch {
-    return [];
+    return { activity: [], ledger: initialMemoryLedger };
   }
 };
 
@@ -818,11 +827,31 @@ export const layer = Layer.unwrap(
     }).pipe(Effect.catchTags(authResponse));
     const cardsNow = () => decodeAdapterBoardWire(hub.snapshot()) ?? [];
     const withAttempts = (cards: readonly AdapterBoardCard[]): readonly AdapterBoardCard[] => {
-      const activity = readBoardAttempts(taskMemoryFile(config.stateDir));
-      return cards.map((card) => ({
-        ...card,
-        attempts: activity.filter((item) => item.taskId === card.taskId),
-      }));
+      const memory = readBoardMemory(taskMemoryFile(config.stateDir));
+      const inFlight = new Set<string>();
+      for (const card of cards) {
+        if (card.state.phase === "executing") inFlight.add(card.state.assignment.attemptId);
+      }
+      const notices = reviewSteward(memory.ledger, memory.activity, inFlight);
+      return cards.map((card) => {
+        const projectId = "intake" in card.state ? card.state.intake.projectId : null;
+        const facts =
+          projectId === null
+            ? []
+            : memory.ledger.graph.facts.filter((fact) => fact.projectId === projectId);
+        const steward = notices.filter(
+          (notice) => notice.taskId === card.taskId || notice.projectId === projectId,
+        );
+        // Drop a previous join. An empty list has to replace the field, or a
+        // resolved conflict stays on the card.
+        const { steward: _previousSteward, memoryFacts: _previousFacts, ...rest } = card;
+        return {
+          ...rest,
+          attempts: memory.activity.filter((item) => item.taskId === card.taskId),
+          ...(steward.length === 0 ? {} : { steward }),
+          ...(facts.length === 0 ? {} : { memoryFacts: facts }),
+        };
+      });
     };
     publishAttempts = () => {
       const current = cardsNow();
@@ -1975,12 +2004,66 @@ export const layer = Layer.unwrap(
         detail: catalog.detail,
       });
     }).pipe(Effect.catchTags(authResponse));
+    const resolveConflict = Effect.gen(function* () {
+      yield* authorize(AuthOrchestrationOperateScope);
+      const request = yield* HttpServerRequest.HttpServerRequest;
+      const text = yield* request.text.pipe(Effect.orElseSucceed(() => ""));
+      return yield* writes.withPermits(1)(
+        Effect.gen(function* () {
+          const body = readJson(text);
+          if (!isRecord(body)) return json(400, { detail: "Expected a JSON object." });
+          const conflictId = stringField(body, "conflictId");
+          const action = stringField(body, "action");
+          if (
+            conflictId === null ||
+            (action !== "keep" && action !== "accept" && action !== "correct")
+          ) {
+            return json(400, { detail: "Expected conflictId and keep, accept, or correct." });
+          }
+          const statement = stringField(body, "body") ?? undefined;
+          const createdAt = yield* stamped;
+          const resolved = yield* withTaskMemory(taskMemoryFile(config.stateDir), (database) =>
+            resolveMemoryConflictSync(database, {
+              action,
+              conflictId,
+              body: statement,
+              createdAt,
+            }),
+          ).pipe(
+            Effect.map((receipt) => ({ _tag: "Ok" as const, receipt })),
+            Effect.catch((error) => Effect.succeed({ _tag: "No" as const, detail: error.message })),
+          );
+          if (resolved._tag === "No")
+            return json(409, { _tag: "Rejected", detail: resolved.detail });
+          if (resolved.receipt.outcome !== "accepted" && resolved.receipt.outcome !== "duplicate") {
+            return json(409, { _tag: "Rejected", detail: resolved.receipt.detail });
+          }
+          publishAttempts();
+          return json(200, {
+            _tag: "Applied",
+            outcome: resolved.receipt.outcome,
+            detail: resolved.receipt.detail,
+            factIds: resolved.receipt.factIds,
+          });
+        }),
+      );
+    }).pipe(
+      Effect.catchTags(authResponse),
+      Effect.catch((cause) =>
+        failEnvironmentInternal("internal_error", cause).pipe(
+          Effect.catchTags({
+            EnvironmentInternalError: (error) => HttpServerRespondable.toResponse(error),
+          }),
+        ),
+      ),
+    );
     return Layer.mergeAll(
       HttpRouter.add("GET", ADAPTER_BOARD_PATH, snapshot),
       HttpRouter.add("POST", ADAPTER_BOARD_PATH, replace),
       HttpRouter.add("GET", ADAPTER_BOARD_EVENTS_PATH, events),
       HttpRouter.add("POST", ADAPTER_BOARD_MOVE_PATH, move),
       HttpRouter.add("POST", ADAPTER_BOARD_EVENT_PATH, workflowEvent),
+      HttpRouter.add("POST", ADAPTER_MEMORY_RESOLVE_PATH, resolveConflict),
       HttpRouter.add("GET", ADAPTER_ANTIGRAVITY_MODELS_PATH, models),
       Layer.effectDiscard(
         Effect.gen(function* () {

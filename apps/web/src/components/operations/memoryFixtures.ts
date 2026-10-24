@@ -22,9 +22,12 @@ export interface MemoryRecordMeta {
 
 export interface MemoryConflict {
   readonly id: string;
-  readonly projectId: OperationsProjectId;
+  readonly projectId: string;
   readonly summary: string;
   readonly factIds: readonly [string, string];
+  readonly authorId?: string;
+  readonly acceptedBody?: string;
+  readonly proposedBody?: string;
 }
 
 const open = (from: string): ValidityWindowV1 => ({ from, until: null });

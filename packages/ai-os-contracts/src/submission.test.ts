@@ -248,6 +248,85 @@ it.effect("accepts a new version from the authority and resolves the open confli
   }),
 );
 
+it.effect("keeps the accepted statement when the authority resolves the conflict that way", () =>
+  Effect.gen(function* () {
+    const first = yield* accept(
+      initialMemoryLedger,
+      "accepted",
+      "Saturday games start at 7:00.",
+      0,
+    );
+    const agent = yield* applySubmission(
+      first.ledger,
+      proposal("agent", "Saturday games start at 8:30.", {
+        expectedVersions: [{ factId: "fact-accepted", revision: 1 }],
+      }),
+      authority,
+    );
+    const kept = yield* applySubmission(
+      agent.ledger,
+      proposal("keep", "Saturday games start at 7:00.", {
+        authorId: authority,
+        intent: "accept",
+        expectedVersions: [{ factId: "fact-accepted", revision: 1 }],
+        facts: [
+          {
+            identity: "tournament-start",
+            fact: {
+              acceptance: "proposed",
+              factId: "fact-keep",
+              projectId: "usba",
+              kind: "Decision",
+              body: "Saturday games start at 7:00.",
+              provenance: { actorId: authority, at },
+              validity: { from: at, until: null },
+            },
+          },
+        ],
+      }),
+      authority,
+    );
+    assert.strictEqual(kept.receipt.outcome, "accepted");
+    assert.strictEqual(kept.receipt.detail, "Kept the accepted statement.");
+    assert.deepStrictEqual(kept.receipt.factIds, ["fact-accepted"]);
+    assert.strictEqual(kept.ledger.conflicts[0]?.resolvedBySubmissionId, "submission-keep");
+    assert.strictEqual(
+      kept.ledger.graph.facts.find((fact) => fact.factId === "fact-keep"),
+      undefined,
+    );
+    assert.deepStrictEqual(
+      packageFacts(kept.ledger.graph, "usba", at).map((fact) => fact.factId),
+      ["fact-accepted"],
+    );
+    const repeat = yield* applySubmission(
+      first.ledger,
+      proposal("again", "Saturday games start at 7:00.", {
+        authorId: authority,
+        intent: "accept",
+        expectedVersions: [{ factId: "fact-accepted", revision: 1 }],
+        facts: [
+          {
+            identity: "tournament-start",
+            fact: {
+              acceptance: "proposed",
+              factId: "fact-again",
+              projectId: "usba",
+              kind: "Decision",
+              body: "Saturday games start at 7:00.",
+              provenance: { actorId: authority, at },
+              validity: { from: at, until: null },
+            },
+          },
+        ],
+      }),
+      authority,
+    );
+    assert.strictEqual(repeat.receipt.outcome, "rejected");
+    assert.strictEqual(repeat.receipt.detail, "That statement is already accepted.");
+    assert.strictEqual(repeat.ledger.receipts.length, first.ledger.receipts.length);
+  }),
+);
+
 it.effect("rejects an agent acceptance, a broken relationship, and an unknown version", () =>
   Effect.gen(function* () {
     const agentAccept = yield* applySubmission(

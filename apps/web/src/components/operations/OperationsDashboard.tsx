@@ -24,12 +24,22 @@ import { hasLiveBoard, tasksForBoard } from "./adapterBoard";
 import { KanbanBoard } from "./KanbanBoard";
 import { useAdapterBoard } from "./adapterFeed";
 import type { NeedsYouItem, OperationsAgent, OperationsTask } from "./fixtures";
-import { INITIAL_MEMORY_REVIEW, boardAttemptActivity, type MemoryReviewState } from "./memoryModel";
+import {
+  INITIAL_MEMORY_REVIEW,
+  boardAttemptActivity,
+  boardMemoryFacts,
+  boardStewardNotices,
+  drawerProjectId,
+  rowsFromFacts,
+  stewardConflicts,
+  stewardNeedsYou,
+  type MemoryReviewState,
+} from "./memoryModel";
+import { postMemoryResolve } from "./memoryResolve";
 import {
   activeAgentCount,
   findProject,
   needsYou,
-  projectById,
   projectChoices,
   projectLabel,
   qaBadgeTone,
@@ -86,10 +96,8 @@ export function OperationsDashboard() {
       : ALL_PROJECTS;
   const tasks =
     workspace === ALL_PROJECTS ? allTasks : tasksForBoard(workspace, cards, includeFixtures);
-  const memoryProject =
-    (workspace === ALL_PROJECTS ? undefined : findProject(workspace)) ??
-    choices.map((choice) => findProject(choice.id)).find((project) => project !== undefined) ??
-    projectById("personal");
+  const memoryProjectId = drawerProjectId(workspace, choices);
+  const memoryProjectLabel = projectLabel(memoryProjectId, names);
   const agents =
     live && !includeFixtures
       ? agentsFromTasks(tasks)
@@ -111,7 +119,16 @@ export function OperationsDashboard() {
     setSurface("memory");
     setMemoryOpen(false);
   };
-  const attention = needsYou(tasks);
+  const notices = live ? boardStewardNotices(cards) : [];
+  const liveFacts = live ? boardMemoryFacts(cards) : null;
+  const liveConflictRows =
+    liveFacts === null ? undefined : stewardConflicts(notices, liveFacts, memoryProjectId);
+  const conflictFactIds = new Set(
+    (liveConflictRows ?? []).flatMap((conflict) => [...conflict.factIds]),
+  );
+  const liveRows =
+    liveFacts === null ? undefined : rowsFromFacts(liveFacts, memoryProjectId, conflictFactIds);
+  const attention = [...needsYou(tasks), ...stewardNeedsYou(notices)];
   const usage = usageFor(tasks);
   const active = activeAgentCount(agents);
 
@@ -166,8 +183,8 @@ export function OperationsDashboard() {
         {surface === "memory" ? (
           <div className="p-4 sm:p-6">
             <CortexView
-              projectId={memoryProject.id}
-              projectLabel={memoryProject.label}
+              projectId={memoryProjectId}
+              projectLabel={memoryProjectLabel}
               review={review}
               highlightId={highlightId}
               currentTaskId={currentTaskId}
@@ -183,7 +200,13 @@ export function OperationsDashboard() {
               <BlockerCard
                 items={attention}
                 noted={noted}
-                onAct={(id) => setNoted((current) => ({ ...current, [id]: true }))}
+                onAct={(id) => {
+                  if (notices.some((notice) => notice.noticeId === id)) {
+                    openMemory(null);
+                    return;
+                  }
+                  setNoted((current) => ({ ...current, [id]: true }));
+                }}
               />
             </div>
             <section aria-labelledby="board-heading" className="min-w-0">
@@ -220,11 +243,13 @@ export function OperationsDashboard() {
       />
       <MemoryBrowser
         open={memoryOpen}
-        projectId={memoryProject.id}
-        projectLabel={memoryProject.label}
+        projectId={memoryProjectId}
+        projectLabel={memoryProjectLabel}
         currentTaskId={currentTaskId}
         currentTaskTitle={currentTask?.title ?? null}
         activity={boardAttemptActivity(cards)}
+        {...(liveRows === undefined ? {} : { records: liveRows })}
+        {...(liveConflictRows === undefined ? {} : { liveConflicts: liveConflictRows })}
         review={review}
         selectedId={memoryId}
         notes={memoryNotes}
@@ -241,15 +266,34 @@ export function OperationsDashboard() {
             [factId]: "Rejected. This mockup does not send the decision.",
           }));
         }}
-        onResolve={(conflictId, keptId) => {
+        onResolve={(conflictId, action, body) => {
+          if (live) {
+            void postMemoryResolve({
+              conflictId,
+              action,
+              ...(body === undefined ? {} : { body }),
+            }).then((result) => {
+              setMemoryNotes((current) => ({
+                ...current,
+                [conflictId]:
+                  result.detail ??
+                  (result._tag === "Applied"
+                    ? "Resolution recorded."
+                    : "The resolution was not recorded."),
+              }));
+            });
+            return;
+          }
           setReview((current) => ({
             ...current,
             resolvedConflicts: new Set([...current.resolvedConflicts, conflictId]),
           }));
           const note =
-            keptId === null
-              ? "Conflict marked resolved. Nothing was saved."
-              : "Kept that claim. Nothing was saved.";
+            action === "keep"
+              ? "Kept the accepted statement. Nothing was saved."
+              : action === "accept"
+                ? "Accepted the proposal. Nothing was saved."
+                : "Correction noted. Nothing was saved.";
           setMemoryNotes((current) => ({ ...current, [conflictId]: note }));
         }}
         onCorrect={(factId) => {

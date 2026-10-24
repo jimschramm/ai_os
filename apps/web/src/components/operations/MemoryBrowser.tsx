@@ -19,6 +19,7 @@ import {
   memoryRows,
   openConflicts,
   versionChain,
+  type MemoryConflict,
   type MemoryReviewState,
   type MemoryRow,
   type MemoryScope,
@@ -42,6 +43,8 @@ export function MemoryBrowser({
   currentTaskId,
   currentTaskTitle,
   activity,
+  records,
+  liveConflicts,
   review,
   selectedId,
   notes,
@@ -58,6 +61,10 @@ export function MemoryBrowser({
   currentTaskId: string | null;
   currentTaskTitle: string | null;
   activity: readonly AttemptMemoryActivityV1[];
+  /** Live records. Omit to keep the fixture list. */
+  records?: readonly MemoryRow[];
+  /** Live steward conflicts. Omit to keep the fixture conflicts. */
+  liveConflicts?: readonly MemoryConflict[];
   review: MemoryReviewState;
   selectedId: string | null;
   notes: Readonly<Record<string, string>>;
@@ -65,7 +72,7 @@ export function MemoryBrowser({
   onClose: () => void;
   onShowRelationships: (factId: string | null) => void;
   onReject: (factId: string) => void;
-  onResolve: (conflictId: string, keptId: string | null) => void;
+  onResolve: (conflictId: string, action: "keep" | "accept" | "correct", body?: string) => void;
   onCorrect: (factId: string) => void;
 }) {
   const [query, setQuery] = useState("");
@@ -75,14 +82,14 @@ export function MemoryBrowser({
   const titleRef = useRef<HTMLHeadingElement>(null);
   const panelRef = useRef<HTMLElement>(null);
   useDialogCycle(open ? "memory" : null, panelRef, titleRef, onClose);
-  const rows = filterRows(memoryRows(projectId, review), {
+  const rows = filterRows(records ?? memoryRows(projectId, review), {
     query,
     scope,
     type,
     status,
     currentTaskId,
   });
-  const conflicts = openConflicts(projectId, review);
+  const conflicts = liveConflicts ?? openConflicts(projectId, review);
   const attempts = attemptActivityFor(activity, projectId, scope === "task" ? currentTaskId : null);
   const selected = rows.find((row) => row.fact.factId === selectedId) ?? null;
   const selectedAttempt =
@@ -177,43 +184,12 @@ export function MemoryBrowser({
               ) : (
                 <ul className="mt-2 flex flex-col gap-2">
                   {conflicts.map((conflict) => (
-                    <li
+                    <ConflictCard
                       key={conflict.id}
-                      className="rounded-lg border border-warning/40 bg-warning/8 px-3 py-2"
-                    >
-                      <p className="text-sm">{conflict.summary}</p>
-                      <ul className="mt-2 flex flex-col gap-2">
-                        {conflict.factIds.map((factId) => (
-                          <li key={factId} className="rounded-md bg-background/50 px-2 py-2">
-                            <p className="text-sm">{factById(factId)?.body ?? factId}</p>
-                            <div className="mt-2 flex flex-wrap gap-2">
-                              <Button
-                                size="sm"
-                                variant="outline"
-                                onClick={() => onResolve(conflict.id, factId)}
-                              >
-                                Accept
-                              </Button>
-                              <Button size="sm" variant="ghost" onClick={() => onReject(factId)}>
-                                Reject
-                              </Button>
-                            </div>
-                          </li>
-                        ))}
-                      </ul>
-                      <div className="mt-2">
-                        <Button
-                          size="sm"
-                          variant="ghost"
-                          onClick={() => onResolve(conflict.id, null)}
-                        >
-                          Resolve
-                        </Button>
-                      </div>
-                      {notes[conflict.id] !== undefined ? (
-                        <p className="mt-2 text-xs text-muted-foreground">{notes[conflict.id]}</p>
-                      ) : null}
-                    </li>
+                      conflict={conflict}
+                      note={notes[conflict.id] ?? null}
+                      onResolve={onResolve}
+                    />
                   ))}
                 </ul>
               )}
@@ -298,6 +274,59 @@ export function MemoryBrowser({
         </div>
       </aside>
     </>
+  );
+}
+
+function ConflictCard({
+  conflict,
+  note,
+  onResolve,
+}: {
+  conflict: MemoryConflict;
+  note: string | null;
+  onResolve: (conflictId: string, action: "keep" | "accept" | "correct", body?: string) => void;
+}) {
+  const [correction, setCorrection] = useState("");
+  const accepted =
+    conflict.acceptedBody ?? factById(conflict.factIds[0])?.body ?? conflict.factIds[0];
+  const proposed =
+    conflict.proposedBody ?? factById(conflict.factIds[1])?.body ?? conflict.factIds[1];
+  const trimmed = correction.trim();
+  return (
+    <li className="rounded-lg border border-warning/40 bg-warning/8 px-3 py-2">
+      <p className="text-sm">{conflict.summary}</p>
+      {conflict.authorId === undefined ? null : (
+        <p className="mt-1 text-xs text-muted-foreground">{authorLabel(conflict.authorId)}</p>
+      )}
+      <p className="mt-2 text-sm">Accepted: {accepted}</p>
+      <p className="mt-1 text-sm">Proposed: {proposed}</p>
+      <div className="mt-2 flex flex-wrap gap-2">
+        <Button size="sm" variant="outline" onClick={() => onResolve(conflict.id, "keep")}>
+          Keep accepted
+        </Button>
+        <Button size="sm" variant="outline" onClick={() => onResolve(conflict.id, "accept")}>
+          Accept proposed
+        </Button>
+      </div>
+      <div className="mt-2 flex flex-wrap items-center gap-2">
+        <Input
+          size="sm"
+          aria-label="Corrected statement"
+          placeholder="Corrected statement"
+          value={correction}
+          onChange={(event) => setCorrection(event.currentTarget.value)}
+        />
+        <Button
+          size="sm"
+          variant="ghost"
+          disabled={trimmed.length === 0}
+          onClick={() => onResolve(conflict.id, "correct", trimmed)}
+        >
+          Correct
+        </Button>
+      </div>
+      {note !== null ? <p className="mt-2 text-xs text-muted-foreground">{note}</p> : null}
+    </li>
   );
 }
 

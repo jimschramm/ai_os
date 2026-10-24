@@ -7,6 +7,8 @@ import {
   SequenceEvent,
   SequenceState,
   AttemptMemoryActivityV1,
+  MemoryFactV1,
+  StewardNoticeV1,
   type KanbanMoveLedger,
 } from "@t3tools/ai-os-contracts";
 import * as Effect from "effect/Effect";
@@ -40,6 +42,8 @@ const WireCards = Schema.Array(
     ),
     updatedAt: IsoDateTime,
     attempts: Schema.optional(Schema.Array(AttemptMemoryActivityV1)),
+    steward: Schema.optional(Schema.Array(StewardNoticeV1)),
+    memoryFacts: Schema.optional(Schema.Array(MemoryFactV1)),
   }),
 );
 
@@ -63,6 +67,8 @@ export const encodeAdapterBoardWire = (cards: readonly AdapterBoardCard[]): stri
       revision: card.revision ?? 0,
       updatedAt: card.updatedAt,
       ...(card.attempts === undefined ? {} : { attempts: card.attempts }),
+      ...(card.steward === undefined ? {} : { steward: card.steward }),
+      ...(card.memoryFacts === undefined ? {} : { memoryFacts: card.memoryFacts }),
     })),
   );
 
@@ -106,6 +112,8 @@ export const decodeAdapterBoardWire = (text: string): readonly AdapterBoardCard[
     revision: card.revision,
     updatedAt: card.updatedAt,
     ...(card.attempts === undefined ? {} : { attempts: card.attempts }),
+    ...(card.steward === undefined ? {} : { steward: card.steward }),
+    ...(card.memoryFacts === undefined ? {} : { memoryFacts: card.memoryFacts }),
   }));
 };
 
