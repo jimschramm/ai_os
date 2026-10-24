@@ -1,6 +1,7 @@
 import * as Schema from "effect/Schema";
 
 import { AssignmentV1 } from "./assignment.ts";
+import { SubmissionV1 } from "./submission.ts";
 import { leaseIdFor } from "./canonical.ts";
 import { strictParse } from "./common.ts";
 import { CompletionSubmissionV1 } from "./completion.ts";
@@ -14,6 +15,7 @@ const decodeAcknowledgment = Schema.decodeUnknownSync(IntakeAcknowledgmentV1, st
 const decodeAssignment = Schema.decodeUnknownSync(AssignmentV1, strictParse);
 const decodeCompletion = Schema.decodeUnknownSync(CompletionSubmissionV1, strictParse);
 const decodeQa = Schema.decodeUnknownSync(QaVerdictV1, strictParse);
+const decodeSubmission = Schema.decodeUnknownSync(SubmissionV1, strictParse);
 
 export const exampleRepoCommit = "c".repeat(40);
 export const revisionOne = { type: "git" as const, sha: "a".repeat(40) };
@@ -128,6 +130,36 @@ export const qaAcceptExample = decodeQa({
   artifactRevision: revisionTwo,
   acceptedRevision: revisionTwo,
   findings: [],
+});
+
+export const submissionExample = decodeSubmission({
+  version: "v1",
+  submissionId: "submission-saturday-start",
+  idempotencyKey: "key-saturday-start",
+  projectId: "usba",
+  authorId: "codex-t3",
+  taskId: "task-usba-page",
+  attemptId: "attempt-1",
+  evidence: [
+    { evidenceId: "evidence-schedule", note: "The schedule file says Saturday starts at 7:00." },
+  ],
+  expectedVersions: [],
+  intent: "propose",
+  facts: [
+    {
+      identity: "tournament-start",
+      fact: {
+        acceptance: "proposed",
+        factId: "fact-saturday-start",
+        projectId: "usba",
+        kind: "Decision",
+        body: "Saturday games start at 7:00.",
+        provenance: { actorId: "codex-t3", at: "2026-10-21T15:00:00Z" },
+        validity: { from: "2026-10-21T15:00:00Z", until: null },
+      },
+    },
+  ],
+  relationships: [],
 });
 
 export const happyPathEvents: ReadonlyArray<SequenceEvent> = [
