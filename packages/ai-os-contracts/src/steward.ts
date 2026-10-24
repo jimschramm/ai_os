@@ -44,16 +44,19 @@ const factBody = (facts: readonly MemoryFactV1[], factId: string): string =>
   facts.find((fact) => fact.factId === factId)?.body ?? factId;
 
 /**
- * Open conflicts, and attempts that read memory without writing.
+ * Open conflicts, and ended attempts that read memory without writing.
+ * `inFlightAttemptIds` is the card's active assignment. A running attempt has
+ * not finished, so a missing write is not a blocker yet.
  * A proposal, including an explicit no-change explanation, counts as a write.
  */
 export const reviewSteward = (
   ledger: MemoryLedgerV1,
   activity: readonly AttemptMemoryActivityV1[],
+  inFlightAttemptIds: ReadonlySet<string> = new Set(),
 ): readonly StewardNoticeV1[] => {
   const notices: StewardNoticeV1[] = [];
   for (const item of activity) {
-    if (item.write !== null) continue;
+    if (item.write !== null || inFlightAttemptIds.has(item.attemptId)) continue;
     const summary = clip(
       `${item.authorId} read memory on ${item.attemptId} and did not write findings.`,
     );

@@ -29,6 +29,7 @@ import {
   boardAttemptActivity,
   boardMemoryFacts,
   boardStewardNotices,
+  drawerProjectId,
   rowsFromFacts,
   stewardConflicts,
   stewardNeedsYou,
@@ -39,7 +40,6 @@ import {
   activeAgentCount,
   findProject,
   needsYou,
-  projectById,
   projectChoices,
   projectLabel,
   qaBadgeTone,
@@ -96,10 +96,8 @@ export function OperationsDashboard() {
       : ALL_PROJECTS;
   const tasks =
     workspace === ALL_PROJECTS ? allTasks : tasksForBoard(workspace, cards, includeFixtures);
-  const memoryProject =
-    (workspace === ALL_PROJECTS ? undefined : findProject(workspace)) ??
-    choices.map((choice) => findProject(choice.id)).find((project) => project !== undefined) ??
-    projectById("personal");
+  const memoryProjectId = drawerProjectId(workspace, choices);
+  const memoryProjectLabel = projectLabel(memoryProjectId, names);
   const agents =
     live && !includeFixtures
       ? agentsFromTasks(tasks)
@@ -124,12 +122,12 @@ export function OperationsDashboard() {
   const notices = live ? boardStewardNotices(cards) : [];
   const liveFacts = live ? boardMemoryFacts(cards) : null;
   const liveConflictRows =
-    liveFacts === null ? undefined : stewardConflicts(notices, liveFacts, memoryProject.id);
+    liveFacts === null ? undefined : stewardConflicts(notices, liveFacts, memoryProjectId);
   const conflictFactIds = new Set(
     (liveConflictRows ?? []).flatMap((conflict) => [...conflict.factIds]),
   );
   const liveRows =
-    liveFacts === null ? undefined : rowsFromFacts(liveFacts, memoryProject.id, conflictFactIds);
+    liveFacts === null ? undefined : rowsFromFacts(liveFacts, memoryProjectId, conflictFactIds);
   const attention = [...needsYou(tasks), ...stewardNeedsYou(notices)];
   const usage = usageFor(tasks);
   const active = activeAgentCount(agents);
@@ -185,8 +183,8 @@ export function OperationsDashboard() {
         {surface === "memory" ? (
           <div className="p-4 sm:p-6">
             <CortexView
-              projectId={memoryProject.id}
-              projectLabel={memoryProject.label}
+              projectId={memoryProjectId}
+              projectLabel={memoryProjectLabel}
               review={review}
               highlightId={highlightId}
               currentTaskId={currentTaskId}
@@ -245,8 +243,8 @@ export function OperationsDashboard() {
       />
       <MemoryBrowser
         open={memoryOpen}
-        projectId={memoryProject.id}
-        projectLabel={memoryProject.label}
+        projectId={memoryProjectId}
+        projectLabel={memoryProjectLabel}
         currentTaskId={currentTaskId}
         currentTaskTitle={currentTask?.title ?? null}
         activity={boardAttemptActivity(cards)}

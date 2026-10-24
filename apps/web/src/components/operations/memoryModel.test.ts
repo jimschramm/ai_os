@@ -13,6 +13,7 @@ import {
   cortexRing,
   currentFacts,
   displayStatus,
+  drawerProjectId,
   filterRows,
   layoutCortex,
   memoryRows,
@@ -234,5 +235,65 @@ describe("operations memory", () => {
       }),
     ]);
     expect(boardStewardNotices([{ steward: [{ not: "a notice" }] }])).toEqual([]);
+  });
+
+  it("shows a conflict from a live project in the drawer with a resolve action", () => {
+    const projectId = drawerProjectId("all", [{ id: "qa-live-project" }]);
+    expect(projectId).toBe("qa-live-project");
+    expect(drawerProjectId("qa-live-project", [{ id: "qa-live-project" }])).toBe("qa-live-project");
+    const accepted = {
+      acceptance: "accepted" as const,
+      factId: "fact-live-accepted",
+      projectId,
+      kind: "Decision" as const,
+      body: "The gate opens at 6.",
+      provenance: { actorId: "agent-a", at: "2026-10-24T06:00:00Z" },
+      validity: { from: "2026-10-24T06:00:00Z", until: null },
+      acceptedBy: "jim",
+      acceptedAt: "2026-10-24T06:00:00Z",
+    };
+    const proposed = {
+      acceptance: "proposed" as const,
+      factId: "fact-live-proposed",
+      projectId,
+      kind: "Decision" as const,
+      body: "The gate opens at 8.",
+      provenance: { actorId: "agent-b", at: "2026-10-24T06:00:00Z" },
+      validity: { from: "2026-10-24T06:00:00Z", until: null },
+    };
+    const notice = {
+      noticeId: "steward-conflict-live",
+      projectId,
+      taskId: "task-live",
+      kind: "open_conflict" as const,
+      authorId: "agent-b",
+      summary:
+        "agent-b conflicts with accepted memory: The gate opens at 6. / The gate opens at 8.",
+      conflictId: "conflict-live",
+      attemptId: "attempt-live",
+      acceptedFactId: "fact-live-accepted",
+      proposedFactId: "fact-live-proposed",
+    };
+    const conflicts = stewardConflicts(
+      boardStewardNotices([{ steward: [notice] }]),
+      [accepted, proposed],
+      projectId,
+    );
+    expect(conflicts).toEqual([
+      expect.objectContaining({
+        id: "conflict-live",
+        projectId: "qa-live-project",
+        authorId: "agent-b",
+        acceptedBody: "The gate opens at 6.",
+        proposedBody: "The gate opens at 8.",
+      }),
+    ]);
+    expect(stewardNeedsYou(boardStewardNotices([{ steward: [notice] }]))).toEqual([
+      expect.objectContaining({
+        id: "steward-conflict-live",
+        kind: "decision",
+        actionLabel: "Resolve",
+      }),
+    ]);
   });
 });

@@ -828,7 +828,11 @@ export const layer = Layer.unwrap(
     const cardsNow = () => decodeAdapterBoardWire(hub.snapshot()) ?? [];
     const withAttempts = (cards: readonly AdapterBoardCard[]): readonly AdapterBoardCard[] => {
       const memory = readBoardMemory(taskMemoryFile(config.stateDir));
-      const notices = reviewSteward(memory.ledger, memory.activity);
+      const inFlight = new Set<string>();
+      for (const card of cards) {
+        if (card.state.phase === "executing") inFlight.add(card.state.assignment.attemptId);
+      }
+      const notices = reviewSteward(memory.ledger, memory.activity, inFlight);
       return cards.map((card) => {
         const projectId = "intake" in card.state ? card.state.intake.projectId : null;
         const facts =

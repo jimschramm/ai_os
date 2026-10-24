@@ -121,3 +121,19 @@ it.effect("flags a missing write and an open conflict for the agent that made th
     );
   }),
 );
+
+it.effect("skips a missing write while the attempt is still running", () =>
+  Effect.sync(() => {
+    const running = activity("attempt-live", "agent-a", null);
+    const ended = activity("attempt-done", "agent-a", null);
+    const notices = reviewSteward(initialMemoryLedger, [running, ended], new Set(["attempt-live"]));
+    assert.strictEqual(
+      notices.some((notice) => notice.attemptId === "attempt-live"),
+      false,
+    );
+    assert.strictEqual(
+      notices.find((notice) => notice.attemptId === "attempt-done")?.kind,
+      "missing_write",
+    );
+  }),
+);

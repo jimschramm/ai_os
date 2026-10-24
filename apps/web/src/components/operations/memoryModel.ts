@@ -328,6 +328,18 @@ export function boardAttemptActivity(
   return activity;
 }
 
+/**
+ * The drawer follows the project selected on the board.
+ * A live id is not in the demo list, so the id itself is the project.
+ */
+export function drawerProjectId(
+  workspace: string,
+  choices: readonly { readonly id: string }[],
+): string {
+  if (workspace !== "all") return workspace;
+  return choices[0]?.id ?? "personal";
+}
+
 /** Steward notices carried on the board snapshot. */
 export function boardStewardNotices(
   cards: readonly { readonly steward?: readonly unknown[] }[],
