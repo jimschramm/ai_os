@@ -1,9 +1,5 @@
 import type { AdapterBoardCard } from "@t3tools/ai-os-adapter/board";
-import {
-  QA_INCOMPLETE_LABEL,
-  RECOVERY_PENDING_LABEL,
-  type SequenceState,
-} from "@t3tools/ai-os-contracts";
+import { RECOVERY_PENDING_LABEL, type SequenceState } from "@t3tools/ai-os-contracts";
 
 import { OPERATIONS_TASKS, type OperationsTask } from "./fixtures";
 import { tasksForProject } from "./model";
@@ -11,7 +7,6 @@ import { tasksForProject } from "./model";
 const completionOf = (state: SequenceState) => {
   switch (state.phase) {
     case "awaiting_qa":
-    case "qa_incomplete":
     case "rework":
     case "accepted":
       return state.completion;
@@ -35,7 +30,6 @@ const runOf = (state: SequenceState) => {
   switch (state.phase) {
     case "executing":
     case "awaiting_qa":
-    case "qa_incomplete":
     case "rework":
     case "accepted":
     case "recovery_pending":
@@ -69,31 +63,23 @@ const taskFromAdapterCard = (card: AdapterBoardCard): OperationsTask | null => {
           nextAction: "Read the T3 thread, then resume or take over.",
           actionLabel: "Resume",
         }
-      : state.phase === "qa_incomplete"
+      : state.phase === "failed"
         ? {
-            id: `${card.taskId}-qa-incomplete`,
+            id: `${card.taskId}-failed`,
             kind: "blocker" as const,
-            summary: QA_INCOMPLETE_LABEL,
-            nextAction: "Send the review to a verified reviewer on a different model.",
-            actionLabel: "Route review",
+            summary: state.blocker.summary,
+            nextAction: state.blocker.nextAction,
+            actionLabel: "I'll take it",
           }
-        : state.phase === "failed"
-          ? {
-              id: `${card.taskId}-failed`,
+        : progressBlocker === undefined
+          ? null
+          : {
+              id: `${card.taskId}-progress-block`,
               kind: "blocker" as const,
-              summary: state.blocker.summary,
-              nextAction: state.blocker.nextAction,
+              summary: progressBlocker.summary,
+              nextAction: progressBlocker.nextAction,
               actionLabel: "I'll take it",
-            }
-          : progressBlocker === undefined
-            ? null
-            : {
-                id: `${card.taskId}-progress-block`,
-                kind: "blocker" as const,
-                summary: progressBlocker.summary,
-                nextAction: progressBlocker.nextAction,
-                actionLabel: "I'll take it",
-              };
+            };
   return {
     id: card.taskId,
     projectId: state.intake.projectId,

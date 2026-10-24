@@ -1408,7 +1408,7 @@ describe("ai-os board route", () => {
     expect(models).toEqual(["gpt-5.4", "gpt-5.4"]);
   });
 
-  it("keeps findings and waits when the submitting session has no actual model", async () => {
+  it("allows rework and rejects acceptance when the submitting session has no actual model", async () => {
     const { runs, models } = sessionRuns({ requested: REVIEWER, actual: null });
     const { handler } = handlerFor(undefined, runs);
     await reachAssigned(handler);
@@ -1421,6 +1421,17 @@ describe("ai-os board route", () => {
     if (waiting?.state.phase !== "awaiting_qa") throw new Error("expected review");
     const revision = waiting.state.completion.artifactRevision;
     if (revision.type !== "git") throw new Error("expected the provider revision");
+    const rejected = await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
+      taskId: "task-demo",
+      title: "Demo task",
+      idempotencyKey: "qa-unknown-accept",
+      event: qaEvent(revision, "accept", REVIEWER),
+    });
+    expect(rejected.status).toBe(409);
+    expect(await rejected.json()).toMatchObject({
+      detail: expect.stringMatching(/actual model/),
+    });
+    expect(await phaseOfHandler(handler)).toBe("awaiting_qa");
     const reworked = await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
       taskId: "task-demo",
       title: "Demo task",
@@ -1429,24 +1440,10 @@ describe("ai-os board route", () => {
     });
     expect(reworked.status).toBe(200);
     const held = (await readCards(handler)).find((card) => card.taskId === "task-demo");
-    expect(held?.state.phase).toBe("qa_incomplete");
-    if (held?.state.phase !== "qa_incomplete") throw new Error("expected incomplete QA");
-    expect(held.state.qaLabel).toBe("Awaiting a verified reviewer");
-    expect(held.state.attemptedVerdict).toBe("rework");
-    expect(held.state.findings).toEqual([finding]);
+    expect(held?.state.phase).toBe("rework");
+    if (held?.state.phase !== "rework") throw new Error("expected rework");
+    expect(held.state.qa.findings).toEqual([finding]);
     expect(held.state.run.reviewerRuntime).toBeUndefined();
-    const accepted = await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
-      taskId: "task-demo",
-      title: "Demo task",
-      idempotencyKey: "qa-unknown-accept",
-      event: qaEvent(revision, "accept", REVIEWER),
-    });
-    expect(accepted.status).toBe(200);
-    const still = (await readCards(handler)).find((card) => card.taskId === "task-demo");
-    expect(still?.state.phase).toBe("qa_incomplete");
-    if (still?.state.phase !== "qa_incomplete") throw new Error("expected incomplete QA");
-    expect(still.state.attemptedVerdict).toBe("accept");
-    expect(still.state.findings).toEqual([finding]);
     expect(models).toEqual(["gpt-5.4"]);
   });
 
