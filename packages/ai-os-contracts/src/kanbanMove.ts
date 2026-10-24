@@ -2,6 +2,7 @@ import * as Effect from "effect/Effect";
 
 import { taskLinkFor } from "./common.ts";
 import { ContractTransitionError } from "./errors.ts";
+import { REWORK_CAP_LABEL } from "./reworkCap.ts";
 import {
   applySequenceEvent,
   initialSequenceState,
@@ -210,6 +211,12 @@ export const requestKanbanMove = (
         false,
         remember(request.ledger, request.idempotencyKey, request.column, request.taskId, state),
       ),
+    );
+  }
+
+  if (state.phase === "rework_capped") {
+    return Effect.succeed(
+      rejected(`${REWORK_CAP_LABEL}. Only Jim can resume this task.`, state, request.ledger),
     );
   }
 

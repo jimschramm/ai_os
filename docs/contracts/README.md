@@ -15,10 +15,11 @@ Request, assignment, execution, independent QA, rework, accepted result. Progres
 | idle             |         | intake                                                                                                                                        |
 | requested        |         | acknowledge                                                                                                                                   |
 | acknowledged     | Ready   | assign                                                                                                                                        |
-| assigned         | Ready   | start_execution, cancel, transfer_ownership                                                                                                   |
+| assigned         | Ready   | start_execution, cancel, transfer_ownership, open_attempt                                                                                     |
 | executing        | Running | submit_completion, lease_expired, report_progress, heartbeat, heartbeat_lapsed, report_usage, cancel, fail, operator_fail, transfer_ownership |
 | awaiting_qa      | Review  | qa, cancel                                                                                                                                    |
-| rework           | Ready   | start_execution, cancel                                                                                                                       |
+| rework           | Ready   | start_execution, cancel, open_attempt                                                                                                         |
+| rework_capped    | Blocked | resume_rework                                                                                                                                 |
 | accepted         | Done    | start_execution, deliver                                                                                                                      |
 | recovery_pending | Blocked | resolve_recovery                                                                                                                              |
 | failed           |         | retry                                                                                                                                         |
@@ -48,11 +49,13 @@ An open attempt has a generation and a lease id minted for that generation (`lea
 
 `QaVerdictV1` is one of:
 
-| Variant                     | Result                                                                                                                                 |
-| --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
-| `availability: unavailable` | Stays `awaiting_qa`. No verdict and no acceptance.                                                                                     |
-| `verdict: rework`           | Moves to `rework`. Findings are required. The reviewed revision is recorded.                                                           |
-| `verdict: accept`           | Moves to `accepted`. `acceptedRevision` must equal `artifactRevision`, and that revision must be the one in the completion submission. |
+| Variant                     | Result                                                                                                                                                                     |
+| --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `availability: unavailable` | Stays `awaiting_qa`. No verdict and no acceptance.                                                                                                                         |
+| `verdict: rework`           | Counts one round on the task. Moves to `rework`, or to `rework_capped` once three rounds are on the task. Findings are required. A capping verdict needs `recommendation`. |
+| `verdict: accept`           | Moves to `accepted`. `acceptedRevision` must equal `artifactRevision`, and that revision must be the one in the completion submission.                                     |
+
+Each rework verdict appends one round to the task's rework ledger: the completion's claimed outcome, the commit SHA when the revision is git, and the findings. The ledger is not on the attempt or the run. A new attempt id (`open_attempt`), a new generation, a handoff, a retry, recovery, and a reload all keep it. No event clears it. After three rounds the task is Blocked, labeled `Needs Jim: rework cap reached`. The notice carries the latest findings, every round, and the agent's recommendation. `start_execution` and a board launch are refused. `resume_rework` is the only way out, and only when `actorId` is `jim`. It records his decision and returns the task to `rework` without clearing the count, so the next rework stops again.
 
 QA's model name must differ from the assignment's implementer model name. A model is `{ provider?, model }`. Provider is attribution (`openai/gpt-5.4` and `azure/gpt-5.4` are the same model, and so is a bare `gpt-5.4`). The schema check and the transition both compare those canonical model names. The transition rejects a QA model name equal to the assigned implementer (`qa_same_model`) and a payload that names some other implementer model (`implementer_mismatch`). Acceptance compares canonical revisions, so a full git id matches regardless of case. An unavailable verdict cannot also carry an acceptance. There is no event that skips QA.
 
@@ -84,6 +87,8 @@ Control commands carry an idempotency key. That key is not a completion claim. T
 | `retry`              | failed                                   | `executing` at the next generation, until `retryCount` reaches `retryLimit` (3).    |
 | `transfer_ownership` | assigned, executing                      | The worker changes. An executing transfer also advances the generation.             |
 | `resolve_recovery`   | recovery_pending                         | `continue` returns to Ready, `cancel` leaves the board, `fail` records the blocker. |
+| `open_attempt`       | assigned, rework                         | Replaces the attempt id. The rework ledger stays.                                   |
+| `resume_rework`      | rework_capped                            | Jim only. Records his decision and returns to `rework`. The count stays.            |
 
 `recovery_pending` accepts no other event. An expired lease or a lapsed heartbeat does not become Ready on its own. A retry past the limit is `retry_limit_reached` and stays `failed`.
 
@@ -109,6 +114,8 @@ Invalid payloads fail schema decode. These transition errors are `ContractTransi
 | `invalid_payload`                     | The state, event, or result does not match its schema.                                                             |
 | `stale_generation`                    | A worker event names a generation or lease other than the open run.                                                |
 | `retry_limit_reached`                 | Retry was asked at the retry limit.                                                                                |
+| `rework_cap_reached`                  | Any event other than Jim's `resume_rework` while the rework cap holds, including an agent resume.                  |
+| `rework_cap_needs_recommendation`     | A rework verdict that would reach the cap has no recommendation.                                                   |
 | `idempotency_conflict`                | The idempotency key was already used for a different payload.                                                      |
 | `delivery_revision_mismatch`          | Delivery names a revision other than the accepted one.                                                             |
 | `delivery_origin_mismatch`            | A conversation delivery does not name the intake's originating conversation.                                       |

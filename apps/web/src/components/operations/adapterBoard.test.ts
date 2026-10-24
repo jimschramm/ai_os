@@ -1,15 +1,20 @@
 import { assert, it } from "@effect/vitest";
 import {
   applySequence,
+  applySequenceEvent,
   assignmentExample,
   intakeV2Example,
+  leaseIdFor,
+  REWORK_CAP_LABEL,
   taskLinkFor,
+  type SequenceState,
 } from "@t3tools/ai-os-contracts";
 import * as Effect from "effect/Effect";
 
 import { encodeAdapterBoard } from "@t3tools/ai-os-adapter/board";
 
 import { tasksForBoard } from "./adapterBoard";
+import { blockerReason, columnFor, needsYou, qaStatusLabel } from "./model";
 import {
   applyAdapterBoardPayload,
   readAdapterBoardSnapshot,
@@ -218,5 +223,70 @@ it.effect("shows a requested task with no assignment", () =>
     assert.strictEqual(shown[0]?.assignment, null);
     assert.strictEqual(shown[0]?.agent, "Unassigned");
     assert.strictEqual(shown[0]?.projectId, "usba");
+  }),
+);
+
+it.effect("puts a capped rework on Blocked and in Needs you", () =>
+  Effect.gen(function* () {
+    const taskId = "task-usba-page";
+    const attempt = `${taskId}-attempt-1`;
+    const sha = (n: number) => ({ type: "git" as const, sha: n.toString(16).padStart(40, "0") });
+    const finding = (n: number) => ({
+      defect: `Defect ${n}.`,
+      evidence: `Evidence ${n}.`,
+      expectedBehavior: `Expected ${n}.`,
+    });
+    let state: SequenceState = yield* assigned(taskId);
+    for (const round of [1, 2, 3]) {
+      if (state.phase !== "executing") {
+        state = yield* applySequenceEvent(state, { type: "start_execution" });
+      }
+      if (state.phase !== "executing") return yield* Effect.die("The round must be executing.");
+      state = yield* applySequenceEvent(state, {
+        type: "submit_completion",
+        completion: {
+          version: "v1",
+          taskId,
+          attemptId: attempt,
+          generation: state.run.generation,
+          leaseId: leaseIdFor(state.run.generation),
+          claimedOutcome: `Fix ${round}.`,
+          artifactRevision: sha(round),
+          evidence: [{ kind: "commit", ref: `commit-${round}` }],
+        },
+      });
+      state = yield* applySequenceEvent(state, {
+        type: "qa",
+        qa: {
+          version: "v1",
+          taskId,
+          attemptId: attempt,
+          availability: "available",
+          qaModel: "claude-sonnet-5",
+          implementerModel: "gpt-5.4",
+          verdict: "rework",
+          artifactRevision: sha(round),
+          findings: [finding(round)],
+          ...(round === 3 ? { recommendation: "Ask Jim before another fix." } : {}),
+        },
+      });
+    }
+    const shown = tasksForBoard(undefined, [
+      {
+        taskId,
+        title: "Tournament page",
+        state,
+        threadId: "t3-thread-1",
+        updatedAt: at,
+      },
+    ]);
+    const task = shown[0];
+    assert.strictEqual(task?.phase, "rework_capped");
+    assert.strictEqual(columnFor(task!), "Blocked");
+    assert.strictEqual(qaStatusLabel(task!), REWORK_CAP_LABEL);
+    assert.strictEqual(blockerReason(task!), REWORK_CAP_LABEL);
+    assert.strictEqual(needsYou(shown)[0]?.nextAction, "Ask Jim before another fix.");
+    assert.strictEqual(task?.reworkCap?.attemptedFixes.length, 3);
+    assert.strictEqual(task?.reworkCap?.remainingIssue[0]?.defect, "Defect 3.");
   }),
 );

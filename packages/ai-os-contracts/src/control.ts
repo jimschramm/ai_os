@@ -2,7 +2,7 @@ import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 
 import { fingerprintOf, PayloadFingerprint } from "./canonical.ts";
-import { ContractId, strictParse } from "./common.ts";
+import { ContractId, ContractText, strictParse } from "./common.ts";
 import { ContractTransitionError, type ContractErrorReason, type SequencePhase } from "./errors.ts";
 import { BlockerV1 } from "./progress.ts";
 
@@ -53,6 +53,21 @@ export const OperatorFailCommandV1 = Schema.Struct({
 });
 export type OperatorFailCommandV1 = typeof OperatorFailCommandV1.Type;
 
+export const ResumeReworkCommandV1 = Schema.Struct({
+  command: Schema.Literal("resume_rework"),
+  ...controlFields,
+  actorId: ContractId,
+  decision: ContractText,
+});
+export type ResumeReworkCommandV1 = typeof ResumeReworkCommandV1.Type;
+
+export const OpenAttemptCommandV1 = Schema.Struct({
+  command: Schema.Literal("open_attempt"),
+  ...controlFields,
+  nextAttemptId: ContractId,
+});
+export type OpenAttemptCommandV1 = typeof OpenAttemptCommandV1.Type;
+
 export const ResolveRecoveryCommandV1 = Schema.Union([
   Schema.Struct({
     command: Schema.Literal("resolve_recovery"),
@@ -80,6 +95,8 @@ export const ControlCommandV1 = Schema.Union([
   TransferOwnershipCommandV1,
   OperatorFailCommandV1,
   ResolveRecoveryCommandV1,
+  ResumeReworkCommandV1,
+  OpenAttemptCommandV1,
 ]);
 export type ControlCommandV1 = typeof ControlCommandV1.Type;
 

@@ -9,8 +9,10 @@ import {
   ContinueCommandV1,
   type ControlCommandV1,
   DEFAULT_RETRY_LIMIT,
+  OpenAttemptCommandV1,
   OperatorFailCommandV1,
   ResolveRecoveryCommandV1,
+  ResumeReworkCommandV1,
   RetryCommandV1,
   TransferOwnershipCommandV1,
   commandFingerprint,
@@ -47,6 +49,15 @@ import {
   WorkerFailV1,
 } from "./progress.ts";
 import { QaAcceptV1, QaReworkV1, QaUnavailableV1, QaVerdictV1 } from "./qa.ts";
+import {
+  JIM_ACTOR_ID,
+  REWORK_CAP,
+  REWORK_CAP_LABEL,
+  ReworkCapNoticeV1,
+  ReworkLedgerV1,
+  reworkCapAllowsWork,
+  reworkCapNoticeMatches,
+} from "./reworkCap.ts";
 import { UsageMeasurementV1 } from "./usage.ts";
 
 export const KanbanColumn = Schema.Literals([
@@ -92,6 +103,8 @@ export const SequenceEvent = Schema.Union([
   Schema.Struct({ type: Schema.Literal("fail"), failure: WorkerFailV1 }),
   Schema.Struct({ type: Schema.Literal("operator_fail"), command: OperatorFailCommandV1 }),
   Schema.Struct({ type: Schema.Literal("resolve_recovery"), command: ResolveRecoveryCommandV1 }),
+  Schema.Struct({ type: Schema.Literal("resume_rework"), command: ResumeReworkCommandV1 }),
+  Schema.Struct({ type: Schema.Literal("open_attempt"), command: OpenAttemptCommandV1 }),
   Schema.Struct({ type: Schema.Literal("deliver"), delivery: ResultDeliveryV1 }),
 ]);
 export type SequenceEvent = typeof SequenceEvent.Type;
@@ -150,6 +163,10 @@ const workerRecordMatchesRun = (
   record.generation === run.generation && record.leaseId === run.leaseId
     ? true
     : "Stored worker data must name the current generation and lease.";
+
+const untilJim = Schema.makeFilter((state: { readonly reworkLedger: ReworkLedgerV1 }) =>
+  reworkCapAllowsWork(state.reworkLedger),
+);
 
 const reviewedRevision = (
   completion: CompletionSubmissionV1,
@@ -220,6 +237,7 @@ export const AssignedState = Schema.Struct({
   acknowledgment: IntakeAcknowledgmentV1,
   assignment: AssignmentV1,
   reworkRevision: Schema.NullOr(ArtifactRevisionV1),
+  reworkLedger: ReworkLedgerV1,
   heldRun: Schema.NullOr(RunV1),
   commands: Schema.Array(AppliedCommandV1),
   nextGeneration: PositiveInt,
@@ -234,6 +252,7 @@ export const AssignedState = Schema.Struct({
     }
     return true;
   }),
+  untilJim,
 );
 export type AssignedState = typeof AssignedState.Type;
 
@@ -243,9 +262,13 @@ export const ExecutingState = Schema.Struct({
   acknowledgment: IntakeAcknowledgmentV1,
   assignment: AssignmentV1,
   reworkRevision: Schema.NullOr(ArtifactRevisionV1),
+  reworkLedger: ReworkLedgerV1,
   run: RunV1,
   commands: Schema.Array(AppliedCommandV1),
-}).check(Schema.makeFilter((state) => assignedTo(state.acknowledgment, state.assignment)));
+}).check(
+  Schema.makeFilter((state) => assignedTo(state.acknowledgment, state.assignment)),
+  untilJim,
+);
 export type ExecutingState = typeof ExecutingState.Type;
 
 export const AwaitingQaState = Schema.Struct({
@@ -256,6 +279,7 @@ export const AwaitingQaState = Schema.Struct({
   completion: CompletionSubmissionV1,
   qa: Schema.NullOr(QaUnavailableV1),
   reworkRevision: Schema.NullOr(ArtifactRevisionV1),
+  reworkLedger: ReworkLedgerV1,
   run: RunV1,
   commands: Schema.Array(AppliedCommandV1),
 }).check(
@@ -278,6 +302,7 @@ export const AwaitingQaState = Schema.Struct({
     }
     return workerRecordMatchesRun(state.run, state.completion);
   }),
+  untilJim,
 );
 export type AwaitingQaState = typeof AwaitingQaState.Type;
 
@@ -289,6 +314,7 @@ export const ReworkState = Schema.Struct({
   completion: CompletionSubmissionV1,
   qa: QaReworkV1,
   reworkRevision: ArtifactRevisionV1,
+  reworkLedger: ReworkLedgerV1,
   run: RunV1,
   commands: Schema.Array(AppliedCommandV1),
 }).check(
@@ -311,8 +337,55 @@ export const ReworkState = Schema.Struct({
     const current = workerRecordMatchesRun(state.run, state.completion);
     return current === true ? reviewedRevision(state.completion, state.qa, null) : current;
   }),
+  untilJim,
 );
 export type ReworkState = typeof ReworkState.Type;
+
+export const ReworkCappedState = Schema.Struct({
+  phase: Schema.Literal("rework_capped"),
+  intake: Intake,
+  acknowledgment: IntakeAcknowledgmentV1,
+  assignment: AssignmentV1,
+  completion: CompletionSubmissionV1,
+  qa: QaReworkV1,
+  reworkRevision: ArtifactRevisionV1,
+  reworkLedger: ReworkLedgerV1,
+  notice: ReworkCapNoticeV1,
+  run: RunV1,
+  commands: Schema.Array(AppliedCommandV1),
+}).check(
+  Schema.makeFilter((state) => {
+    const match = payloadMatches(state.acknowledgment, state.assignment, state.completion);
+    if (match !== true) {
+      return match;
+    }
+    const qaMatch = payloadMatches(state.acknowledgment, state.assignment, state.qa);
+    if (qaMatch !== true) {
+      return qaMatch;
+    }
+    const models = independentQa(state.assignment, state.qa);
+    if (models !== true) {
+      return models;
+    }
+    if (!sameRevision(state.qa.artifactRevision, state.reworkRevision)) {
+      return "Rework records the revision that was reviewed.";
+    }
+    const current = workerRecordMatchesRun(state.run, state.completion);
+    if (current !== true) {
+      return current;
+    }
+    const reviewed = reviewedRevision(state.completion, state.qa, null);
+    if (reviewed !== true) {
+      return reviewed;
+    }
+    return reworkCapNoticeMatches({
+      ledger: state.reworkLedger,
+      notice: state.notice,
+      recommendation: state.qa.recommendation,
+    });
+  }),
+);
+export type ReworkCappedState = typeof ReworkCappedState.Type;
 
 export const AcceptedState = Schema.Struct({
   phase: Schema.Literal("accepted"),
@@ -321,6 +394,7 @@ export const AcceptedState = Schema.Struct({
   assignment: AssignmentV1,
   completion: CompletionSubmissionV1,
   qa: QaAcceptV1,
+  reworkLedger: ReworkLedgerV1,
   run: RunV1,
   commands: Schema.Array(AppliedCommandV1),
   deliveries: Schema.Array(DeliveryAckV1),
@@ -344,6 +418,7 @@ export const AcceptedState = Schema.Struct({
     const current = workerRecordMatchesRun(state.run, state.completion);
     return current === true ? reviewedRevision(state.completion, state.qa, null) : current;
   }),
+  untilJim,
 );
 export type AcceptedState = typeof AcceptedState.Type;
 
@@ -353,10 +428,14 @@ export const RecoveryPendingState = Schema.Struct({
   acknowledgment: IntakeAcknowledgmentV1,
   assignment: AssignmentV1,
   reworkRevision: Schema.NullOr(ArtifactRevisionV1),
+  reworkLedger: ReworkLedgerV1,
   recoveryLabel: Schema.Literal(RECOVERY_PENDING_LABEL),
   run: RunV1,
   commands: Schema.Array(AppliedCommandV1),
-}).check(Schema.makeFilter((state) => assignedTo(state.acknowledgment, state.assignment)));
+}).check(
+  Schema.makeFilter((state) => assignedTo(state.acknowledgment, state.assignment)),
+  untilJim,
+);
 export type RecoveryPendingState = typeof RecoveryPendingState.Type;
 
 export const FailedState = Schema.Struct({
@@ -365,10 +444,14 @@ export const FailedState = Schema.Struct({
   acknowledgment: IntakeAcknowledgmentV1,
   assignment: AssignmentV1,
   reworkRevision: Schema.NullOr(ArtifactRevisionV1),
+  reworkLedger: ReworkLedgerV1,
   run: RunV1,
   commands: Schema.Array(AppliedCommandV1),
   blocker: BlockerV1,
-}).check(Schema.makeFilter((state) => assignedTo(state.acknowledgment, state.assignment)));
+}).check(
+  Schema.makeFilter((state) => assignedTo(state.acknowledgment, state.assignment)),
+  untilJim,
+);
 export type FailedState = typeof FailedState.Type;
 
 export const CancelledState = Schema.Struct({
@@ -377,10 +460,14 @@ export const CancelledState = Schema.Struct({
   acknowledgment: IntakeAcknowledgmentV1,
   assignment: AssignmentV1,
   reworkRevision: Schema.NullOr(ArtifactRevisionV1),
+  reworkLedger: ReworkLedgerV1,
   run: Schema.NullOr(RunV1),
   commands: Schema.Array(AppliedCommandV1),
   nextGeneration: PositiveInt,
-}).check(Schema.makeFilter((state) => assignedTo(state.acknowledgment, state.assignment)));
+}).check(
+  Schema.makeFilter((state) => assignedTo(state.acknowledgment, state.assignment)),
+  untilJim,
+);
 export type CancelledState = typeof CancelledState.Type;
 
 export const SequenceState = Schema.Union([
@@ -391,6 +478,7 @@ export const SequenceState = Schema.Union([
   ExecutingState,
   AwaitingQaState,
   ReworkState,
+  ReworkCappedState,
   AcceptedState,
   RecoveryPendingState,
   FailedState,
@@ -402,7 +490,7 @@ export const LEGAL_EVENTS = {
   idle: ["intake"],
   requested: ["acknowledge"],
   acknowledged: ["assign"],
-  assigned: ["start_execution", "cancel", "transfer_ownership"],
+  assigned: ["start_execution", "cancel", "transfer_ownership", "open_attempt"],
   executing: [
     "submit_completion",
     "lease_expired",
@@ -416,7 +504,8 @@ export const LEGAL_EVENTS = {
     "transfer_ownership",
   ],
   awaiting_qa: ["qa", "cancel"],
-  rework: ["start_execution", "cancel"],
+  rework: ["start_execution", "cancel", "open_attempt"],
+  rework_capped: ["resume_rework"],
   accepted: ["start_execution", "deliver"],
   recovery_pending: ["resolve_recovery"],
   failed: ["retry"],
@@ -436,6 +525,8 @@ export const kanbanColumn = (phase: SequencePhase): KanbanColumn | null => {
     case "assigned":
     case "rework":
       return "Ready";
+    case "rework_capped":
+      return "Blocked";
     case "executing":
       return "Running";
     case "recovery_pending":
@@ -474,6 +565,8 @@ const contractFor = (event: SequenceEvent): ContractName => {
     case "transfer_ownership":
     case "operator_fail":
     case "resolve_recovery":
+    case "resume_rework":
+    case "open_attempt":
       return "control";
     case "deliver":
       return "delivery";
@@ -554,6 +647,7 @@ const applyAssign = (
       acknowledgment: state.acknowledgment,
       assignment: freezeSnapshot(event.assignment),
       reworkRevision: null,
+      reworkLedger: { rounds: [], decisions: [] },
       heldRun: null,
       commands: [],
       nextGeneration: 1,
@@ -571,6 +665,7 @@ const applyStart = (
       acknowledgment: state.acknowledgment,
       assignment: state.assignment,
       reworkRevision: state.reworkRevision,
+      reworkLedger: state.reworkLedger,
       run: freshRun(state.nextGeneration, state.heldRun ?? undefined),
       commands: state.commands,
     });
@@ -582,6 +677,7 @@ const applyStart = (
       acknowledgment: state.acknowledgment,
       assignment: state.assignment,
       reworkRevision: null,
+      reworkLedger: state.reworkLedger,
       run: freshRun(state.run.generation + 1, state.run),
       commands: state.commands,
     });
@@ -593,6 +689,7 @@ const applyStart = (
       acknowledgment: state.acknowledgment,
       assignment: state.assignment,
       reworkRevision: state.reworkRevision,
+      reworkLedger: state.reworkLedger,
       run: freshRun(state.run.generation + 1, state.run),
       commands: state.commands,
     });
@@ -621,6 +718,7 @@ const applyLeaseExpired = (
       acknowledgment: state.acknowledgment,
       assignment: state.assignment,
       reworkRevision: state.reworkRevision,
+      reworkLedger: state.reworkLedger,
       recoveryLabel: RECOVERY_PENDING_LABEL,
       run: state.run,
       commands: state.commands,
@@ -676,6 +774,7 @@ const applyCompletion = (
       completion: event.completion,
       qa: null,
       reworkRevision: state.reworkRevision,
+      reworkLedger: state.reworkLedger,
       run: state.run,
       commands: state.commands,
     };
@@ -723,6 +822,7 @@ const applyQa = (
         completion: state.completion,
         qa,
         reworkRevision: state.reworkRevision,
+        reworkLedger: state.reworkLedger,
         run: state.run,
         commands: state.commands,
       };
@@ -760,6 +860,45 @@ const applyQa = (
       );
     }
     if (qa.verdict === "rework") {
+      const round = {
+        round: state.reworkLedger.rounds.length + 1,
+        summary: state.completion.claimedOutcome,
+        commitSha: qa.artifactRevision.type === "git" ? qa.artifactRevision.sha : null,
+        findings: qa.findings,
+      };
+      const reworkLedger = {
+        rounds: [...state.reworkLedger.rounds, round],
+        decisions: state.reworkLedger.decisions,
+      };
+      const [firstRound, ...earlierRounds] = reworkLedger.rounds;
+      if (firstRound !== undefined && reworkLedger.rounds.length >= REWORK_CAP) {
+        if (qa.recommendation === undefined) {
+          return yield* reject(
+            state,
+            event,
+            "rework_cap_needs_recommendation",
+            "A rework that reaches the cap needs a recommendation for Jim.",
+          );
+        }
+        return {
+          phase: "rework_capped" as const,
+          intake: state.intake,
+          acknowledgment: state.acknowledgment,
+          assignment: state.assignment,
+          completion: state.completion,
+          qa,
+          reworkRevision: qa.artifactRevision,
+          reworkLedger,
+          notice: {
+            label: REWORK_CAP_LABEL,
+            remainingIssue: qa.findings,
+            attemptedFixes: [firstRound, ...earlierRounds],
+            recommendation: qa.recommendation,
+          },
+          run: state.run,
+          commands: state.commands,
+        };
+      }
       return {
         phase: "rework" as const,
         intake: state.intake,
@@ -768,6 +907,7 @@ const applyQa = (
         completion: state.completion,
         qa,
         reworkRevision: qa.artifactRevision,
+        reworkLedger,
         run: state.run,
         commands: state.commands,
       };
@@ -779,6 +919,7 @@ const applyQa = (
       assignment: state.assignment,
       completion: state.completion,
       qa,
+      reworkLedger: state.reworkLedger,
       run: state.run,
       commands: state.commands,
       deliveries: [],
@@ -793,6 +934,8 @@ const controlCommandOf = (event: SequenceEvent): ControlCommandV1 | null => {
     case "transfer_ownership":
     case "operator_fail":
     case "resolve_recovery":
+    case "resume_rework":
+    case "open_attempt":
       return event.command;
     default:
       return null;
@@ -938,6 +1081,7 @@ const applyHeartbeatLapse = (
       acknowledgment: state.acknowledgment,
       assignment: state.assignment,
       reworkRevision: state.reworkRevision,
+      reworkLedger: state.reworkLedger,
       recoveryLabel: RECOVERY_PENDING_LABEL,
       run: state.run,
       commands: state.commands,
@@ -1000,6 +1144,7 @@ const applyCancel = (
         acknowledgment: state.acknowledgment,
         assignment: state.assignment,
         reworkRevision: state.reworkRevision,
+        reworkLedger: state.reworkLedger,
         run: state.heldRun,
         commands,
         nextGeneration: state.nextGeneration,
@@ -1011,6 +1156,7 @@ const applyCancel = (
       acknowledgment: state.acknowledgment,
       assignment: state.assignment,
       reworkRevision: state.reworkRevision,
+      reworkLedger: state.reworkLedger,
       run: state.run,
       commands,
       nextGeneration: state.run.generation + 1,
@@ -1038,6 +1184,7 @@ const applyContinue = (
       acknowledgment: state.acknowledgment,
       assignment: state.assignment,
       reworkRevision: state.reworkRevision,
+      reworkLedger: state.reworkLedger,
       heldRun: state.run,
       commands,
       nextGeneration: state.nextGeneration,
@@ -1068,6 +1215,7 @@ const applyRetry = (
       acknowledgment: state.acknowledgment,
       assignment: state.assignment,
       reworkRevision: state.reworkRevision,
+      reworkLedger: state.reworkLedger,
       run: freshRun(state.run.generation + 1, {
         ...state.run,
         retryCount: state.run.retryCount + 1,
@@ -1119,6 +1267,7 @@ const applyFail = (
       acknowledgment: state.acknowledgment,
       assignment: state.assignment,
       reworkRevision: state.reworkRevision,
+      reworkLedger: state.reworkLedger,
       run: state.run,
       commands: state.commands,
       blocker: event.failure.blocker,
@@ -1146,6 +1295,7 @@ const applyOperatorFail = (
       acknowledgment: state.acknowledgment,
       assignment: state.assignment,
       reworkRevision: state.reworkRevision,
+      reworkLedger: state.reworkLedger,
       run: state.run,
       commands,
       blocker: event.command.blocker,
@@ -1174,6 +1324,7 @@ const applyResolveRecovery = (
         acknowledgment: state.acknowledgment,
         assignment: state.assignment,
         reworkRevision: state.reworkRevision,
+        reworkLedger: state.reworkLedger,
         heldRun: state.run,
         commands,
         nextGeneration: state.run.generation + 1,
@@ -1186,6 +1337,7 @@ const applyResolveRecovery = (
         acknowledgment: state.acknowledgment,
         assignment: state.assignment,
         reworkRevision: state.reworkRevision,
+        reworkLedger: state.reworkLedger,
         run: state.run,
         commands,
         nextGeneration: state.run.generation + 1,
@@ -1197,9 +1349,105 @@ const applyResolveRecovery = (
       acknowledgment: state.acknowledgment,
       assignment: state.assignment,
       reworkRevision: state.reworkRevision,
+      reworkLedger: state.reworkLedger,
       run: state.run,
       commands,
       blocker: event.command.blocker,
+    };
+  });
+
+const retargetProgress = <T extends { readonly attemptId: string }>(
+  record: T,
+  attemptId: string,
+): T => (record.attemptId === attemptId ? record : { ...record, attemptId });
+
+const applyResume = (
+  state: SequenceState,
+  event: Extract<SequenceEvent, { type: "resume_rework" }>,
+): Effect.Effect<SequenceState, ContractTransitionError> =>
+  Effect.gen(function* () {
+    if (state.phase !== "rework_capped") {
+      return yield* reject(
+        state,
+        event,
+        "illegal_transition",
+        `Cannot resume_rework from ${state.phase}.`,
+      );
+    }
+    yield* matchesWork(state, event, event.command);
+    if (event.command.actorId !== JIM_ACTOR_ID) {
+      return yield* reject(
+        state,
+        event,
+        "rework_cap_reached",
+        "Only Jim can resume a task that reached the rework cap.",
+      );
+    }
+    const commands = yield* withCommand(state, event, event.command);
+    return {
+      phase: "rework" as const,
+      intake: state.intake,
+      acknowledgment: state.acknowledgment,
+      assignment: state.assignment,
+      completion: state.completion,
+      qa: state.qa,
+      reworkRevision: state.reworkRevision,
+      reworkLedger: {
+        rounds: state.reworkLedger.rounds,
+        decisions: [
+          ...state.reworkLedger.decisions,
+          {
+            actorId: JIM_ACTOR_ID,
+            decision: event.command.decision,
+            reworkRounds: state.reworkLedger.rounds.length,
+          },
+        ],
+      },
+      run: state.run,
+      commands,
+    };
+  });
+
+const applyOpenAttempt = (
+  state: SequenceState,
+  event: Extract<SequenceEvent, { type: "open_attempt" }>,
+): Effect.Effect<SequenceState, ContractTransitionError> =>
+  Effect.gen(function* () {
+    if (state.phase !== "assigned" && state.phase !== "rework") {
+      return yield* reject(
+        state,
+        event,
+        "illegal_transition",
+        `Cannot open_attempt from ${state.phase}.`,
+      );
+    }
+    yield* matchesWork(state, event, event.command);
+    const commands = yield* withCommand(state, event, event.command);
+    const attemptId = event.command.nextAttemptId;
+    const assignment = freezeSnapshot({ ...state.assignment, attemptId });
+    if (state.phase === "assigned") {
+      const heldRun = state.heldRun;
+      return {
+        ...state,
+        assignment,
+        commands,
+        heldRun:
+          heldRun?.progress == null
+            ? heldRun
+            : { ...heldRun, progress: retargetProgress(heldRun.progress, attemptId) },
+      };
+    }
+    const progress = state.run.progress;
+    return {
+      ...state,
+      assignment,
+      commands,
+      completion: retargetProgress(state.completion, attemptId),
+      qa: retargetProgress(state.qa, attemptId),
+      run:
+        progress === null
+          ? state.run
+          : { ...state.run, progress: retargetProgress(progress, attemptId) },
     };
   });
 
@@ -1284,6 +1532,14 @@ const transition = (
         `${RECOVERY_PENDING_LABEL}. An expired lease does not return to Ready.`,
       );
     }
+    if (state.phase === "rework_capped" && event.type !== "resume_rework") {
+      return yield* reject(
+        state,
+        event,
+        "rework_cap_reached",
+        `${REWORK_CAP_LABEL}. No further rework or implementation is dispatched.`,
+      );
+    }
     if (event.type === "acknowledge" && state.phase === "idle") {
       return yield* reject(
         state,
@@ -1337,6 +1593,10 @@ const transition = (
         return yield* applyOperatorFail(state, event);
       case "resolve_recovery":
         return yield* applyResolveRecovery(state, event);
+      case "resume_rework":
+        return yield* applyResume(state, event);
+      case "open_attempt":
+        return yield* applyOpenAttempt(state, event);
       case "deliver":
         return yield* applyDeliver(state, event);
     }
@@ -1350,6 +1610,7 @@ const PHASES = [
   "executing",
   "awaiting_qa",
   "rework",
+  "rework_capped",
   "accepted",
   "recovery_pending",
   "failed",
@@ -1401,6 +1662,8 @@ const contractNameOf = (value: unknown): ContractName => {
     case "transfer_ownership":
     case "operator_fail":
     case "resolve_recovery":
+    case "resume_rework":
+    case "open_attempt":
       return "control";
     case "fail":
       return "sequence";

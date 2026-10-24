@@ -56,6 +56,7 @@ export const QaReworkV1 = Schema.Struct({
   verdict: Schema.Literal("rework"),
   artifactRevision: ArtifactRevisionV1,
   findings: Schema.NonEmptyArray(QaFindingV1),
+  recommendation: Schema.optionalKey(ContractText),
 }).check(differentModel);
 export type QaReworkV1 = typeof QaReworkV1.Type;
 

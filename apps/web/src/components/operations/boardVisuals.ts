@@ -201,6 +201,8 @@ export function progressIndex(phase: SequencePhase): {
       return { index: 3, stalled: false };
     case "rework":
       return { index: 4, stalled: false };
+    case "rework_capped":
+      return { index: 4, stalled: true };
     case "accepted":
       return { index: 5, stalled: false };
     case "failed":
@@ -218,6 +220,7 @@ const PROGRESS_PERCENT = {
   recovery_pending: 48,
   awaiting_qa: 80,
   rework: 62,
+  rework_capped: 48,
   accepted: 100,
   failed: 48,
   cancelled: 20,

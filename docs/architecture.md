@@ -199,6 +199,7 @@ Reliability rules:
 - Idempotent operations.
 - Live authorization checks.
 - Bounded retries.
+- Rework cap: three QA rework rounds are recorded on the task. The task then stops on Blocked as "Needs Jim: rework cap reached" until Jim resumes. A new attempt does not clear the count.
 - `recovery_pending`: an expired lease becomes Blocked, labeled "Execution status unknown", and never returns to Ready on its own.
 
 A maintainer agent handles platform health, with independent QA and an external recovery path for when the maintainer itself is down. Operations cover backups, restore, updates, diagnostics, and docs.
