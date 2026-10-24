@@ -329,7 +329,18 @@ const planSubmission = (ledger: MemoryLedgerV1, submission: SubmissionV1): Publi
       facts.push(item);
       continue;
     }
+    // The same text is already accepted only when the author named the current
+    // revision. A stale revision is an open conflict, and the proposal is kept.
     if (currentFact.body === item.fact.body) {
+      const namedStaleRevision = stale.some((expected) => {
+        const named = ledger.revisions.find((revision) => revision.factId === expected.factId);
+        return named?.identity === item.identity && named.projectId === submission.projectId;
+      });
+      if (!namedStaleRevision) {
+        continue;
+      }
+      conflicts.push({ accepted: current, proposed: item });
+      facts.push(item);
       continue;
     }
     const expected = submission.expectedVersions.find(

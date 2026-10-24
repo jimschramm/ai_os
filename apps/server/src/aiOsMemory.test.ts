@@ -109,9 +109,9 @@ it.effect("publishes a fact and its relationship in one committed batch", () =>
     reopened.exec("BEGIN IMMEDIATE");
     reopened
       .prepare(
-        "INSERT INTO ai_os_memory_event (idempotency_key, submission_id, project_id, outcome, ledger_json, receipt_json) VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO ai_os_memory_event (idempotency_key, submission_id, project_id, outcome, receipt_json) VALUES (?, ?, ?, ?, ?)",
       )
-      .run("rolled-back", "rolled-back", "probe", "pending", "{}", "{}");
+      .run("rolled-back", "rolled-back", "probe", "pending", "{}");
     reopened.exec("ROLLBACK");
     reopened.close();
 
@@ -243,6 +243,151 @@ it.effect("keeps the accepted decision when two writers race", () =>
     }
     assert.strictEqual(bodies.has(winner.body), true);
     assert.ok(ledger.conflicts.some((conflict) => conflict.resolvedBySubmissionId === null));
+    checked.close();
+    NodeFS.rmSync(NodePath.dirname(file), { recursive: true, force: true });
+  }),
+);
+
+const decision = (
+  id: string,
+  body: string,
+  intent: "propose" | "accept",
+  expectedFactId: string | null,
+) => ({
+  version: "v1" as const,
+  submissionId: `submission-${id}`,
+  idempotencyKey: `key-${id}`,
+  projectId: "probe",
+  authorId: intent === "accept" ? authority : "codex-t3",
+  taskId: "task-probe",
+  attemptId: "attempt-1",
+  evidence: [{ evidenceId: `evidence-${id}`, note: "Throwaway probe evidence." }],
+  expectedVersions: expectedFactId === null ? [] : [{ factId: expectedFactId, revision: 1 }],
+  intent,
+  facts: [
+    {
+      identity: "tournament-start",
+      fact: {
+        acceptance: "proposed" as const,
+        factId: `fact-${id}`,
+        projectId: "probe",
+        kind: "Decision" as const,
+        body,
+        provenance: { actorId: intent === "accept" ? authority : "codex-t3", at },
+        validity: { from: at, until: null },
+      },
+    },
+  ],
+  relationships: [] as [],
+});
+
+it.effect("records a conflict when the text matches but the expected revision is stale", () =>
+  Effect.gen(function* () {
+    const file = temporaryFile();
+    const database = openMemoryDatabase(file);
+    yield* submitMemory(
+      database,
+      decision("rev1", "Saturday games start at 7:00.", "accept", null),
+      authority,
+    );
+    const replaced = yield* submitMemory(
+      database,
+      decision("rev2", "Saturday games start at 8:30.", "accept", "fact-rev1"),
+      authority,
+    );
+    assert.strictEqual(replaced.outcome, "accepted");
+    const receipt = yield* submitMemory(
+      database,
+      decision("stale", "Saturday games start at 8:30.", "propose", "fact-rev1"),
+      authority,
+    );
+    assert.strictEqual(receipt.outcome, "conflict");
+    database.close();
+
+    const reopened = openMemoryDatabase(file);
+    const ledger = readMemoryLedger(reopened);
+    const stored = ledger.receipts.find((item) => item.submissionId === "submission-stale");
+    const conflict = ledger.conflicts.find((item) => item.submissionId === "submission-stale");
+    assert.strictEqual(stored?.outcome, "conflict");
+    assert.strictEqual(conflict?.authorId, "codex-t3");
+    assert.strictEqual(conflict?.acceptedFactId, "fact-rev2");
+    assert.strictEqual(conflict?.proposedFactId, "fact-stale");
+    assert.strictEqual(conflict?.resolvedBySubmissionId, null);
+    assert.strictEqual(
+      ledger.graph.facts.find((fact) => fact.factId === "fact-rev2")?.acceptance,
+      "accepted",
+    );
+    assert.strictEqual(
+      ledger.graph.facts.find((fact) => fact.factId === "fact-rev2")?.body,
+      "Saturday games start at 8:30.",
+    );
+    reopened.close();
+    NodeFS.rmSync(NodePath.dirname(file), { recursive: true, force: true });
+  }),
+);
+
+it.effect("persists two concurrent submissions", () =>
+  Effect.gen(function* () {
+    const file = temporaryFile();
+    const prepared = openMemoryDatabase(file);
+    prepared.close();
+    const moduleUrl = NodeURL.pathToFileURL(
+      NodePath.join(import.meta.dirname, "aiOsMemory.ts"),
+    ).href;
+    const run = (id: string, body: string) =>
+      new Promise<string>((resolve, reject) => {
+        const worker = new NodeWorkerThreads.Worker(
+          `
+            const { parentPort, workerData } = require("node:worker_threads");
+            import(workerData.moduleUrl).then((memory) => {
+              const database = memory.openMemoryDatabase(workerData.file);
+              try {
+                const receipt = memory.submitMemorySync(database, workerData.submission, workerData.authority);
+                parentPort.postMessage({ outcome: receipt.outcome });
+              } finally {
+                database.close();
+              }
+            }).catch((error) => {
+              parentPort.postMessage({ error: String(error && error.stack ? error.stack : error) });
+            });
+          `,
+          {
+            eval: true,
+            execArgv: ["--experimental-strip-types"],
+            workerData: {
+              moduleUrl,
+              file,
+              authority,
+              submission: submission(id, body),
+            },
+          },
+        );
+        worker.once("message", (message: { outcome?: string; error?: string }) => {
+          if (message.error !== undefined) {
+            reject(new Error(message.error));
+            return;
+          }
+          resolve(message.outcome ?? "");
+        });
+        worker.once("error", reject);
+      });
+    const outcomes = yield* Effect.promise(() =>
+      Promise.all([run("one", "Finding one."), run("two", "Finding two.")]),
+    );
+    assert.deepStrictEqual(outcomes.slice().sort(), ["pending", "pending"]);
+    const checked = openMemoryDatabase(file);
+    const ledger = readMemoryLedger(checked);
+    const ids = new Set(ledger.receipts.map((item) => item.submissionId));
+    assert.strictEqual(ids.has("submission-one"), true);
+    assert.strictEqual(ids.has("submission-two"), true);
+    const events = checked.prepare("SELECT COUNT(*) AS count FROM ai_os_memory_event").get() as {
+      count: number;
+    };
+    const snapshots = checked
+      .prepare("SELECT COUNT(*) AS count FROM ai_os_memory_snapshot")
+      .get() as { count: number };
+    assert.strictEqual(events.count, 2);
+    assert.strictEqual(snapshots.count, 1);
     checked.close();
     NodeFS.rmSync(NodePath.dirname(file), { recursive: true, force: true });
   }),

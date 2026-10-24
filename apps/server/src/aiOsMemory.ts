@@ -27,6 +27,8 @@ import * as Schema from "effect/Schema";
  * is not copied into TAM's knowledge rows, so a TAM save cannot retire it.
  * The path does not call TAM's quality gate or contradiction detector, so it
  * does not need the ollama provider configured on a personal install.
+ * Event rows store the receipt. The current ledger is one snapshot row,
+ * replaced in the same transaction.
  */
 const SCHEMA = `
   CREATE TABLE IF NOT EXISTS ai_os_memory_event (
@@ -35,8 +37,11 @@ const SCHEMA = `
     submission_id TEXT NOT NULL UNIQUE,
     project_id TEXT NOT NULL,
     outcome TEXT NOT NULL,
-    ledger_json TEXT NOT NULL,
     receipt_json TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS ai_os_memory_snapshot (
+    id INTEGER PRIMARY KEY,
+    ledger_json TEXT NOT NULL
   );
 `;
 
@@ -65,7 +70,7 @@ const isConstraint = (error: unknown): boolean =>
 
 const readLedger = (database: NodeSqlite.DatabaseSync): MemoryLedgerV1 => {
   const row = database
-    .prepare("SELECT ledger_json FROM ai_os_memory_event ORDER BY seq DESC LIMIT 1")
+    .prepare("SELECT ledger_json FROM ai_os_memory_snapshot WHERE id = 1")
     .get() as { ledger_json?: string } | undefined;
   if (row?.ledger_json === undefined) {
     return initialMemoryLedger;
@@ -100,8 +105,7 @@ export const readMemoryLedger = (database: NodeSqlite.DatabaseSync): MemoryLedge
 
 /**
  * One immediate transaction. A rejected or duplicate submission writes nothing.
- * A pending, accepted, or conflict submission writes one row that holds the
- * facts and relationships of that batch.
+ * Any other outcome inserts the receipt and replaces the single ledger snapshot.
  */
 export const submitMemorySync = (
   database: NodeSqlite.DatabaseSync,
@@ -119,17 +123,23 @@ export const submitMemorySync = (
     database
       .prepare(
         `INSERT INTO ai_os_memory_event
-          (idempotency_key, submission_id, project_id, outcome, ledger_json, receipt_json)
-         VALUES (?, ?, ?, ?, ?, ?)`,
+          (idempotency_key, submission_id, project_id, outcome, receipt_json)
+         VALUES (?, ?, ?, ?, ?)`,
       )
       .run(
         result.receipt.idempotencyKey,
         result.receipt.submissionId,
         result.receipt.projectId,
         result.receipt.outcome,
-        JSON.stringify(result.ledger),
         JSON.stringify(result.receipt),
       );
+    database
+      .prepare(
+        `INSERT INTO ai_os_memory_snapshot (id, ledger_json)
+         VALUES (1, ?)
+         ON CONFLICT(id) DO UPDATE SET ledger_json = excluded.ledger_json`,
+      )
+      .run(JSON.stringify(result.ledger));
     database.exec("COMMIT");
     return result.receipt;
   } catch (error) {
