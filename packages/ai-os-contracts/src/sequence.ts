@@ -872,6 +872,14 @@ const applyQa = (
       };
       const [firstRound, ...earlierRounds] = reworkLedger.rounds;
       if (firstRound !== undefined && reworkLedger.rounds.length >= REWORK_CAP) {
+        if (qa.recommendation === undefined) {
+          return yield* reject(
+            state,
+            event,
+            "rework_cap_needs_recommendation",
+            "A rework that reaches the cap needs a recommendation for Jim.",
+          );
+        }
         return {
           phase: "rework_capped" as const,
           intake: state.intake,
@@ -885,7 +893,7 @@ const applyQa = (
             label: REWORK_CAP_LABEL,
             remainingIssue: qa.findings,
             attemptedFixes: [firstRound, ...earlierRounds],
-            recommendation: qa.recommendation ?? "No recommendation provided",
+            recommendation: qa.recommendation,
           },
           run: state.run,
           commands: state.commands,
