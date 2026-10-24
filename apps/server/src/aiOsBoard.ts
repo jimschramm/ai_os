@@ -12,6 +12,7 @@ import {
   makeAdapterBoardHub,
 } from "@t3tools/ai-os-adapter/board-hub";
 import {
+  AWAITING_IMPLEMENTER_MODEL,
   antigravitySupports,
   launchCommandId,
   observationEvents,
@@ -399,6 +400,8 @@ const recordConfirmedRun = (input: {
   readonly disposition: BoardLaunchDisposition;
   readonly summary: string | null;
   readonly ledger: KanbanMoveLedger;
+  /** Model the run was asked to use. Null when the thread did not report one. */
+  readonly implementerRequested?: string | null;
   /** Provider-reported model. A finished run without one is not submitted for QA. */
   readonly implementerActual?: string | null;
 }): Effect.Effect<KanbanMoveResult> =>
@@ -425,9 +428,12 @@ const recordConfirmedRun = (input: {
     if (started._tag !== "Applied" || started.state.phase !== "executing") return started;
     if (input.disposition === "active") return started;
     const run = started.state.run;
-    const actual = input.implementerActual?.trim() ?? "";
+    const requestedText = input.implementerRequested?.trim() ?? "";
+    const actualText = input.implementerActual?.trim() ?? "";
+    const requested = requestedText.length > 0 ? { model: requestedText } : null;
+    const actual = actualText.length > 0 ? { model: actualText } : null;
     const recorded =
-      input.disposition === "completed" && actual.length > 0
+      input.disposition === "completed" && (requested !== null || actual !== null)
         ? yield* applyBoardWorkflowEvent(
             started.state,
             {
@@ -437,8 +443,8 @@ const recordConfirmedRun = (input: {
               generation: run.generation,
               leaseId: run.leaseId,
               role: "implementer",
-              requested: { model: actual },
-              actual: { model: actual },
+              requested,
+              actual,
             },
             `runtime-${input.taskId}-${run.generation}-implementer`,
             input.taskId,
@@ -446,7 +452,34 @@ const recordConfirmedRun = (input: {
           )
         : started;
     if (recorded._tag !== "Applied" || recorded.state.phase !== "executing") return recorded;
-    if (input.disposition === "completed" && actual.length === 0) return recorded;
+    if (input.disposition === "completed" && actual === null) {
+      return yield* applyBoardWorkflowEvent(
+        recorded.state,
+        {
+          type: "report_progress",
+          report: {
+            version: "v1",
+            taskId: input.taskId,
+            attemptId,
+            generation: run.generation,
+            leaseId: run.leaseId,
+            status: "blocked",
+            blockers: [
+              {
+                summary: AWAITING_IMPLEMENTER_MODEL,
+                ownerId: queued.assignment.workerId,
+                nextAction:
+                  "Wait until the provider reports the model that ran. This run stays out of QA.",
+              },
+            ],
+            partialArtifacts: [],
+          },
+        },
+        `await-model-${input.taskId}-${run.generation}`,
+        input.taskId,
+        recorded.ledger,
+      );
+    }
     const terminal =
       input.disposition === "completed"
         ? yield* applyBoardWorkflowEvent(
@@ -1048,7 +1081,32 @@ export const layer = Layer.unwrap(
                         ledger,
                       };
                     }
-                    return yield* commitInterruptedMove(decoded.state, requestInput);
+                    if (decoded.state.phase !== "executing") {
+                      return {
+                        _tag: "Rejected" as const,
+                        detail: "The run is no longer active, so the card was left as it is.",
+                        state: decoded.state,
+                        ledger,
+                      };
+                    }
+                    // Cancel only asks the process to stop. The card stays blocked
+                    // until recover confirms the process is gone and the worktree is cleaned.
+                    const executing = decoded.state;
+                    return yield* applyBoardWorkflowEvent(
+                      executing,
+                      {
+                        type: "lease_expired",
+                        lease: {
+                          taskId,
+                          attemptId: executing.assignment.attemptId,
+                          generation: executing.run.generation,
+                          leaseId: executing.run.leaseId,
+                        },
+                      },
+                      `${idempotencyKey}-block`,
+                      taskId,
+                      ledger,
+                    );
                   }
                   const threadId = card.threadId;
                   const runId = card.runId ?? null;
@@ -1192,6 +1250,7 @@ export const layer = Layer.unwrap(
                       disposition: launched.value.disposition,
                       summary: launched.value.summary,
                       ledger,
+                      implementerRequested: watched?.requestedModel ?? null,
                       implementerActual: watched?.actualModel ?? null,
                     });
                   })

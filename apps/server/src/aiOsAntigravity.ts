@@ -1,5 +1,5 @@
 // @effect-diagnostics nodeBuiltinImport:off - Recovery confirms one spawned review pid and removes its worktree.
-import { access, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import * as NodeFSP from "node:fs/promises";
 
 import {
   advisoryUsage,
@@ -98,8 +98,8 @@ export const startTicksOf = (stat: string): string | null => {
 export const readProcessIdentity = async (pid: number): Promise<ProcessIdentity | null> => {
   if (!Number.isInteger(pid) || pid <= 0) return null;
   try {
-    const bootId = (await readFile("/proc/sys/kernel/random/boot_id", "utf8")).trim();
-    const ticks = startTicksOf(await readFile(`/proc/${pid}/stat`, "utf8"));
+    const bootId = (await NodeFSP.readFile("/proc/sys/kernel/random/boot_id", "utf8")).trim();
+    const ticks = startTicksOf(await NodeFSP.readFile(`/proc/${pid}/stat`, "utf8"));
     if (bootId.length === 0 || ticks === null) return null;
     return { bootId, startTicks: ticks };
   } catch {
@@ -429,7 +429,7 @@ export const makeAntigravityReviews = (deps: AntigravityDeps = {}) =>
       const readMarker = (taskId: string) =>
         Effect.promise(async (): Promise<ActiveReview | null> => {
           try {
-            return decodeActiveReviewFile(await readFile(markerFor(taskId), "utf8"));
+            return decodeActiveReviewFile(await NodeFSP.readFile(markerFor(taskId), "utf8"));
           } catch {
             return null;
           }
@@ -437,8 +437,8 @@ export const makeAntigravityReviews = (deps: AntigravityDeps = {}) =>
       const writeMarker = (taskId: string, marker: ActiveReview) =>
         Effect.promise(async () => {
           const file = markerFor(taskId);
-          await mkdir(path.dirname(file), { recursive: true });
-          await writeFile(file, encodeActiveReviewFile(marker));
+          await NodeFSP.mkdir(path.dirname(file), { recursive: true });
+          await NodeFSP.writeFile(file, encodeActiveReviewFile(marker));
         });
       const signalStop =
         deps.signal ??
@@ -471,17 +471,19 @@ export const makeAntigravityReviews = (deps: AntigravityDeps = {}) =>
       const releaseMarker = (taskId: string, generation: number) =>
         Effect.promise(async () => {
           try {
-            const current = decodeActiveReviewFile(await readFile(markerFor(taskId), "utf8"));
+            const current = decodeActiveReviewFile(
+              await NodeFSP.readFile(markerFor(taskId), "utf8"),
+            );
             if (current.generation !== generation) return;
           } catch {
             return;
           }
-          await rm(markerFor(taskId), { force: true });
+          await NodeFSP.rm(markerFor(taskId), { force: true });
         });
       const isolationPresent = (root: string) =>
         Effect.promise(async () => {
           try {
-            await access(root);
+            await NodeFSP.access(root);
             return true;
           } catch {
             return false;
@@ -508,7 +510,12 @@ export const makeAntigravityReviews = (deps: AntigravityDeps = {}) =>
         Effect.gen(function* () {
           const current = jobs.get(input.taskId);
           if (current !== undefined && current.execution === null) {
-            return { status: "running" as const, runId: current.runId };
+            return {
+              status: "unavailable" as const,
+              detail:
+                "The earlier advisory review is still running. It stays blocked until that process is confirmed stopped.",
+              models: [] as readonly string[],
+            };
           }
           const workspace = yield* projects.get(ProjectId.make(input.projectId)).pipe(
             Effect.map((row) => (Option.isSome(row) ? row.value.workspaceRoot : null)),
@@ -574,7 +581,7 @@ export const makeAntigravityReviews = (deps: AntigravityDeps = {}) =>
                   signal: job.abort.signal,
                   onSpawn: (pid) => {
                     const writePid = (identity: { bootId: string; startTicks: string } | null) =>
-                      writeFile(
+                      NodeFSP.writeFile(
                         markerFor(input.taskId),
                         encodeActiveReviewFile({
                           pid,
@@ -625,7 +632,7 @@ export const makeAntigravityReviews = (deps: AntigravityDeps = {}) =>
           if (job !== undefined && job.execution !== null) {
             if (marker !== null) {
               yield* Effect.promise(() => sweepAdvisoryIsolation({ root: marker.isolationRoot }));
-              yield* Effect.promise(() => rm(markerFor(taskId), { force: true }));
+              yield* Effect.promise(() => NodeFSP.rm(markerFor(taskId), { force: true }));
             }
             jobs.delete(taskId);
             return { status: "stopped" as const };
@@ -641,7 +648,7 @@ export const makeAntigravityReviews = (deps: AntigravityDeps = {}) =>
                 sweepAdvisoryIsolation({ root: marker.isolationRoot, pid: null }),
               );
             }
-            yield* Effect.promise(() => rm(markerFor(taskId), { force: true }));
+            yield* Effect.promise(() => NodeFSP.rm(markerFor(taskId), { force: true }));
             return { status: "stopped" as const };
           }
           const alive = pidAlive(marker.pid);
@@ -649,7 +656,7 @@ export const makeAntigravityReviews = (deps: AntigravityDeps = {}) =>
             yield* Effect.promise(() =>
               sweepAdvisoryIsolation({ root: marker.isolationRoot, pid: null }),
             );
-            yield* Effect.promise(() => rm(markerFor(taskId), { force: true }));
+            yield* Effect.promise(() => NodeFSP.rm(markerFor(taskId), { force: true }));
             return { status: "stopped" as const };
           }
           const live = yield* Effect.promise(() => readIdentity(marker.pid ?? -1));
@@ -662,7 +669,7 @@ export const makeAntigravityReviews = (deps: AntigravityDeps = {}) =>
             yield* Effect.promise(() =>
               sweepAdvisoryIsolation({ root: marker.isolationRoot, pid: null }),
             );
-            yield* Effect.promise(() => rm(markerFor(taskId), { force: true }));
+            yield* Effect.promise(() => NodeFSP.rm(markerFor(taskId), { force: true }));
             return { status: "stopped" as const };
           }
           const again = yield* Effect.promise(() => readIdentity(marker.pid ?? -1));
@@ -671,7 +678,7 @@ export const makeAntigravityReviews = (deps: AntigravityDeps = {}) =>
             yield* Effect.promise(() =>
               sweepAdvisoryIsolation({ root: marker.isolationRoot, pid: null }),
             );
-            yield* Effect.promise(() => rm(markerFor(taskId), { force: true }));
+            yield* Effect.promise(() => NodeFSP.rm(markerFor(taskId), { force: true }));
             return { status: "stopped" as const };
           }
           signalStop(marker.pid);
@@ -694,12 +701,12 @@ export const makeAntigravityReviews = (deps: AntigravityDeps = {}) =>
           const pid = marker === null ? null : confirmedReviewPid(marker, live, alive);
           const cleaned = yield* Effect.promise(() => sweepAdvisoryIsolation({ root, pid }));
           if (!cleaned) return;
-          yield* Effect.promise(() => rm(markerFor(taskId), { force: true }));
+          yield* Effect.promise(() => NodeFSP.rm(markerFor(taskId), { force: true }));
           if (job !== undefined) jobs.delete(taskId);
         });
       const stored = yield* Effect.promise(async () => {
         try {
-          return await readdir(path.join(config.stateDir, "antigravity"));
+          return await NodeFSP.readdir(path.join(config.stateDir, "antigravity"));
         } catch {
           return [] as string[];
         }

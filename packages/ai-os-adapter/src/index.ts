@@ -13,6 +13,7 @@ export {
   clearAdapterBoard,
   createGrokT3Adapter,
   memorySessionStore,
+  AWAITING_IMPLEMENTER_MODEL,
   observationEvents,
   type ObservationEvent,
   readAdapterBoard,

@@ -220,6 +220,50 @@ it.effect("leaves a live review running when its identity cannot be read", () =>
   }),
 );
 
+it.effect("refuses a second start while the review process is still running", () =>
+  Effect.gen(function* () {
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    yield* Effect.addFinalizer(() => Effect.sync(() => release?.()));
+    yield* useReviews(
+      {
+        listModels: async () => ({
+          source: "cli" as const,
+          models: [{ slug: "gemini-4-argon-high", label: "Argon" }],
+          detail: null,
+        }),
+        runReview: async () => {
+          await gate;
+          return finished;
+        },
+      },
+      (reviews, dir) =>
+        Effect.gen(function* () {
+          const input = {
+            projectId: intakeExample.projectId,
+            taskId: "task-live",
+            generation: 1,
+            intake: intakeExample,
+            context: assignmentExample.contextPackage,
+            requestedModel: "gemini-4-argon-high" as string | undefined,
+          };
+          const opened = yield* reviews.start(input);
+          expect(opened.status).toBe("running");
+          const again = yield* reviews.start({ ...input, generation: 2 });
+          expect(again.status).toBe("unavailable");
+          const waiting = yield* reviews.recover("task-live");
+          expect(waiting.status).toBe("still_running");
+          release?.();
+          yield* waitUntilGone(markerPath(dir, "task-live"));
+          const stopped = yield* reviews.recover("task-live");
+          expect(stopped.status).toBe("stopped");
+        }),
+    );
+  }),
+);
+
 it.effect("deletes the marker when the review finishes", () =>
   Effect.gen(function* () {
     const dir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "agy-finish-"));

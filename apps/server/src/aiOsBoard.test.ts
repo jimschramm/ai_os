@@ -694,7 +694,8 @@ describe("ai-os board route", () => {
           status: "completed",
           text: "Done already.",
           revision: null,
-          actualModel: "gpt-5.4",
+          requestedModel: "gpt-5.4",
+          actualModel: "gpt-6-sol",
         }),
     });
     await reachAssigned(handler);
@@ -706,6 +707,13 @@ describe("ai-os board route", () => {
     expect(moved.status).toBe(200);
     expect(launches).toBe(1);
     expect(await phaseOfHandler(handler)).toBe("awaiting_qa");
+    const reviewed = (await readCards(handler)).find((item) => item.taskId === "task-demo");
+    expect(
+      reviewed?.state.phase === "awaiting_qa" ? reviewed.state.run.implementerRuntime : null,
+    ).toEqual({
+      requested: "gpt-5.4",
+      actual: "gpt-6-sol",
+    });
     const again = await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
       taskId: "task-demo",
       column: "Running",
@@ -714,6 +722,48 @@ describe("ai-os board route", () => {
     expect(again.status).toBe(409);
     expect(launches).toBe(1);
     expect(await phaseOfHandler(handler)).toBe("awaiting_qa");
+  });
+
+  it("shows a blocker when a finished launch has no implementer model", async () => {
+    const { handler } = handlerFor(undefined, {
+      ...allowRuns,
+      confirmLaunch: () => Effect.succeed("settled"),
+      launch: () =>
+        Effect.succeed({
+          threadId: "thread-unknown",
+          runId: "run-unknown",
+          disposition: "completed",
+          summary: "Done already.",
+        }),
+      watchThread: () =>
+        Effect.succeed({
+          threadId: "thread-unknown",
+          runId: "run-unknown",
+          status: "completed",
+          text: "Done already.",
+          revision: null,
+          requestedModel: null,
+          actualModel: null,
+        }),
+    });
+    await reachAssigned(handler);
+    const moved = await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
+      taskId: "task-demo",
+      column: "Running",
+      idempotencyKey: "unknown-model",
+    });
+    expect(moved.status).toBe(200);
+    const card = (await readCards(handler)).find((item) => item.taskId === "task-demo");
+    expect(card?.state.phase).toBe("executing");
+    expect(card?.state.phase === "executing" ? card.state.run.implementerRuntime : "recorded").toBe(
+      undefined,
+    );
+    expect(card?.state.phase === "executing" ? card.state.run.progress?.status : null).toBe(
+      "blocked",
+    );
+    expect(
+      card?.state.phase === "executing" ? card.state.run.progress?.blockers[0]?.summary : null,
+    ).toBe("Awaiting implementer model");
   });
 
   it("records a failed launch as blocked instead of leaving it Ready", async () => {
@@ -1741,12 +1791,23 @@ describe("ai-os board route", () => {
 
   it("cancels a running advisory review through the board", async () => {
     let canceled = 0;
+    let starts = 0;
+    let processRunning = true;
+    let worktree = true;
     const { handler } = handlerFor(undefined, allowRuns, {
       ...idleReviews,
-      start: () => Effect.succeed({ status: "running" as const, runId: "agy-run-1" }),
+      start: () => {
+        starts += 1;
+        return Effect.succeed({ status: "running" as const, runId: `agy-run-${starts}` });
+      },
       cancel: () => {
         canceled += 1;
         return Effect.succeed("requested" as const);
+      },
+      recover: () => {
+        if (processRunning) return Effect.succeed({ status: "still_running" as const });
+        worktree = false;
+        return Effect.succeed({ status: "stopped" as const });
       },
     });
     expect(
@@ -1809,7 +1870,33 @@ describe("ai-os board route", () => {
     expect(stopped.status).toBe(200);
     expect(canceled).toBe(1);
     const after = (await readCards(handler)).find((item) => item.taskId === "task-agy");
-    expect(after?.state.phase).toBe("assigned");
+    expect(after?.state.phase).toBe("recovery_pending");
+    const early = await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
+      taskId: "task-agy",
+      column: "Running",
+      idempotencyKey: "run-agy-early",
+      model: "gemini-4-argon-high",
+    });
+    expect(early.status).toBe(409);
+    expect(starts).toBe(1);
+    expect(worktree).toBe(true);
+    const held = (await readCards(handler)).find((item) => item.taskId === "task-agy");
+    expect(held?.state.phase).toBe("recovery_pending");
+    processRunning = false;
+    const again = await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
+      taskId: "task-agy",
+      column: "Running",
+      idempotencyKey: "run-agy-again",
+      model: "gemini-4-argon-high",
+    });
+    expect(again.status).toBe(200);
+    expect(starts).toBe(2);
+    expect(worktree).toBe(false);
+    const restarted = (await readCards(handler)).find((item) => item.taskId === "task-agy");
+    expect(restarted?.state.phase).toBe("executing");
+    expect(restarted?.state.phase === "executing" ? restarted.state.assignment.attemptId : "").toBe(
+      "retry-task-agy-2",
+    );
   });
 
   it("keeps an interrupted advisory review blocked until the old process stops", async () => {

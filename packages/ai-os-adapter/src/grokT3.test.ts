@@ -1386,49 +1386,71 @@ it.effect("attributes tokens to the provider session model and not the request",
   }),
 );
 
-it.effect("records the reviewer's provider session while awaiting QA", () =>
+it.effect("does not record the reviewer from the implementer's thread after completion", () =>
   Effect.gen(function* () {
     const awaiting = yield* applySequence(happyPathEvents.slice(0, 6));
     if (awaiting.phase !== "awaiting_qa") {
       return yield* Effect.die("Completion must wait for QA.");
     }
-    const view = {
-      threadId: "thread-qa",
-      runId: "run-qa",
-      status: "running" as const,
-      text: null,
-      revision: null,
-      requestedModel: "gpt-6-astra",
-      actualModel: "gpt-6-astra",
-    };
     const planned = observationEvents({
       taskId: "task-usba-page",
-      threadId: "thread-qa",
+      threadId: "thread-implementer",
       state: awaiting,
-      view,
+      view: {
+        threadId: "thread-implementer",
+        runId: "run-1",
+        status: "completed",
+        text: "done",
+        revision: null,
+        requestedModel: "gpt-5.4",
+        actualModel: "gpt-5.4",
+      },
       allowLapse: false,
       workerId: "codex-t3",
     });
-    const recorded = planned.find((item) => item.event.type === "record_runtime_models");
-    if (recorded === undefined || recorded.event.type !== "record_runtime_models") {
-      return yield* Effect.die("Awaiting QA must record the reviewer runtime.");
+    assert.strictEqual(
+      planned.some((item) => item.event.type === "record_runtime_models"),
+      false,
+    );
+  }),
+);
+
+it.effect("blocks a finished run until the implementer model is known", () =>
+  Effect.gen(function* () {
+    const executing = yield* applySequence(happyPathEvents.slice(0, 4));
+    if (executing.phase !== "executing") {
+      return yield* Effect.die("The run must be executing.");
     }
-    assert.strictEqual(recorded.event.role, "reviewer");
-    assert.strictEqual(recorded.event.actual?.model, "gpt-6-astra");
-    const unknown = observationEvents({
+    const planned = observationEvents({
       taskId: "task-usba-page",
-      threadId: "thread-qa",
-      state: awaiting,
-      view: { ...view, actualModel: null },
+      threadId: "thread-1",
+      state: executing,
+      view: {
+        threadId: "thread-1",
+        runId: "run-1",
+        status: "completed",
+        text: "done",
+        revision: null,
+        requestedModel: "gpt-5.4",
+        actualModel: null,
+      },
       allowLapse: false,
       workerId: "codex-t3",
     });
-    const missing = unknown.find((item) => item.event.type === "record_runtime_models");
-    if (missing === undefined || missing.event.type !== "record_runtime_models") {
-      return yield* Effect.die("A requested reviewer model is still recorded.");
+    assert.strictEqual(
+      planned.some((item) => item.event.type === "submit_completion"),
+      false,
+    );
+    const runtime = planned.find((item) => item.event.type === "record_runtime_models");
+    if (runtime === undefined || runtime.event.type !== "record_runtime_models") {
+      return yield* Effect.die("The requested model is recorded without an actual.");
     }
-    assert.strictEqual(missing.event.role, "reviewer");
-    assert.strictEqual(missing.event.requested?.model, "gpt-6-astra");
-    assert.strictEqual(missing.event.actual, null);
+    assert.strictEqual(runtime.event.requested?.model, "gpt-5.4");
+    assert.strictEqual(runtime.event.actual, null);
+    const progress = planned.find((item) => item.event.type === "report_progress");
+    if (progress === undefined || progress.event.type !== "report_progress") {
+      return yield* Effect.die("A finished run with no implementer model needs a blocker.");
+    }
+    assert.strictEqual(progress.event.report.blockers[0]?.summary, "Awaiting implementer model");
   }),
 );

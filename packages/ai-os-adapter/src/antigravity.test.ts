@@ -1,9 +1,9 @@
 // @effect-diagnostics nodeBuiltinImport:off
-import { execFile, spawn } from "node:child_process";
-import { lstatSync, readFileSync, statSync, writeFileSync } from "node:fs";
-import { mkdtemp, mkdir, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import path from "node:path";
+import * as NodeChildProcess from "node:child_process";
+import * as NodeFS from "node:fs";
+import * as NodeFSP from "node:fs/promises";
+import * as NodeOS from "node:os";
+import * as NodePath from "node:path";
 
 import { assignmentExample, intakeV2Example } from "@t3tools/ai-os-contracts";
 import { describe, expect, it } from "vite-plus/test";
@@ -39,7 +39,7 @@ const finished = (stdout: string, code = 0): SpawnedCli => ({
 
 const git = (args: readonly string[], cwd: string) =>
   new Promise<string>((resolve, reject) => {
-    execFile(
+    NodeChildProcess.execFile(
       "git",
       ["-c", "user.email=test@example.com", "-c", "user.name=Test", ...args],
       { cwd },
@@ -52,25 +52,25 @@ const git = (args: readonly string[], cwd: string) =>
 
 const allowCleanup = (root: string) =>
   new Promise<void>((resolve) => {
-    execFile("chmod", ["-R", "u+w", root], () => resolve());
+    NodeChildProcess.execFile("chmod", ["-R", "u+w", root], () => resolve());
   });
 
 const withRepo = async <T>(
   run: (input: { readonly repo: string; readonly sha: string }) => Promise<T>,
 ): Promise<T> => {
-  const root = await mkdtemp(path.join(tmpdir(), "agy-review-"));
-  const repo = path.join(root, "repo");
-  await mkdir(repo);
+  const root = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "agy-review-"));
+  const repo = NodePath.join(root, "repo");
+  await NodeFSP.mkdir(repo);
   try {
     await git(["init"], repo);
-    await writeFile(path.join(repo, "README.md"), "schedule\n");
+    await NodeFSP.writeFile(NodePath.join(repo, "README.md"), "schedule\n");
     await git(["add", "README.md"], repo);
     await git(["commit", "-m", "schedule"], repo);
     const sha = (await git(["rev-parse", "HEAD"], repo)).trim();
     return await run({ repo, sha });
   } finally {
     await allowCleanup(root);
-    await rm(root, { recursive: true, force: true });
+    await NodeFSP.rm(root, { recursive: true, force: true });
   }
 };
 
@@ -261,14 +261,17 @@ describe("antigravity advisory review", () => {
         spawn: (input) => {
           calls.push({ args: input.args, env: { ...input.env }, cwd: input.cwd });
           if (input.args[0] === "models") return finished(catalog);
-          sourceMode = statSync(input.cwd).mode & 0o777;
-          fileMode = statSync(path.join(input.cwd, "README.md")).mode & 0o777;
-          writeFileSync(path.join(path.dirname(input.cwd), "scratch", "note.txt"), "ok");
+          sourceMode = NodeFS.statSync(input.cwd).mode & 0o777;
+          fileMode = NodeFS.statSync(NodePath.join(input.cwd, "README.md")).mode & 0o777;
+          NodeFS.writeFileSync(
+            NodePath.join(NodePath.dirname(input.cwd), "scratch", "note.txt"),
+            "ok",
+          );
           deny = (
             JSON.parse(
-              readFileSync(
-                path.join(
-                  path.dirname(input.cwd),
+              NodeFS.readFileSync(
+                NodePath.join(
+                  NodePath.dirname(input.cwd),
                   "home",
                   ".gemini",
                   "antigravity-cli",
@@ -281,7 +284,7 @@ describe("antigravity advisory review", () => {
           return finished(successResult("gemini-4-argon-high"));
         },
       };
-      const isolation = path.join(path.dirname(repo), "isolation");
+      const isolation = NodePath.join(NodePath.dirname(repo), "isolation");
       const result = await runAdvisoryReview({
         repoRoot: repo,
         isolationRoot: isolation,
@@ -314,7 +317,7 @@ describe("antigravity advisory review", () => {
           "gemini-4-argon-high",
           "--sandbox",
           "--add-dir",
-          path.join(path.dirname(review?.cwd ?? ""), "scratch"),
+          NodePath.join(NodePath.dirname(review?.cwd ?? ""), "scratch"),
           "--output-format",
           "stream-json",
           "--print-timeout",
@@ -329,7 +332,7 @@ describe("antigravity advisory review", () => {
       expect(review?.env.GEMINI_API_KEY).toBeUndefined();
       expect(review?.env.ANTHROPIC_API_KEY).toBeUndefined();
       expect(review?.env.SSH_AUTH_SOCK).toBeUndefined();
-      expect(review?.env.HOME).toBe(path.join(path.dirname(review?.cwd ?? ""), "home"));
+      expect(review?.env.HOME).toBe(NodePath.join(NodePath.dirname(review?.cwd ?? ""), "home"));
       expect(sourceMode & 0o222).toBe(0);
       expect(fileMode & 0o222).toBe(0);
       expect(deny).toEqual(
@@ -339,7 +342,7 @@ describe("antigravity advisory review", () => {
           "command(git merge)",
         ]),
       );
-      await expect(stat(review?.cwd ?? "")).rejects.toThrow();
+      await expect(NodeFSP.stat(review?.cwd ?? "")).rejects.toThrow();
       const listed = await git(["worktree", "list", "--porcelain"], repo);
       expect(listed).not.toContain(review?.cwd ?? "missing");
     });
@@ -347,9 +350,9 @@ describe("antigravity advisory review", () => {
 
   it("does not follow a symlink out of the worktree", async () => {
     await withRepo(async ({ repo, sha }) => {
-      const outside = path.join(path.dirname(repo), "outside.txt");
-      await writeFile(outside, "secret\n", { mode: 0o644 });
-      await symlink(outside, path.join(repo, "linked.txt"));
+      const outside = NodePath.join(NodePath.dirname(repo), "outside.txt");
+      await NodeFSP.writeFile(outside, "secret\n", { mode: 0o644 });
+      await NodeFSP.symlink(outside, NodePath.join(repo, "linked.txt"));
       await git(["add", "linked.txt"], repo);
       await git(["commit", "-m", "link"], repo);
       const linked = (await git(["rev-parse", "HEAD"], repo)).trim();
@@ -358,13 +361,13 @@ describe("antigravity advisory review", () => {
       const spawner: CliSpawner = {
         spawn: (input) => {
           if (input.args[0] === "models") return finished(catalog);
-          linkIsSymlink = lstatSync(path.join(input.cwd, "linked.txt")).isSymbolicLink();
+          linkIsSymlink = NodeFS.lstatSync(NodePath.join(input.cwd, "linked.txt")).isSymbolicLink();
           return finished(successResult("gemini-4-argon-high"));
         },
       };
       const result = await runAdvisoryReview({
         repoRoot: repo,
-        isolationRoot: path.join(path.dirname(repo), "isolation"),
+        isolationRoot: NodePath.join(NodePath.dirname(repo), "isolation"),
         context: { ...assignmentExample.contextPackage, repoCommit: linked },
         intake: intakeV2Example,
         requestedModel: "gemini-4-argon-high",
@@ -374,7 +377,7 @@ describe("antigravity advisory review", () => {
       });
       expect(result.status).toBe("completed");
       expect(linkIsSymlink).toBe(true);
-      expect((await stat(outside)).mode & 0o222).not.toBe(0);
+      expect((await NodeFSP.stat(outside)).mode & 0o222).not.toBe(0);
     });
   });
 
@@ -388,7 +391,7 @@ describe("antigravity advisory review", () => {
           return reviews === 1 ? finished("", 1) : finished(successResult("gemini-4-argon-high"));
         },
       };
-      const isolation = path.join(path.dirname(repo), "isolation");
+      const isolation = NodePath.join(NodePath.dirname(repo), "isolation");
       const input = {
         repoRoot: repo,
         isolationRoot: isolation,
@@ -405,21 +408,23 @@ describe("antigravity advisory review", () => {
       const second = await runAdvisoryReview(input);
       expect(second.status).toBe("completed");
       expect(await git(["worktree", "list", "--porcelain"], repo)).not.toContain(isolation);
-      expect(await readdir(isolation).catch(() => [])).toEqual([]);
+      expect(await NodeFSP.readdir(isolation).catch(() => [])).toEqual([]);
     });
   });
 
   it("sweeps a leftover read-only worktree and stops the recorded child", async () => {
     await withRepo(async ({ repo, sha }) => {
-      const isolation = path.join(path.dirname(repo), "isolation");
-      const attempt = path.join(isolation, "attempt01");
-      const source = path.join(attempt, "source");
+      const isolation = NodePath.join(NodePath.dirname(repo), "isolation");
+      const attempt = NodePath.join(isolation, "attempt01");
+      const source = NodePath.join(attempt, "source");
       await git(["worktree", "add", "--detach", source, sha], repo);
       await new Promise<void>((resolve, reject) => {
-        execFile("chmod", ["-R", "a-w", source], (error) => (error ? reject(error) : resolve()));
+        NodeChildProcess.execFile("chmod", ["-R", "a-w", source], (error) =>
+          error ? reject(error) : resolve(),
+        );
       });
       const pid = await new Promise<number>((resolve, reject) => {
-        const parent = spawn(
+        const parent = NodeChildProcess.spawn(
           process.execPath,
           [
             "-e",
@@ -447,7 +452,7 @@ describe("antigravity advisory review", () => {
         }
         expect(alive).toBe(false);
         expect(await git(["worktree", "list", "--porcelain"], repo)).not.toContain(source);
-        expect(await readdir(isolation).catch(() => [])).toEqual([]);
+        expect(await NodeFSP.readdir(isolation).catch(() => [])).toEqual([]);
       } finally {
         try {
           process.kill(pid, "SIGKILL");
@@ -492,7 +497,7 @@ describe("antigravity advisory review", () => {
       };
       const result = await runAdvisoryReview({
         repoRoot: repo,
-        isolationRoot: path.join(path.dirname(repo), "isolation"),
+        isolationRoot: NodePath.join(NodePath.dirname(repo), "isolation"),
         context: { ...assignmentExample.contextPackage, repoCommit: sha },
         intake: intakeV2Example,
         requestedModel: "gemini-4-argon-high",
@@ -534,7 +539,7 @@ describe("antigravity advisory review", () => {
       };
       const result = await runAdvisoryReview({
         repoRoot: repo,
-        isolationRoot: path.join(path.dirname(repo), "isolation"),
+        isolationRoot: NodePath.join(NodePath.dirname(repo), "isolation"),
         context: { ...assignmentExample.contextPackage, repoCommit: sha },
         intake: intakeV2Example,
         requestedModel: "gemini-4-argon-high",
@@ -572,7 +577,7 @@ describe("antigravity advisory review", () => {
       };
       const result = await runAdvisoryReview({
         repoRoot: repo,
-        isolationRoot: path.join(path.dirname(repo), "isolation"),
+        isolationRoot: NodePath.join(NodePath.dirname(repo), "isolation"),
         context: { ...assignmentExample.contextPackage, repoCommit: sha },
         intake: intakeV2Example,
         requestedModel: "gemini-4-argon-high",
@@ -634,7 +639,7 @@ describe("antigravity advisory review", () => {
       };
       const result = await runAdvisoryReview({
         repoRoot: repo,
-        isolationRoot: path.join(path.dirname(repo), "isolation"),
+        isolationRoot: NodePath.join(NodePath.dirname(repo), "isolation"),
         context: { ...assignmentExample.contextPackage, repoCommit: sha },
         intake: intakeV2Example,
         requestedModel: "gemini-4-argon-high",
@@ -691,7 +696,7 @@ describe("antigravity listing", () => {
 it("scrubs review credentials", () => {
   const env = advisoryEnvironment(parentEnv, "/tmp/home", "/tmp/scratch");
   expect(env.GH_TOKEN).toBeUndefined();
-  expect(env.GIT_CONFIG_GLOBAL).toBe(path.join("/tmp/home", "gitconfig"));
+  expect(env.GIT_CONFIG_GLOBAL).toBe(NodePath.join("/tmp/home", "gitconfig"));
   const parsed = parseCliRun(
     [JSON.stringify({ event: "init", init: { model: "gemini-4-argon-high" } })],
     "c".repeat(40),

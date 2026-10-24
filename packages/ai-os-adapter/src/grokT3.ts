@@ -141,6 +141,9 @@ export interface ObservationEvent {
  * Progress, usage, completion, and failure for one executing run.
  * A missing or interrupted view lapses only when the caller still owns the heartbeat.
  */
+/** Visible while a finished run has no provider-reported implementer model. */
+export const AWAITING_IMPLEMENTER_MODEL = "Awaiting implementer model";
+
 const modelRef = (value: string | null | undefined) => {
   const trimmed = value?.trim() ?? "";
   return trimmed.length > 0 ? { model: trimmed } : null;
@@ -220,20 +223,7 @@ export const observationEvents = (input: {
   readonly allowLapse: boolean;
   readonly workerId: string;
 }): readonly ObservationEvent[] => {
-  if (input.state.phase === "awaiting_qa") {
-    if (input.view === null) return [];
-    const awaiting = input.state;
-    const reviewer = runtimeObservation({
-      taskId: input.taskId,
-      attemptId: awaiting.assignment.attemptId,
-      generation: awaiting.run.generation,
-      leaseId: awaiting.run.leaseId,
-      stored: awaiting.run.reviewerRuntime,
-      view: input.view,
-      role: "reviewer",
-    });
-    return reviewer === null ? [] : [reviewer];
-  }
+  // This poll watches the implementer's thread. Its model is not the reviewer's.
   if (input.state.phase !== "executing") return [];
   const run = input.state.run;
   const attemptId = input.state.assignment.attemptId;
@@ -341,6 +331,35 @@ export const observationEvents = (input: {
     ];
   }
   if (view.status !== "completed") return [];
+  const completedActual = modelRef(view.actualModel);
+  if (completedActual === null) {
+    return [
+      ...(runtime === null ? [] : [runtime]),
+      {
+        idempotencyKey: `await-model-${taskId}-${run.generation}`,
+        event: {
+          type: "report_progress",
+          report: {
+            version: "v1",
+            taskId,
+            attemptId,
+            generation: run.generation,
+            leaseId: run.leaseId,
+            status: "blocked",
+            blockers: [
+              {
+                summary: AWAITING_IMPLEMENTER_MODEL,
+                ownerId: input.state.assignment.workerId,
+                nextAction:
+                  "Wait until the provider reports the model that ran. This run stays out of QA.",
+              },
+            ],
+            partialArtifacts: [],
+          },
+        },
+      },
+    ];
+  }
   return [
     ...(runtime === null ? [] : [runtime]),
     {

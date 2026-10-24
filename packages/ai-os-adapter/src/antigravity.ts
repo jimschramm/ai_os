@@ -1,10 +1,10 @@
 // @effect-diagnostics nodeBuiltinImport:off globalTimers:off - This runner spawns the Antigravity CLI and arms a SIGKILL watchdog.
-import { execFile, spawn } from "node:child_process";
-import { randomBytes } from "node:crypto";
-import { chmod, lstat, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
-import type { Stats } from "node:fs";
-import path from "node:path";
-import type { Readable } from "node:stream";
+import * as NodeChildProcess from "node:child_process";
+import * as NodeCrypto from "node:crypto";
+import type * as NodeFS from "node:fs";
+import * as NodeFSP from "node:fs/promises";
+import * as NodePath from "node:path";
+import type * as NodeStream from "node:stream";
 
 import {
   canonicalGitSha,
@@ -189,7 +189,7 @@ export const advisoryEnvironment = (
   const env = agyEnvironment(parent);
   env.HOME = home;
   env.TMPDIR = scratch;
-  env.GIT_CONFIG_GLOBAL = path.join(home, "gitconfig");
+  env.GIT_CONFIG_GLOBAL = NodePath.join(home, "gitconfig");
   env.GIT_CONFIG_NOSYSTEM = "1";
   env.GIT_TERMINAL_PROMPT = "0";
   env.GIT_CONFIG_COUNT = "1";
@@ -404,7 +404,7 @@ export const parseCliRun = (lines: readonly string[], commit: string): ParsedCli
   };
 };
 
-const linesFrom = async function* (stream: Readable): AsyncGenerator<string> {
+const linesFrom = async function* (stream: NodeStream.Readable): AsyncGenerator<string> {
   let pending = "";
   for await (const chunk of stream) {
     pending += String(chunk);
@@ -422,7 +422,7 @@ const emptyLines = async function* (): AsyncGenerator<string> {};
 
 export const nodeCliSpawner: CliSpawner = {
   spawn: (input) => {
-    const child = spawn(input.command, input.args, {
+    const child = NodeChildProcess.spawn(input.command, input.args, {
       cwd: input.cwd,
       env: input.env,
       stdio: ["ignore", "pipe", "pipe"],
@@ -454,7 +454,7 @@ export const nodeCliSpawner: CliSpawner = {
 const defaultGit: GitRunner = {
   run: (args, cwd) =>
     new Promise((resolve) => {
-      execFile("git", args, { cwd, encoding: "utf8" }, (error, stdout, stderr) => {
+      NodeChildProcess.execFile("git", args, { cwd, encoding: "utf8" }, (error, stdout, stderr) => {
         const code =
           error !== null &&
           typeof error === "object" &&
@@ -471,23 +471,23 @@ const defaultGit: GitRunner = {
 
 const walkTree = async (
   root: string,
-  visit: (abs: string, info: Stats) => Promise<void>,
+  visit: (abs: string, info: NodeFS.Stats) => Promise<void>,
 ): Promise<void> => {
-  const info = await lstat(root);
+  const info = await NodeFSP.lstat(root);
   if (info.isSymbolicLink()) return;
   await visit(root, info);
   if (!info.isDirectory()) return;
-  for (const entry of await readdir(root, { withFileTypes: true })) {
+  for (const entry of await NodeFSP.readdir(root, { withFileTypes: true })) {
     if (entry.isSymbolicLink()) continue;
-    await walkTree(path.join(root, entry.name), visit);
+    await walkTree(NodePath.join(root, entry.name), visit);
   }
 };
 
 const makeReadOnly = (root: string): Promise<void> =>
-  walkTree(root, (abs, info) => chmod(abs, info.isDirectory() ? 0o555 : 0o444));
+  walkTree(root, (abs, info) => NodeFSP.chmod(abs, info.isDirectory() ? 0o555 : 0o444));
 
 const restoreWritable = (root: string): Promise<void> =>
-  walkTree(root, (abs, info) => chmod(abs, info.isDirectory() ? 0o755 : 0o644)).catch(
+  walkTree(root, (abs, info) => NodeFSP.chmod(abs, info.isDirectory() ? 0o755 : 0o644)).catch(
     () => undefined,
   );
 
@@ -527,14 +527,14 @@ const stopRecordedChild = async (pid: number | null | undefined): Promise<boolea
 
 const mainRepoFromWorktree = async (source: string): Promise<string | null> => {
   try {
-    const pointer = await readFile(path.join(source, ".git"), "utf8");
+    const pointer = await NodeFSP.readFile(NodePath.join(source, ".git"), "utf8");
     const match = /^gitdir:\s*(.+)$/m.exec(pointer);
     const gitDir = match?.[1];
     if (gitDir === undefined) return null;
-    const resolved = path.resolve(source, gitDir.trim());
-    const worktrees = path.dirname(resolved);
-    if (path.basename(worktrees) !== "worktrees") return null;
-    return path.dirname(path.dirname(worktrees));
+    const resolved = NodePath.resolve(source, gitDir.trim());
+    const worktrees = NodePath.dirname(resolved);
+    if (NodePath.basename(worktrees) !== "worktrees") return null;
+    return NodePath.dirname(NodePath.dirname(worktrees));
   } catch {
     return null;
   }
@@ -545,7 +545,7 @@ const attemptDirectories = async (root: string): Promise<string[]> => {
   const walk = async (dir: string): Promise<void> => {
     let entries;
     try {
-      entries = await readdir(dir, { withFileTypes: true });
+      entries = await NodeFSP.readdir(dir, { withFileTypes: true });
     } catch {
       return;
     }
@@ -556,7 +556,7 @@ const attemptDirectories = async (root: string): Promise<string[]> => {
     for (const entry of entries) {
       if (!entry.isDirectory() || entry.name === "source" || entry.name === "scratch") continue;
       if (entry.name === "home") continue;
-      await walk(path.join(dir, entry.name));
+      await walk(NodePath.join(dir, entry.name));
     }
   };
   await walk(root);
@@ -578,7 +578,7 @@ export const sweepAdvisoryIsolation = async (input: {
   const attempts = await attemptDirectories(input.root);
   const repos = new Set<string>();
   for (const attempt of attempts) {
-    const source = path.join(attempt, "source");
+    const source = NodePath.join(attempt, "source");
     await restoreWritable(source);
     const repo = await mainRepoFromWorktree(source);
     if (repo !== null) {
@@ -588,7 +588,7 @@ export const sweepAdvisoryIsolation = async (input: {
   }
   for (const repo of repos) await git.run(["worktree", "prune"], repo);
   for (const attempt of attempts) {
-    await rm(attempt, { recursive: true, force: true }).catch(() => undefined);
+    await NodeFSP.rm(attempt, { recursive: true, force: true }).catch(() => undefined);
   }
   return true;
 };
@@ -767,15 +767,15 @@ export const runAdvisoryReview = async (input: {
   if (input.signal?.aborted) return stop("canceled", "The review was canceled.", [], choice.slug);
 
   const git = input.git ?? defaultGit;
-  const attempt = path.join(input.isolationRoot, randomBytes(8).toString("hex"));
-  const source = path.join(attempt, "source");
-  const scratch = path.join(attempt, "scratch");
-  const home = path.join(attempt, "home");
+  const attempt = NodePath.join(input.isolationRoot, NodeCrypto.randomBytes(8).toString("hex"));
+  const source = NodePath.join(attempt, "source");
+  const scratch = NodePath.join(attempt, "scratch");
+  const home = NodePath.join(attempt, "home");
   let linked = false;
   try {
     const verified = await git.run(["rev-parse", "--verify", `${commit}^{commit}`], input.repoRoot);
     if (verified.code !== 0) return stop("failed", gitFailure(verified, "rev-parse"));
-    await mkdir(attempt, { recursive: true });
+    await NodeFSP.mkdir(attempt, { recursive: true });
     const added = await git.run(["worktree", "add", "--detach", source, commit], input.repoRoot);
     if (added.code !== 0) return stop("failed", gitFailure(added, "worktree add"));
     linked = true;
@@ -788,8 +788,8 @@ export const runAdvisoryReview = async (input: {
       );
     }
     await makeReadOnly(source);
-    await mkdir(scratch, { recursive: true, mode: 0o700 });
-    await mkdir(home, { recursive: true, mode: 0o700 });
+    await NodeFSP.mkdir(scratch, { recursive: true, mode: 0o700 });
+    await NodeFSP.mkdir(home, { recursive: true, mode: 0o700 });
     const settings = {
       toolPermission: "request-review",
       enableTerminalSandbox: true,
@@ -807,12 +807,15 @@ export const runAdvisoryReview = async (input: {
         deny: [`write_file(${source})`, "command(git push)", "command(git merge)"],
       },
     };
-    const settingsDir = path.join(home, ".gemini", "antigravity-cli");
-    await mkdir(settingsDir, { recursive: true });
-    await writeFile(path.join(settingsDir, "settings.json"), JSON.stringify(settings, null, 2));
-    await writeFile(path.join(home, "gitconfig"), "");
-    const schemaPath = path.join(home, "findings.schema.json");
-    await writeFile(schemaPath, JSON.stringify(FINDINGS_SCHEMA));
+    const settingsDir = NodePath.join(home, ".gemini", "antigravity-cli");
+    await NodeFSP.mkdir(settingsDir, { recursive: true });
+    await NodeFSP.writeFile(
+      NodePath.join(settingsDir, "settings.json"),
+      JSON.stringify(settings, null, 2),
+    );
+    await NodeFSP.writeFile(NodePath.join(home, "gitconfig"), "");
+    const schemaPath = NodePath.join(home, "findings.schema.json");
+    await NodeFSP.writeFile(schemaPath, JSON.stringify(FINDINGS_SCHEMA));
     const prompt = [
       "Advisory repository review. Read the source. Do not merge, push, or deploy.",
       "The source tree is read-only. Put tests only in the scratch directory.",
@@ -909,6 +912,6 @@ export const runAdvisoryReview = async (input: {
       await git.run(["worktree", "remove", "--force", source], input.repoRoot);
     }
     await git.run(["worktree", "prune"], input.repoRoot);
-    await rm(attempt, { recursive: true, force: true }).catch(() => undefined);
+    await NodeFSP.rm(attempt, { recursive: true, force: true }).catch(() => undefined);
   }
 };

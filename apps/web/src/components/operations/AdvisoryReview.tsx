@@ -127,7 +127,7 @@ function ModelPicker({ taskId }: { taskId: string }) {
     return () => {
       cancelled = true;
     };
-  }, [taskId]);
+  }, []);
 
   const unverified = catalog?.source !== "cli";
   const run = async () => {
