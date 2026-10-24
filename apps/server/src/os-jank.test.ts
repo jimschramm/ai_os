@@ -1,6 +1,7 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it as effectIt } from "@effect/vitest";
 import * as HostProcess from "@t3tools/shared/HostProcess";
+import * as Path from "effect/Path";
 import { CommandAvailability, WindowsShellEnvironment } from "@t3tools/shared/shell";
 import * as Effect from "effect/Effect";
 // @effect-diagnostics-next-line nodeBuiltinImport:off -- Observe the existing synchronous shell probe without launching the user's login shell.
@@ -8,7 +9,8 @@ import * as NodeChildProcess from "node:child_process";
 import * as NodeOS from "node:os";
 import { assert, it, vi } from "vite-plus/test";
 
-import { fixPath, hydratePosixHome } from "./os-jank.ts";
+import * as ServerConfig from "./config.ts";
+import { fixPath, hydratePosixHome, resolveBaseDir } from "./os-jank.ts";
 
 vi.mock("node:child_process", { spy: true });
 
@@ -169,4 +171,26 @@ effectIt.effect("replaces a Path-spelled Windows PATH instead of adding a second
 
     assert.deepEqual(env, { PATH: "C:\\Tools;C:\\Windows" });
   }),
+);
+
+effectIt.effect("defaults the home to ~/.ai_os-home and keeps an explicit directory", () =>
+  Effect.gen(function* () {
+    const path = yield* Path.Path;
+    const home = "/home/jim";
+    const unset = yield* resolveBaseDir(undefined).pipe(
+      Effect.provideService(HostProcess.HomeDirectory, home),
+    );
+    const blank = yield* resolveBaseDir("   ").pipe(
+      Effect.provideService(HostProcess.HomeDirectory, home),
+    );
+    const explicit = yield* resolveBaseDir("/var/ai-os").pipe(
+      Effect.provideService(HostProcess.HomeDirectory, home),
+    );
+    const secrets = yield* ServerConfig.deriveServerPaths(unset, undefined);
+
+    assert.equal(unset, path.join(home, ".ai_os-home"));
+    assert.equal(blank, unset);
+    assert.equal(explicit, path.resolve("/var/ai-os"));
+    assert.equal(secrets.secretsDir, path.join(unset, "userdata", "secrets"));
+  }).pipe(Effect.provide(NodeServices.layer)),
 );
