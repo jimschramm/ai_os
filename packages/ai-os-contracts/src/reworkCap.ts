@@ -1,3 +1,4 @@
+import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 
 import { ContractText, GitSha, PositiveInt } from "./common.ts";
@@ -30,16 +31,18 @@ export type JimResumeDecisionV1 = typeof JimResumeDecisionV1.Type;
 export const ReworkLedgerV1 = Schema.Struct({
   rounds: Schema.Array(ReworkRoundV1),
   decisions: Schema.Array(JimResumeDecisionV1),
-}).check(
-  Schema.makeFilter((ledger) => {
-    for (let index = 0; index < ledger.rounds.length; index += 1) {
-      if (ledger.rounds[index]?.round !== index + 1) {
-        return "Rework rounds are numbered on the task, starting at 1.";
+})
+  .check(
+    Schema.makeFilter((ledger) => {
+      for (let index = 0; index < ledger.rounds.length; index += 1) {
+        if (ledger.rounds[index]?.round !== index + 1) {
+          return "Rework rounds are numbered on the task, starting at 1.";
+        }
       }
-    }
-    return true;
-  }),
-);
+      return true;
+    }),
+  )
+  .pipe(Schema.withDecodingDefault(Effect.sync(() => ({ rounds: [], decisions: [] }))));
 export type ReworkLedgerV1 = typeof ReworkLedgerV1.Type;
 
 export const ReworkCapNoticeV1 = Schema.Struct({

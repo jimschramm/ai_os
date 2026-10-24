@@ -323,6 +323,48 @@ describe("ai-os board route", () => {
     ]);
   });
 
+  it("keeps in-flight cards from a board saved before rework ledgers", async () => {
+    const executing = await Effect.runPromise(applySequence(happyPathEvents.slice(0, 4)));
+    const awaiting = await Effect.runPromise(applySequence(happyPathEvents.slice(0, 5)));
+    const withoutLedger = (state: object) => {
+      const copy = JSON.parse(JSON.stringify(state)) as Record<string, unknown>;
+      delete copy.reworkLedger;
+      return copy;
+    };
+    const dir = preparedDir();
+    NodeFS.writeFileSync(
+      NodePath.join(dir, "ai-os-board.json"),
+      JSON.stringify({
+        cards: [
+          {
+            taskId: "task-usba-page",
+            title: "Schedule still running",
+            state: withoutLedger(executing),
+            threadId: "thread:usba",
+            runId: "run:usba",
+            revision: 4,
+            updatedAt: "2026-10-21T18:00:00Z",
+          },
+          {
+            taskId: "task-usba-qa",
+            title: "Schedule waiting on QA",
+            state: withoutLedger(awaiting),
+            threadId: null,
+            revision: 5,
+            updatedAt: "2026-10-21T18:05:00Z",
+          },
+        ],
+        ledger: {},
+      }),
+    );
+    const { handler } = handlerFor(dir);
+    const loaded = await readCards(handler);
+    expect(loaded.map((card) => [card.taskId, card.title, card.state.phase])).toEqual([
+      ["task-usba-page", "Schedule still running", "executing"],
+      ["task-usba-qa", "Schedule waiting on QA", "awaiting_qa"],
+    ]);
+  });
+
   it("rejects an empty id, a blank title, and a non-Z timestamp", async () => {
     const dir = preparedDir();
     seedIdle(dir, [{ taskId: "task-a", title: "First" }]);
