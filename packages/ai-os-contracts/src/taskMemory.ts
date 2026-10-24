@@ -19,6 +19,7 @@ import { ContractTransitionError } from "./errors.ts";
 import {
   MemoryNodeKindV1,
   packageFacts,
+  packageProposals,
   ProposedRelationshipV1,
   type MemoryFactV1,
 } from "./memory.ts";
@@ -93,6 +94,9 @@ export const TaskMemoryPackageV1 = Schema.Struct({
     decisions: lineList,
     knowledge: lineList,
     conflicts: Schema.Array(ConflictOrientationV1),
+    proposals: Schema.Array(OrientationLineV1).pipe(
+      Schema.withDecodingDefault(Effect.sync(() => [] as ReadonlyArray<OrientationLineV1>)),
+    ),
   }),
   detail: lineList,
   summaries: Schema.Array(ArtifactSummaryV1),
@@ -250,6 +254,7 @@ export const orientationText = (memoryPackage: TaskMemoryPackageV1): readonly st
     (conflict) =>
       `Open conflict ${conflict.conflictId}: ${conflict.acceptedBody} / ${conflict.proposedBody} (${conflict.authorId})`,
   ),
+  ...memoryPackage.orientation.proposals.map((line) => `proposed, not accepted: ${line.body}`),
   ...memoryPackage.summaries.map((item) => item.summary),
 ];
 
@@ -269,10 +274,12 @@ export const promptCarriesMemory = (memoryPackage: TaskMemoryPackageV1, prompt: 
 export const taskWritePrompt = (
   memoryPackage: TaskMemoryPackageV1,
   writePath: string,
+  writeToken: string,
 ): readonly string[] => [
   `Memory write: POST ${writePath} for attempt ${memoryPackage.attemptId} in project ${memoryPackage.projectId}.`,
-  `Record a fact: {"attemptId":"${memoryPackage.attemptId}","write":{"kind":"fact","identity":"<identity>","nodeKind":"Decision","body":"<statement>","evidence":[{"evidenceId":"<id>","note":"<source>"}]}}`,
-  `Propose findings: {"attemptId":"${memoryPackage.attemptId}","write":{"kind":"findings","facts":[{"identity":"<identity>","fact":{"acceptance":"proposed","factId":"<id>","projectId":"${memoryPackage.projectId}","kind":"Decision","body":"<statement>","provenance":{"actorId":"${memoryPackage.authorId}","at":"${memoryPackage.createdAt}"},"validity":{"from":"${memoryPackage.createdAt}","until":null}}}],"relationships":[],"evidence":[{"evidenceId":"<id>","note":"<source>"}]}}`,
+  `Memory write token: ${writeToken}`,
+  `Record a fact: {"attemptId":"${memoryPackage.attemptId}","writeToken":"${writeToken}","write":{"kind":"fact","identity":"<identity>","nodeKind":"Decision","body":"<statement>","evidence":[{"evidenceId":"<id>","note":"<source>"}]}}`,
+  `Propose findings: {"attemptId":"${memoryPackage.attemptId}","writeToken":"${writeToken}","write":{"kind":"findings","facts":[{"identity":"<identity>","fact":{"acceptance":"proposed","factId":"<id>","projectId":"${memoryPackage.projectId}","kind":"Decision","body":"<statement>","provenance":{"actorId":"${memoryPackage.authorId}","at":"${memoryPackage.createdAt}"},"validity":{"from":"${memoryPackage.createdAt}","until":null}}}],"relationships":[],"evidence":[{"evidenceId":"<id>","note":"<source>"}]}}`,
   "This attempt has one write. A stale or contradictory proposal is kept as a conflict for the Memory Steward.",
 ];
 
@@ -291,6 +298,22 @@ export const prepareTaskMemory = (
       Effect.mapError(() => invalid("The task memory request does not match the schema.")),
     );
     const current = packageFacts(ledger.graph, decoded.projectId, decoded.createdAt);
+    const pendingProposals = packageProposals(
+      ledger.graph,
+      decoded.projectId,
+      decoded.createdAt,
+    ).filter((fact) => {
+      const named = ledger.identities.find(
+        (item) => item.factId === fact.factId && item.projectId === decoded.projectId,
+      );
+      if (named === undefined) return true;
+      return !ledger.revisions.some(
+        (revision) =>
+          revision.current &&
+          revision.identity === named.identity &&
+          revision.projectId === decoded.projectId,
+      );
+    });
     const artifacts = current.filter((fact) => fact.kind === "Artifact");
     const knowledge = current.filter(
       (fact) => fact.kind !== "Instruction" && fact.kind !== "Decision" && fact.kind !== "Artifact",
@@ -320,7 +343,11 @@ export const prepareTaskMemory = (
       summary: summaryOf(fact.body),
       actorId: fact.provenance.actorId,
     }));
-    const memoryVersions = current.map((fact) => fact.factId);
+    const memoryVersions = [
+      ...current.map((fact) => fact.factId),
+      ...pendingProposals.map((fact) => fact.factId),
+    ];
+    const packaged = [...current, ...pendingProposals];
     const canonical = [
       decoded.projectId,
       decoded.taskId,
@@ -330,8 +357,11 @@ export const prepareTaskMemory = (
       decoded.repoCommit,
       decoded.requirements,
       ...[...memoryVersions].sort().map((factId) => {
-        const fact = current.find((item) => item.factId === factId);
-        return `${factId}\t${fact?.body ?? ""}`;
+        const fact = packaged.find((item) => item.factId === factId);
+        const standing = pendingProposals.some((item) => item.factId === factId)
+          ? "proposed"
+          : "accepted";
+        return `${standing}\t${factId}\t${fact?.body ?? ""}`;
       }),
       ...conflicts.map(
         (conflict) => `${conflict.conflictId}\t${conflict.acceptedBody}\t${conflict.proposedBody}`,
@@ -363,6 +393,7 @@ export const prepareTaskMemory = (
         decisions: byKind(current, "Decision"),
         knowledge: knowledge.map(lineFrom),
         conflicts,
+        proposals: pendingProposals.map(lineFrom),
       },
       detail: current.map(lineFrom),
       summaries,

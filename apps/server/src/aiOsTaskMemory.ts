@@ -1,8 +1,8 @@
 // @effect-diagnostics nodeBuiltinImport:off - node:sqlite is synchronous, and the read receipt is stored beside the ledger.
+import * as NodeCrypto from "node:crypto";
 import * as NodeSqlite from "node:sqlite";
 
 import {
-  contentDigest,
   ContractTransitionError,
   decodeAttemptMemoryActivityV1,
   decodeContextPackageSnapshotV1,
@@ -30,7 +30,8 @@ const READ_SCHEMA = `
     runtime TEXT NOT NULL,
     digest TEXT NOT NULL,
     receipt_json TEXT NOT NULL,
-    package_json TEXT NOT NULL
+    package_json TEXT NOT NULL,
+    write_token TEXT
   );
 `;
 
@@ -55,6 +56,35 @@ const rollback = (database: NodeSqlite.DatabaseSync) => {
 
 const prepareReads = (database: NodeSqlite.DatabaseSync) => {
   database.exec(READ_SCHEMA);
+  const columns = database.prepare("PRAGMA table_info(ai_os_memory_read)").all() as ReadonlyArray<{
+    name?: string;
+  }>;
+  if (!columns.some((column) => column.name === "write_token")) {
+    database.exec("ALTER TABLE ai_os_memory_read ADD COLUMN write_token TEXT");
+  }
+};
+
+/** Token supplied in this attempt's launch prompt. A stored token wins. */
+export const attemptWriteTokenSync = (
+  database: NodeSqlite.DatabaseSync,
+  attemptId: string,
+): string => {
+  prepareReads(database);
+  const row = database
+    .prepare("SELECT write_token FROM ai_os_memory_read WHERE attempt_id = ?")
+    .get(attemptId) as { write_token?: string | null } | undefined;
+  if (typeof row?.write_token === "string" && row.write_token.length > 0) return row.write_token;
+  return `wt-${NodeCrypto.randomBytes(16).toString("hex")}`;
+};
+
+const storedWriteToken = (database: NodeSqlite.DatabaseSync, attemptId: string): string | null => {
+  prepareReads(database);
+  const row = database
+    .prepare("SELECT write_token FROM ai_os_memory_read WHERE attempt_id = ?")
+    .get(attemptId) as { write_token?: string | null } | undefined;
+  return typeof row?.write_token === "string" && row.write_token.length > 0
+    ? row.write_token
+    : null;
 };
 
 const storedRead = (
@@ -96,20 +126,30 @@ export const prepareTaskMemorySync = (
 export const commitTaskReadSync = (
   database: NodeSqlite.DatabaseSync,
   prepared: PreparedTaskMemory,
+  writeToken?: string,
 ): PreparedTaskMemory => {
   prepareReads(database);
   database.exec("BEGIN IMMEDIATE");
   try {
     const existing = storedRead(database, prepared.receipt.attemptId);
     if (existing !== null) {
-      database.exec("ROLLBACK");
+      if (writeToken !== undefined) {
+        database
+          .prepare(
+            `UPDATE ai_os_memory_read
+             SET write_token = ?
+             WHERE attempt_id = ? AND write_token IS NULL`,
+          )
+          .run(writeToken, prepared.receipt.attemptId);
+      }
+      database.exec("COMMIT");
       return existing;
     }
     database
       .prepare(
         `INSERT INTO ai_os_memory_read
-          (attempt_id, receipt_id, project_id, task_id, author_id, runtime, digest, receipt_json, package_json)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          (attempt_id, receipt_id, project_id, task_id, author_id, runtime, digest, receipt_json, package_json, write_token)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         prepared.receipt.attemptId,
@@ -121,6 +161,7 @@ export const commitTaskReadSync = (
         prepared.receipt.digest,
         JSON.stringify(prepared.receipt),
         JSON.stringify(prepared.package),
+        writeToken ?? null,
       );
     database.exec("COMMIT");
     return prepared;
@@ -154,94 +195,17 @@ export const recordTaskWriteSync = (
   return submitMemorySync(database, submission, acceptingAuthorId);
 };
 
-const fitId = (prefix: string, key: string): string => {
-  const joined = `${prefix}-${key}`;
-  if (joined.length <= 128 && /^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(joined)) return joined;
-  return `${prefix}-${contentDigest(key)}`;
-};
-
-const isRecordedFact = (
-  write: unknown,
-): write is { readonly kind: "fact"; readonly identity: string } =>
-  typeof write === "object" &&
-  write !== null &&
-  "kind" in write &&
-  write.kind === "fact" &&
-  "identity" in write &&
-  typeof write.identity === "string";
-
 /**
- * A later run only reads accepted facts. A new recorded fact is accepted by
- * the authority. Findings stay proposed, and a contradiction is already a conflict.
+ * The attempt's own project and launch token.
+ * The write stays a proposal. This does not accept it.
  */
-const acceptRecordedFactSync = (
-  database: NodeSqlite.DatabaseSync,
-  receipt: SubmissionReceiptV1,
-  write: unknown,
-  acceptingAuthorId: string,
-): void => {
-  if (receipt.outcome !== "pending" || receipt.factIds.length !== 1) return;
-  if (!isRecordedFact(write)) return;
-  const proposedId = receipt.factIds[0];
-  if (proposedId === undefined) return;
-  const ledger = readMemoryLedger(database);
-  const proposed = ledger.graph.facts.find((fact) => fact.factId === proposedId);
-  const identity = ledger.identities.find((item) => item.factId === proposedId);
-  if (proposed === undefined || identity === undefined || identity.identity !== write.identity) {
-    return;
-  }
-  const current = ledger.revisions.find(
-    (revision) =>
-      revision.current &&
-      revision.identity === identity.identity &&
-      revision.projectId === receipt.projectId,
-  );
-  if (current !== undefined) return;
-  const factId = fitId("known", proposedId);
-  const key = fitId("accept", proposedId);
-  const accepted = submitMemorySync(
-    database,
-    {
-      version: "v1",
-      submissionId: key,
-      idempotencyKey: key,
-      projectId: receipt.projectId,
-      authorId: acceptingAuthorId,
-      taskId: receipt.taskId,
-      attemptId: fitId("accept", receipt.attemptId),
-      evidence: receipt.evidence,
-      expectedVersions: [],
-      intent: "accept",
-      facts: [
-        {
-          identity: identity.identity,
-          fact: {
-            acceptance: "proposed",
-            factId,
-            projectId: receipt.projectId,
-            kind: proposed.kind,
-            body: proposed.body,
-            provenance: { actorId: acceptingAuthorId, at: proposed.provenance.at },
-            validity: { from: proposed.validity.from, until: null },
-          },
-        },
-      ],
-      relationships: [],
-    },
-    acceptingAuthorId,
-  );
-  if (accepted.outcome !== "accepted" && accepted.outcome !== "duplicate") {
-    throw invalid(accepted.detail);
-  }
-};
-
-/** The attempt's own project. A recorded fact with no current statement is then accepted. */
 export const submitAttemptMemorySync = (
   database: NodeSqlite.DatabaseSync,
   attemptId: string,
   projectId: string,
   write: unknown,
   acceptingAuthorId: string,
+  writeToken: string,
 ): SubmissionReceiptV1 => {
   const activity = readAttemptActivitySync(database).find((item) => item.attemptId === attemptId);
   if (activity === undefined) {
@@ -250,9 +214,11 @@ export const submitAttemptMemorySync = (
   if (activity.projectId !== projectId) {
     throw invalid("A fact stays inside the attempt's project.");
   }
-  const receipt = recordTaskWriteSync(database, attemptId, write, acceptingAuthorId);
-  acceptRecordedFactSync(database, receipt, write, acceptingAuthorId);
-  return receipt;
+  const token = storedWriteToken(database, attemptId);
+  if (token === null || token !== writeToken) {
+    throw invalid("This write token belongs to a different attempt.");
+  }
+  return recordTaskWriteSync(database, attemptId, write, acceptingAuthorId);
 };
 
 const writeFor = (

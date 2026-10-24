@@ -91,6 +91,7 @@ import {
 import { memoryDatabasePath, openMemoryDatabase, readMemoryLedger } from "./aiOsMemory.ts";
 import { resolveMemoryConflictSync } from "./aiOsSteward.ts";
 import {
+  attemptWriteTokenSync,
   commitTaskReadSync,
   prepareTaskMemorySync,
   readAttemptActivitySync,
@@ -472,17 +473,22 @@ const suppliedForLaunch = (file: string, state: BoardSequence) =>
         detail: "This run has no project.",
       });
     }
-    const prepared = yield* withTaskMemory(file, (database) =>
-      prepareTaskMemorySync(database, request),
-    );
+    const supplied = yield* withTaskMemory(file, (database) => {
+      const prepared = prepareTaskMemorySync(database, request);
+      return {
+        prepared,
+        writeToken: attemptWriteTokenSync(database, prepared.receipt.attemptId),
+      };
+    });
     const lines = [
-      ...orientationText(prepared.package),
-      ...taskWritePrompt(prepared.package, ADAPTER_MEMORY_WRITE_PATH),
+      ...orientationText(supplied.prepared.package),
+      ...taskWritePrompt(supplied.prepared.package, ADAPTER_MEMORY_WRITE_PATH, supplied.writeToken),
     ];
-    const prompt = renderSuppliedPrompt(state.intake, prepared.contextPackage, lines);
+    const prompt = renderSuppliedPrompt(state.intake, supplied.prepared.contextPackage, lines);
     if (
-      !promptCarriesMemory(prepared.package, prompt) ||
-      !prompt.includes(ADAPTER_MEMORY_WRITE_PATH)
+      !promptCarriesMemory(supplied.prepared.package, prompt) ||
+      !prompt.includes(ADAPTER_MEMORY_WRITE_PATH) ||
+      !prompt.includes(supplied.writeToken)
     ) {
       return yield* new ContractTransitionError({
         contract: "memory",
@@ -492,12 +498,12 @@ const suppliedForLaunch = (file: string, state: BoardSequence) =>
         detail: "The launch prompt does not include the memory package.",
       });
     }
-    return { prepared, prompt, lines };
+    return { prepared: supplied.prepared, prompt, lines, writeToken: supplied.writeToken };
   });
 
 /** Store the read after the adapter has accepted the prompt that carries this package. */
-const commitSuppliedRead = (file: string, prepared: PreparedTaskMemory) =>
-  withTaskMemory(file, (database) => commitTaskReadSync(database, prepared)).pipe(
+const commitSuppliedRead = (file: string, prepared: PreparedTaskMemory, writeToken: string) =>
+  withTaskMemory(file, (database) => commitTaskReadSync(database, prepared, writeToken)).pipe(
     Effect.map(() => ({ _tag: "Ok" as const })),
     Effect.catch((error) => Effect.succeed({ _tag: "No" as const, detail: error.message })),
   );
@@ -1273,6 +1279,7 @@ export const layer = Layer.unwrap(
               const recorded = yield* commitSuppliedRead(
                 taskMemoryFile(config.stateDir),
                 supplied.value.prepared,
+                supplied.value.writeToken,
               );
               if (recorded._tag === "No") return rejectedMove(recorded.detail, rejectedState, book);
               const started = yield* applyBoardWorkflowEvent(
@@ -1486,6 +1493,7 @@ export const layer = Layer.unwrap(
                     const recorded = yield* commitSuppliedRead(
                       taskMemoryFile(config.stateDir),
                       supplied.value.prepared,
+                      supplied.value.writeToken,
                     );
                     if (recorded._tag === "No")
                       return rejectedMove(recorded.detail, queued, ledger);
@@ -1887,6 +1895,7 @@ export const layer = Layer.unwrap(
             const recorded = yield* commitSuppliedRead(
               taskMemoryFile(config.stateDir),
               supplied.value.prepared,
+              supplied.value.writeToken,
             );
             if (recorded._tag === "No") {
               return json(409, { _tag: "Rejected", detail: recorded.detail });
@@ -2075,8 +2084,9 @@ export const layer = Layer.unwrap(
           const body = readJson(text);
           if (!isRecord(body)) return json(400, { detail: "Expected a JSON object." });
           const attemptId = stringField(body, "attemptId");
-          if (attemptId === null || !("write" in body)) {
-            return json(400, { detail: "Expected attemptId and write." });
+          const writeToken = stringField(body, "writeToken");
+          if (attemptId === null || writeToken === null || !("write" in body)) {
+            return json(400, { detail: "Expected attemptId, writeToken, and write." });
           }
           const running = cardsNow().find(
             (card) =>
@@ -2090,7 +2100,7 @@ export const layer = Layer.unwrap(
             return json(409, { _tag: "Rejected", detail: "This run has no project." });
           }
           const wrote = yield* withTaskMemory(taskMemoryFile(config.stateDir), (database) =>
-            submitAttemptMemorySync(database, attemptId, projectId, body.write, "jim"),
+            submitAttemptMemorySync(database, attemptId, projectId, body.write, "jim", writeToken),
           ).pipe(
             Effect.map((receipt) => ({ _tag: "Ok" as const, receipt })),
             Effect.catch((error) => Effect.succeed({ _tag: "No" as const, detail: error.message })),

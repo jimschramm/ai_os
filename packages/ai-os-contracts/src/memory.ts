@@ -228,6 +228,20 @@ export const packageFacts = (
   );
 };
 
+/**
+ * Pending proposals for a project. These are not accepted knowledge.
+ * Callers label them `proposed, not accepted` and keep them out of `packageFacts`.
+ */
+export const packageProposals = (
+  graph: MemoryGraphV1,
+  projectId: string,
+  asOf: string,
+): ReadonlyArray<ProposedFactV1> =>
+  graph.facts.filter(
+    (fact): fact is ProposedFactV1 =>
+      fact.acceptance === "proposed" && fact.projectId === projectId && covers(fact.validity, asOf),
+  );
+
 export const historyFacts = (
   graph: MemoryGraphV1,
   projectId: string,
