@@ -200,6 +200,7 @@ Reliability rules:
 - Idempotent operations.
 - Live authorization checks.
 - Bounded retries.
+- Rework cap: three QA rework rounds are recorded on the task. The task then stops on Blocked as "Needs Jim: rework cap reached" until Jim resumes. A new attempt does not clear the count.
 - `recovery_pending`: an expired lease or a lost advisory process stays Blocked, labeled "Execution status unknown", until the earlier process is confirmed stopped. Advisory work is read-only, and that does not make a retry safe: it still uses resources and can produce duplicate or late results. Late results from the old attempt are rejected. It never returns to Ready on its own. The exception is an advisory restart: after that process is confirmed stopped, In Progress leaves Blocked and starts a new attempt. While the process might still be running, the card stays Blocked. A review marker with no pid that was written before this server started is stopped. A pid is signaled only when its boot id and start time were read and still match the marker, so a reused pid is left alone. A live pid whose identity cannot be read stays running: the marker stays, and startup does not remove its worktree. The marker is removed when the review finishes.
 
 A maintainer agent handles platform health, with independent QA and an external recovery path for when the maintainer itself is down. Operations cover backups, restore, updates, diagnostics, and docs.

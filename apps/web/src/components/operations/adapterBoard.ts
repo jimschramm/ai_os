@@ -2,6 +2,7 @@ import type { AdapterBoardCard } from "@t3tools/ai-os-adapter/board";
 import {
   QA_INCOMPLETE_LABEL,
   RECOVERY_PENDING_LABEL,
+  REWORK_CAP_LABEL,
   type SequenceState,
 } from "@t3tools/ai-os-contracts";
 
@@ -13,6 +14,7 @@ const completionOf = (state: SequenceState) => {
     case "awaiting_qa":
     case "qa_incomplete":
     case "rework":
+    case "rework_capped":
     case "accepted":
       return state.completion;
     default:
@@ -24,6 +26,7 @@ const qaOf = (state: SequenceState): OperationsTask["qa"] => {
   switch (state.phase) {
     case "awaiting_qa":
     case "rework":
+    case "rework_capped":
     case "accepted":
       return state.qa;
     default:
@@ -37,6 +40,7 @@ const runOf = (state: SequenceState) => {
     case "awaiting_qa":
     case "qa_incomplete":
     case "rework":
+    case "rework_capped":
     case "accepted":
     case "recovery_pending":
     case "review_delivered":
@@ -61,39 +65,47 @@ const taskFromAdapterCard = (card: AdapterBoardCard): OperationsTask | null => {
   const report = run?.progress ?? null;
   const progressBlocker = report?.status === "blocked" ? report.blockers[0] : undefined;
   const needsYou =
-    state.phase === "recovery_pending"
+    state.phase === "rework_capped"
       ? {
-          id: `${card.taskId}-recovery`,
-          kind: "blocker" as const,
-          summary: RECOVERY_PENDING_LABEL,
-          nextAction: "Read the T3 thread, then resume or take over.",
-          actionLabel: "Resume",
+          id: `${card.taskId}-rework-cap`,
+          kind: "decision" as const,
+          summary: REWORK_CAP_LABEL,
+          nextAction: state.notice.recommendation,
+          actionLabel: "Jim resumes",
         }
-      : state.phase === "qa_incomplete"
+      : state.phase === "recovery_pending"
         ? {
-            id: `${card.taskId}-qa-incomplete`,
+            id: `${card.taskId}-recovery`,
             kind: "blocker" as const,
-            summary: QA_INCOMPLETE_LABEL,
-            nextAction: "Send the review to a verified reviewer on a different model.",
-            actionLabel: "Route review",
+            summary: RECOVERY_PENDING_LABEL,
+            nextAction: "Read the T3 thread, then resume or take over.",
+            actionLabel: "Resume",
           }
-        : state.phase === "failed"
+        : state.phase === "qa_incomplete"
           ? {
-              id: `${card.taskId}-failed`,
+              id: `${card.taskId}-qa-incomplete`,
               kind: "blocker" as const,
-              summary: state.blocker.summary,
-              nextAction: state.blocker.nextAction,
-              actionLabel: "I'll take it",
+              summary: QA_INCOMPLETE_LABEL,
+              nextAction: "Send the review to a verified reviewer on a different model.",
+              actionLabel: "Route review",
             }
-          : progressBlocker === undefined
-            ? null
-            : {
-                id: `${card.taskId}-progress-block`,
+          : state.phase === "failed"
+            ? {
+                id: `${card.taskId}-failed`,
                 kind: "blocker" as const,
-                summary: progressBlocker.summary,
-                nextAction: progressBlocker.nextAction,
+                summary: state.blocker.summary,
+                nextAction: state.blocker.nextAction,
                 actionLabel: "I'll take it",
-              };
+              }
+            : progressBlocker === undefined
+              ? null
+              : {
+                  id: `${card.taskId}-progress-block`,
+                  kind: "blocker" as const,
+                  summary: progressBlocker.summary,
+                  nextAction: progressBlocker.nextAction,
+                  actionLabel: "I'll take it",
+                };
   return {
     id: card.taskId,
     projectId: state.intake.projectId,
@@ -115,6 +127,7 @@ const taskFromAdapterCard = (card: AdapterBoardCard): OperationsTask | null => {
     candidates: [],
     usage: run?.usage ?? [],
     needsYou,
+    reworkCap: state.phase === "rework_capped" ? state.notice : null,
     result: completion?.claimedOutcome ?? null,
   };
 };

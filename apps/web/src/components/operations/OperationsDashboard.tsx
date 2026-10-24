@@ -661,6 +661,34 @@ function TaskDrawerBody({
               </ul>
             )}
           </section>
+          {task.reworkCap == null ? null : (
+            <section aria-labelledby="rework-cap-heading">
+              <h3 id="rework-cap-heading" className="text-sm font-semibold">
+                {task.reworkCap.label}
+              </h3>
+              <p className="mt-2 text-sm leading-6">{task.reworkCap.recommendation}</p>
+              <ul className="mt-2 flex flex-col gap-1">
+                {task.reworkCap.remainingIssue.map((finding) => (
+                  <li key={finding.defect} className="text-sm">
+                    {finding.defect}
+                  </li>
+                ))}
+              </ul>
+              <ol className="mt-3 flex flex-col gap-2">
+                {task.reworkCap.attemptedFixes.map((round) => (
+                  <li key={round.round} className="text-sm">
+                    <span className="text-muted-foreground">Round {round.round}</span>{" "}
+                    {round.summary}
+                    {round.commitSha === null ? null : (
+                      <span className="mt-1 block font-mono text-xs text-muted-foreground">
+                        {round.commitSha.slice(0, 7)}
+                      </span>
+                    )}
+                  </li>
+                ))}
+              </ol>
+            </section>
+          )}
           <AdvisoryReviewSection task={task} live={live} />
           <section aria-labelledby="qa-heading">
             <h3 id="qa-heading" className="text-sm font-semibold">
@@ -740,7 +768,7 @@ function ProgressStepper({ phase }: { phase: OperationsTask["phase"] }) {
             </span>
             {current && state.stalled ? (
               <Badge size="sm" variant="warning">
-                Unknown
+                {phase === "rework_capped" ? "Needs Jim" : "Unknown"}
               </Badge>
             ) : null}
           </li>

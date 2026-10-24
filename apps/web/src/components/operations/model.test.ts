@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vite-plus/test";
-import { RECOVERY_PENDING_LABEL } from "@t3tools/ai-os-contracts";
+import { RECOVERY_PENDING_LABEL, REWORK_CAP_LABEL } from "@t3tools/ai-os-contracts";
 
 import { OPERATIONS_TASKS } from "./fixtures";
 import { factById } from "./memoryModel";
@@ -34,6 +34,11 @@ describe("operations mockup", () => {
     expect(columnFor(blocked[0]!)).toBe("Blocked");
     expect(qaStatusLabel(blocked[0]!)).toBe(RECOVERY_PENDING_LABEL);
     expect(qaStatusLabel(blocked[0]!)).toBe("Execution status unknown");
+    const sample = tasksForProject("usba")[0];
+    expect(sample).toBeDefined();
+    if (sample === undefined) return;
+    expect(qaStatusLabel({ ...sample, phase: "rework_capped" })).toBe(REWORK_CAP_LABEL);
+    expect(columnFor({ ...sample, phase: "rework_capped" })).toBe("Blocked");
   });
 
   it("fills every column for the USBA workspace", () => {

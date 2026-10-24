@@ -3,6 +3,7 @@ import {
   QA_INCOMPLETE_LABEL,
   RECOVERY_PENDING_LABEL,
   REVIEW_DELIVERED_LABEL,
+  REWORK_CAP_LABEL,
   usageTotals,
   type KanbanColumn,
   type UsageMeasurementV1,
@@ -24,7 +25,7 @@ export const BOARD_COLUMNS = [
   { id: "Ready", label: "Ready/Queued", hint: "Assigned or back for another pass" },
   { id: "Running", label: "In Progress", hint: "Someone is in the work" },
   { id: "Review", label: "In QA", hint: "Waiting on an independent review" },
-  { id: "Blocked", label: "Blocked", hint: "Includes execution status unknown" },
+  { id: "Blocked", label: "Blocked", hint: "Execution status unknown, or needs Jim" },
   { id: "Done", label: "Done", hint: "Accepted by a different model" },
 ] as const satisfies readonly {
   readonly id: KanbanColumn;
@@ -114,6 +115,7 @@ export function tasksInColumn(
 }
 
 export function qaStatusLabel(task: OperationsTask): string {
+  if (task.phase === "rework_capped") return REWORK_CAP_LABEL;
   if (task.phase === "recovery_pending") return RECOVERY_PENDING_LABEL;
   if (task.phase === "qa_incomplete") return QA_INCOMPLETE_LABEL;
   if (task.phase === "review_delivered") return REVIEW_DELIVERED_LABEL;
@@ -124,7 +126,12 @@ export function qaStatusLabel(task: OperationsTask): string {
 }
 
 export function qaBadgeTone(task: OperationsTask): QaBadgeTone {
-  if (task.phase === "recovery_pending" || task.phase === "qa_incomplete") return "warning";
+  if (
+    task.phase === "rework_capped" ||
+    task.phase === "recovery_pending" ||
+    task.phase === "qa_incomplete"
+  )
+    return "warning";
   if (task.qa === null) return "secondary";
   if (task.qa.availability === "unavailable") return "warning";
   if (task.qa.verdict === "rework") return "warning";

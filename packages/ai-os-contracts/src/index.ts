@@ -12,6 +12,7 @@ export * from "./submission.ts";
 export * from "./taskMemory.ts";
 export * from "./usage.ts";
 export * from "./control.ts";
+export * from "./reworkCap.ts";
 export * from "./delivery.ts";
 export * from "./sequence.ts";
 export * from "./kanbanMove.ts";

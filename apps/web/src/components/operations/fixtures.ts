@@ -9,6 +9,7 @@ import {
   type ProgressReportV1,
   type AdvisoryReviewV1,
   type QaVerdictV1,
+  type ReworkCapNoticeV1,
   type SequencePhase,
   type UsageMeasurementV1,
 } from "@t3tools/ai-os-contracts";
@@ -63,6 +64,7 @@ export interface OperationsTask {
   readonly candidates: readonly MemoryCandidateV1[];
   readonly usage: readonly UsageMeasurementV1[];
   readonly needsYou: NeedsYouItem | null;
+  readonly reworkCap?: ReworkCapNoticeV1 | null;
   readonly result: string | null;
 }
 
