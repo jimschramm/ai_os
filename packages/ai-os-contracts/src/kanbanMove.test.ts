@@ -337,7 +337,7 @@ it.effect("queues a backlog card through acknowledge and pauses only through the
 
 it.effect("keeps a completion claim from counting as acceptance", () =>
   Effect.gen(function* () {
-    const executing = phase(yield* applySequence(happyPathEvents.slice(0, 4)), "executing");
+    const executing = phase(yield* applySequence(happyPathEvents.slice(0, 5)), "executing");
     const submitted = yield* applyBoardWorkflowEvent(
       executing,
       {

@@ -274,6 +274,14 @@ export const RuntimeModelsV1 = Schema.Struct({
 });
 export type RuntimeModelsV1 = typeof RuntimeModelsV1.Type;
 
+/** An earlier QA attempt that did not count as independent QA. */
+export const PriorReviewV1 = Schema.Struct({
+  findings: Schema.Array(QaFindingV1),
+  artifactRevision: ArtifactRevisionV1,
+  attemptedVerdict: Schema.Literals(["rework", "accept"]),
+});
+export type PriorReviewV1 = typeof PriorReviewV1.Type;
+
 export const RunV1 = Schema.Struct({
   generation: PositiveInt,
   leaseId: ContractId,
@@ -287,6 +295,8 @@ export const RunV1 = Schema.Struct({
   reviewerRuntime: Schema.optionalKey(RuntimeModelsV1),
   // Absent on runs recorded before advisory review existed.
   advisory: Schema.optionalKey(AdvisoryReviewV1),
+  // Earlier incomplete reviews. Absent until a verified reviewer replaces one.
+  priorReviews: Schema.optionalKey(Schema.Array(PriorReviewV1)),
 }).check(
   Schema.makeFilter((run) => {
     if (run.retryCount > run.retryLimit) {
@@ -844,6 +854,14 @@ const applyCompletion = (
         "Rework must submit a new artifact revision.",
       );
     }
+    if ((state.run.implementerRuntime?.actual ?? null) === null) {
+      return yield* reject(
+        state,
+        event,
+        "qa_model_unknown",
+        "The implementer's actual model is unknown, so this completion is not submitted.",
+      );
+    }
     return {
       phase: "awaiting_qa" as const,
       intake: state.intake,
@@ -856,6 +874,24 @@ const applyCompletion = (
       commands: state.commands,
     };
   });
+
+/** Keep the incomplete attempt when a later review replaces it. */
+const withPriorReview = (
+  state: Extract<SequenceState, { phase: "awaiting_qa" | "qa_incomplete" }>,
+) => {
+  if (state.phase !== "qa_incomplete") return state.run;
+  return {
+    ...state.run,
+    priorReviews: [
+      ...(state.run.priorReviews ?? []),
+      {
+        findings: state.findings,
+        artifactRevision: state.artifactRevision,
+        attemptedVerdict: state.attemptedVerdict,
+      },
+    ],
+  };
+};
 
 const applyQa = (
   state: SequenceState,
@@ -899,7 +935,7 @@ const applyQa = (
         completion: state.completion,
         qa,
         reworkRevision: state.reworkRevision,
-        run: state.run,
+        run: withPriorReview(state),
         commands: state.commands,
       };
     }
@@ -931,7 +967,7 @@ const applyQa = (
         artifactRevision: qa.artifactRevision,
         attemptedVerdict: qa.verdict,
         reworkRevision: state.reworkRevision,
-        run: state.run,
+        run: withPriorReview(state),
         commands: state.commands,
         qaLabel: QA_INCOMPLETE_LABEL,
       };
@@ -948,7 +984,7 @@ const applyQa = (
         completion: state.completion,
         qa,
         reworkRevision: qa.artifactRevision,
-        run: state.run,
+        run: withPriorReview(state),
         commands: state.commands,
       };
     }
@@ -959,7 +995,7 @@ const applyQa = (
       assignment: state.assignment,
       completion: state.completion,
       qa,
-      run: state.run,
+      run: withPriorReview(state),
       commands: state.commands,
       deliveries: [],
     };

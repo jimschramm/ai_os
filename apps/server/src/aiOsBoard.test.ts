@@ -687,6 +687,15 @@ describe("ai-os board route", () => {
           summary: "Done already.",
         });
       },
+      watchThread: () =>
+        Effect.succeed({
+          threadId: "thread-fast",
+          runId: "run-fast",
+          status: "completed",
+          text: "Done already.",
+          revision: null,
+          actualModel: "gpt-5.4",
+        }),
     });
     await reachAssigned(handler);
     const moved = await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
@@ -745,6 +754,22 @@ describe("ai-os board route", () => {
     });
     expect(started.status).toBe(200);
     expect(await phaseOfHandler(handler)).toBe("executing");
+    const recorded = await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
+      taskId: "task-demo",
+      title: "Demo task",
+      idempotencyKey: "runtime-settled",
+      event: {
+        type: "record_runtime_models",
+        taskId: "task-demo",
+        attemptId: "attempt-1",
+        generation: 1,
+        leaseId: leaseIdFor(1),
+        role: "implementer",
+        requested: { model: "gpt-5.4" },
+        actual: { model: "gpt-5.4" },
+      },
+    });
+    expect(recorded.status).toBe(200);
     const done = await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
       taskId: "task-demo",
       title: "Demo task",
@@ -1448,6 +1473,179 @@ describe("ai-os board route", () => {
     expect(still.state.attemptedVerdict).toBe("accept");
     expect(still.state.findings).toEqual([finding]);
     expect(models).toEqual(["gpt-5.4"]);
+  });
+
+  it("blocks completion when the implementer's actual model is unknown", async () => {
+    const { handler } = handlerFor();
+    await reachExecuting(handler);
+    const blocked = await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
+      taskId: "task-demo",
+      title: "Demo task",
+      idempotencyKey: "complete-unknown-implementer",
+      event: {
+        type: "submit_completion",
+        completion: {
+          version: "v1",
+          taskId: "task-demo",
+          attemptId: "attempt-1",
+          generation: 1,
+          leaseId: leaseIdFor(1),
+          claimedOutcome: "Finished without a reported model.",
+          artifactRevision: { type: "named", kind: "page", id: "t3-result" },
+          evidence: [{ kind: "readback", ref: "thread:thread-1" }],
+        },
+      },
+    });
+    expect(blocked.status).toBe(409);
+    expect(await blocked.json()).toMatchObject({
+      detail: expect.stringMatching(/actual model is unknown/),
+    });
+    expect(await phaseOfHandler(handler)).toBe("executing");
+  });
+
+  it("rejects a reviewer thread that is the implementer's thread", async () => {
+    const { runs } = sessionRuns({ requested: REVIEWER, actual: REVIEWER });
+    const { handler } = handlerFor(undefined, runs);
+    await reachAssigned(handler);
+    await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
+      taskId: "task-demo",
+      column: "Running",
+      idempotencyKey: "impl-own-thread",
+    });
+    const waiting = (await readCards(handler)).find((card) => card.taskId === "task-demo");
+    if (waiting?.state.phase !== "awaiting_qa" || waiting.threadId === null) {
+      throw new Error("expected the implementer's thread");
+    }
+    const revision = waiting.state.completion.artifactRevision;
+    if (revision.type !== "git") throw new Error("expected the provider revision");
+    const rejected = await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
+      taskId: "task-demo",
+      title: "Demo task",
+      idempotencyKey: "qa-own-thread",
+      event: { ...qaEvent(revision, "accept", REVIEWER), threadId: waiting.threadId },
+    });
+    expect(rejected.status).toBe(409);
+    expect(await rejected.json()).toMatchObject({
+      detail: expect.stringMatching(/implementer's thread/),
+    });
+    expect(await phaseOfHandler(handler)).toBe("awaiting_qa");
+  });
+
+  it("rejects a reviewer thread that belongs to another task", async () => {
+    const { runs } = sessionRuns({ requested: REVIEWER, actual: REVIEWER });
+    const { handler } = handlerFor(undefined, runs);
+    await reachAssigned(handler);
+    await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
+      taskId: "task-demo",
+      column: "Running",
+      idempotencyKey: "impl-this-task",
+    });
+    expect(
+      (
+        await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
+          taskId: "task-other",
+          title: "Other task",
+          idempotencyKey: "intake-other",
+          event: {
+            type: "intake",
+            intake: { ...intakeV2Example, projectId: "usba", workspaceId: "usba" },
+          },
+        })
+      ).status,
+    ).toBe(200);
+    expect(
+      (
+        await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
+          taskId: "task-other",
+          column: "Ready",
+          idempotencyKey: "ready-other",
+        })
+      ).status,
+    ).toBe(200);
+    expect(
+      (
+        await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
+          taskId: "task-other",
+          title: "Other task",
+          idempotencyKey: "assign-other",
+          event: {
+            type: "assign",
+            assignment: {
+              ...assignmentExample,
+              taskId: "task-other",
+              attemptId: "attempt-other",
+              assignmentId: "assignment-other",
+            },
+          },
+        })
+      ).status,
+    ).toBe(200);
+    expect(
+      (
+        await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
+          taskId: "task-other",
+          column: "Running",
+          idempotencyKey: "run-other",
+        })
+      ).status,
+    ).toBe(200);
+    const cards = await readCards(handler);
+    const demo = cards.find((card) => card.taskId === "task-demo");
+    const other = cards.find((card) => card.taskId === "task-other");
+    if (demo?.state.phase !== "awaiting_qa" || other === undefined || other.threadId === null) {
+      throw new Error("expected the other task's thread");
+    }
+    const revision = demo.state.completion.artifactRevision;
+    if (revision.type !== "git") throw new Error("expected the provider revision");
+    const rejected = await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
+      taskId: "task-demo",
+      title: "Demo task",
+      idempotencyKey: "qa-other-task",
+      event: { ...qaEvent(revision, "accept", REVIEWER), threadId: other.threadId },
+    });
+    expect(rejected.status).toBe(409);
+    expect(await rejected.json()).toMatchObject({
+      detail: expect.stringMatching(/not from this task/),
+    });
+    expect(await phaseOfHandler(handler)).toBe("awaiting_qa");
+  });
+
+  it("lets a verified reviewer replace an unknown one and accept", async () => {
+    const reviewer = { requested: REVIEWER, actual: null as string | null };
+    const { runs } = sessionRuns(reviewer);
+    const { handler } = handlerFor(undefined, runs);
+    await reachAssigned(handler);
+    await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
+      taskId: "task-demo",
+      column: "Running",
+      idempotencyKey: "impl-replace",
+    });
+    const waiting = (await readCards(handler)).find((card) => card.taskId === "task-demo");
+    if (waiting?.state.phase !== "awaiting_qa") throw new Error("expected review");
+    const revision = waiting.state.completion.artifactRevision;
+    if (revision.type !== "git") throw new Error("expected the provider revision");
+    const held = await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
+      taskId: "task-demo",
+      title: "Demo task",
+      idempotencyKey: "qa-held",
+      event: qaEvent(revision, "accept", REVIEWER),
+    });
+    expect(held.status).toBe(200);
+    expect(await phaseOfHandler(handler)).toBe("qa_incomplete");
+    reviewer.actual = REVIEWER;
+    const accepted = await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
+      taskId: "task-demo",
+      title: "Demo task",
+      idempotencyKey: "qa-verified",
+      event: qaEvent(revision, "accept", REVIEWER),
+    });
+    expect(accepted.status).toBe(200);
+    const done = (await readCards(handler)).find((card) => card.taskId === "task-demo");
+    expect(done?.state.phase).toBe("accepted");
+    if (done?.state.phase !== "accepted") throw new Error("expected acceptance");
+    expect(modelName(done.state.run.reviewerRuntime?.actual)).toBe(REVIEWER);
+    expect(done.state.run.priorReviews?.[0]?.attemptedVerdict).toBe("accept");
+    expect(done.state.run.priorReviews?.[0]?.findings).toEqual([finding]);
   });
 
   it("rejects a verdict whose models differ from the submitting session", async () => {

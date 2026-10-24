@@ -126,6 +126,8 @@ export interface T3ThreadView {
   readonly requestedModel?: string | null;
   /** Model the provider session reported. Null is not the request and not the assignment. */
   readonly actualModel?: string | null;
+  /** Project that owns the thread. Absent when the lookup did not read one. */
+  readonly projectId?: string | null;
 }
 
 export interface T3ContinueRequest {
@@ -275,6 +277,7 @@ export const threadViewFromProjection = (
     revision,
     requestedModel: requested.length > 0 ? requested : null,
     actualModel: reported.length > 0 ? reported : null,
+    projectId: projection.thread.projectId,
     ...(usage?.inputTokens === undefined ? {} : { inputTokens: usage.inputTokens }),
     ...(usage?.outputTokens === undefined ? {} : { outputTokens: usage.outputTokens }),
   };

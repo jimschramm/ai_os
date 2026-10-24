@@ -125,7 +125,7 @@ it.effect("confirms only after the intake is a durable receipt", () =>
 
 it.effect("keeps a completion claim out of acceptance until independent QA", () =>
   Effect.gen(function* () {
-    const executing = yield* applySequence(happyPathEvents.slice(0, 4));
+    const executing = yield* applySequence(happyPathEvents.slice(0, 5));
     const submitted = yield* applySequenceEvent(executing, {
       type: "submit_completion",
       completion: completionExample,
@@ -265,6 +265,7 @@ it.effect("delivers an advisory review without entering QA", () =>
         assignment: { ...assignmentExample, taskType: "implementation" as const },
       },
       { type: "start_execution" },
+      runtimeRecord("implementer", "gpt-5.4"),
       { type: "submit_completion", completion: completionExample },
     ]);
     assert.strictEqual(implementation.phase, "awaiting_qa");
@@ -366,46 +367,24 @@ it.effect("keeps QA on the runtime implementer when usage names another model", 
   }),
 );
 
-it.effect("rejects acceptance when an actual model is unknown", () =>
+it.effect("blocks completion when the implementer's actual model is unknown", () =>
   Effect.gen(function* () {
-    const reviewerOnly = yield* applySequence([
-      happyPathEvents[0]!,
-      happyPathEvents[1]!,
-      happyPathEvents[2]!,
-      { type: "start_execution" },
-      { type: "submit_completion", completion: completionExample },
-      runtimeRecord("reviewer", "claude-sonnet-5"),
-    ]);
-    const missingImplementer = yield* applySequenceEvent(reviewerOnly, {
-      type: "qa",
-      threadId: "thread-qa",
-      qa: acceptOn("claude-sonnet-5", "gpt-5.4"),
+    const executing = yield* applySequence(happyPathEvents.slice(0, 4));
+    const blocked = yield* failure(executing, {
+      type: "submit_completion",
+      completion: completionExample,
     });
-    assert.strictEqual(missingImplementer.phase, "qa_incomplete");
-    if (reviewerOnly.phase !== "awaiting_qa") return;
-    assert.strictEqual(reviewerOnly.assignment.implementerModel.model, "gpt-5.4");
-    assert.strictEqual(reviewerOnly.run.implementerRuntime, undefined);
-
-    const neither = yield* applySequence([
-      ...happyPathEvents.slice(0, 4),
-      { type: "submit_completion", completion: completionExample },
-    ]);
-    const missingBoth = yield* applySequenceEvent(neither, {
-      type: "qa",
-      threadId: "thread-qa",
-      qa: acceptOn("claude-sonnet-5", "gpt-5.4"),
-    });
-    assert.strictEqual(missingBoth.phase, "qa_incomplete");
+    assert.strictEqual(blocked.reason, "qa_model_unknown");
+    assert.strictEqual(executing.phase, "executing");
+    const submitted = yield* applySequence(happyPathEvents.slice(0, 6));
+    assert.strictEqual(submitted.phase, "awaiting_qa");
   }),
 );
 
 it.effect("keeps findings and waits for a verified reviewer when a model is unknown", () =>
   Effect.gen(function* () {
     if (qaReworkExample.availability !== "available") return;
-    const awaiting = yield* applySequence([
-      ...happyPathEvents.slice(0, 4),
-      { type: "submit_completion", completion: completionExample },
-    ]);
+    const awaiting = yield* applySequence(happyPathEvents.slice(0, 6));
     const reworked = yield* applySequenceEvent(awaiting, {
       type: "qa",
       threadId: "thread-qa",
@@ -447,6 +426,49 @@ it.effect("keeps findings and waits for a verified reviewer when a model is unkn
       qa: qaReworkExample,
     });
     assert.strictEqual(done.phase, "rework");
+    if (done.phase !== "rework") return;
+    assert.strictEqual(done.run.priorReviews?.[0]?.attemptedVerdict, "rework");
+    assert.deepStrictEqual(done.run.priorReviews?.[0]?.findings, qaReworkExample.findings);
+  }),
+);
+
+it.effect("a verified reviewer replaces an unknown one and can accept", () =>
+  Effect.gen(function* () {
+    if (qaReworkExample.availability !== "available") {
+      return yield* Effect.die("The rework example must be an available verdict.");
+    }
+    const awaiting = yield* applySequence(happyPathEvents.slice(0, 6));
+    const held = yield* applySequenceEvent(awaiting, {
+      type: "qa",
+      threadId: "thread-qa",
+      qa: {
+        ...acceptOn("claude-sonnet-5", "gpt-5.4"),
+        findings: qaReworkExample.findings,
+      },
+    });
+    if (held.phase !== "qa_incomplete") {
+      return yield* Effect.die("An unknown reviewer must leave the review incomplete.");
+    }
+    const verified = yield* applySequenceEvent(held, runtimeRecord("reviewer", "claude-sonnet-5"));
+    const accepted = yield* applySequenceEvent(verified, {
+      type: "qa",
+      threadId: "thread-qa",
+      qa: {
+        ...acceptOn("claude-sonnet-5", "gpt-5.4"),
+        findings: [],
+      },
+    });
+    assert.strictEqual(accepted.phase, "accepted");
+    if (accepted.phase !== "accepted") return;
+    assert.strictEqual(accepted.run.reviewerRuntime?.actual?.model, "claude-sonnet-5");
+    assert.strictEqual(accepted.run.priorReviews?.[0]?.attemptedVerdict, "accept");
+    assert.deepStrictEqual(accepted.run.priorReviews?.[0]?.findings, qaReworkExample.findings);
+    const swapped = yield* failure(verified, {
+      ...runtimeRecord("reviewer", "gpt-6-astra"),
+      requested: { model: "gpt-6-astra" },
+      actual: { model: "gpt-6-astra" },
+    });
+    assert.strictEqual(swapped.reason, "illegal_transition");
   }),
 );
 
@@ -733,7 +755,7 @@ it.effect("retries an advisory review under a new attempt and rejects the old on
 
 it.effect("rejects a completion or QA payload for a different task", () =>
   Effect.gen(function* () {
-    const executing = yield* applySequence(happyPathEvents.slice(0, 4));
+    const executing = yield* applySequence(happyPathEvents.slice(0, 5));
     const otherTask = yield* failure(executing, {
       type: "submit_completion",
       completion: { ...completionExample, taskId: "task-other" },

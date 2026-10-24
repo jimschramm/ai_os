@@ -30,6 +30,7 @@ import {
   executionLaunchKey,
   openBoardTask,
   requestKanbanMove,
+  sameModelName,
   SequenceState,
   type ContextPackageSnapshotV1,
   type SequenceEvent,
@@ -398,6 +399,8 @@ const recordConfirmedRun = (input: {
   readonly disposition: BoardLaunchDisposition;
   readonly summary: string | null;
   readonly ledger: KanbanMoveLedger;
+  /** Provider-reported model. A finished run without one is not submitted for QA. */
+  readonly implementerActual?: string | null;
 }): Effect.Effect<KanbanMoveResult> =>
   Effect.gen(function* () {
     const queued =
@@ -422,10 +425,32 @@ const recordConfirmedRun = (input: {
     if (started._tag !== "Applied" || started.state.phase !== "executing") return started;
     if (input.disposition === "active") return started;
     const run = started.state.run;
+    const actual = input.implementerActual?.trim() ?? "";
+    const recorded =
+      input.disposition === "completed" && actual.length > 0
+        ? yield* applyBoardWorkflowEvent(
+            started.state,
+            {
+              type: "record_runtime_models",
+              taskId: input.taskId,
+              attemptId,
+              generation: run.generation,
+              leaseId: run.leaseId,
+              role: "implementer",
+              requested: { model: actual },
+              actual: { model: actual },
+            },
+            `runtime-${input.taskId}-${run.generation}-implementer`,
+            input.taskId,
+            started.ledger,
+          )
+        : started;
+    if (recorded._tag !== "Applied" || recorded.state.phase !== "executing") return recorded;
+    if (input.disposition === "completed" && actual.length === 0) return recorded;
     const terminal =
       input.disposition === "completed"
         ? yield* applyBoardWorkflowEvent(
-            started.state,
+            recorded.state,
             {
               type: "submit_completion",
               completion: {
@@ -441,7 +466,7 @@ const recordConfirmedRun = (input: {
             },
             `complete-${input.taskId}-${run.generation}`,
             input.taskId,
-            started.ledger,
+            recorded.ledger,
           )
         : yield* applyBoardWorkflowEvent(
             started.state,
@@ -463,7 +488,7 @@ const recordConfirmedRun = (input: {
             input.taskId,
             started.ledger,
           );
-    return terminal._tag === "Applied" ? terminal : started;
+    return terminal._tag === "Applied" ? terminal : recorded;
   });
 
 const publicMove = (result: KanbanMoveResult) =>
@@ -734,12 +759,41 @@ export const layer = Layer.unwrap(
           runId: viewed.runId ?? runId,
         };
       });
+    const namedThread = (threadId: string | null | undefined): string | null =>
+      threadId !== undefined && threadId !== null && threadId.length > 0 ? threadId : null;
+    const reviewerThreadProblem = (
+      reviewerThread: string | null,
+      implementerThread: string | null,
+      taskId: string,
+      taskProjectId: string | null,
+      reviewerProject: string | null | undefined,
+    ): string | null => {
+      if (reviewerThread === null) return null;
+      if (implementerThread !== null && reviewerThread === implementerThread) {
+        return "The reviewer's thread is the implementer's thread.";
+      }
+      const otherTask = cardsNow().find(
+        (card) => card.taskId !== taskId && card.threadId === reviewerThread,
+      );
+      if (otherTask !== undefined) return "The reviewer's thread is not from this task.";
+      if (
+        taskProjectId !== null &&
+        reviewerProject !== undefined &&
+        reviewerProject !== null &&
+        reviewerProject.length > 0 &&
+        reviewerProject !== taskProjectId
+      ) {
+        return "The reviewer's thread is not from this task.";
+      }
+      return null;
+    };
     const recordSubmittedReviewer = (
       state: BoardSequence,
       event: Extract<SequenceEvent, { type: "qa" }>,
       taskId: string,
       idempotencyKey: string,
       book: KanbanMoveLedger,
+      implementerThreadId: string | null,
     ) =>
       Effect.gen(function* () {
         if (event.qa.availability !== "available") {
@@ -748,15 +802,47 @@ export const layer = Layer.unwrap(
         if (state.phase !== "awaiting_qa" && state.phase !== "qa_incomplete") {
           return { _tag: "Ready" as const, state, book };
         }
+        const named = namedThread(event.threadId);
+        const namedProblem = reviewerThreadProblem(named, implementerThreadId, taskId, null, null);
+        if (namedProblem !== null) {
+          return {
+            _tag: "Rejected" as const,
+            outcome: rejectedMove(namedProblem, state, book),
+          };
+        }
         const view = yield* runs
           .readReviewerSession({
             threadId: event.threadId ?? null,
             runId: event.runId ?? null,
           })
           .pipe(Effect.catchTags({ BoardRunError: () => Effect.succeed(null) }));
+        const resolvedProblem = reviewerThreadProblem(
+          view?.threadId ?? null,
+          implementerThreadId,
+          taskId,
+          projectIdOf(state),
+          view?.projectId,
+        );
+        if (resolvedProblem !== null) {
+          return {
+            _tag: "Rejected" as const,
+            outcome: rejectedMove(resolvedProblem, state, book),
+          };
+        }
         const actual = view?.actualModel?.trim() ?? "";
         if (view === null || actual.length === 0) {
           return { _tag: "Ready" as const, state, book };
+        }
+        const recordedReviewer = state.run.reviewerRuntime?.actual ?? null;
+        if (recordedReviewer !== null && !sameModelName(recordedReviewer, actual)) {
+          return {
+            _tag: "Rejected" as const,
+            outcome: rejectedMove(
+              "A verified reviewer is already recorded and cannot be replaced.",
+              state,
+              book,
+            ),
+          };
         }
         const requested = view.requestedModel?.trim() ?? "";
         const digest = yield* crypto
@@ -1096,6 +1182,9 @@ export const layer = Layer.unwrap(
                     }
                     launchedThread = launched.value.threadId;
                     launchedRun = runId;
+                    const watched = yield* runs
+                      .watchThread(launched.value.threadId)
+                      .pipe(Effect.catchTags({ BoardRunError: () => Effect.succeed(null) }));
                     return yield* recordConfirmedRun({
                       state: queued,
                       taskId,
@@ -1103,6 +1192,7 @@ export const layer = Layer.unwrap(
                       disposition: launched.value.disposition,
                       summary: launched.value.summary,
                       ledger,
+                      implementerActual: watched?.actualModel ?? null,
                     });
                   })
                 : asked._tag === "NeedsRecover"
@@ -1363,6 +1453,7 @@ export const layer = Layer.unwrap(
                   taskId,
                   idempotencyKey,
                   ledger,
+                  card?.threadId ?? null,
                 )
               : null;
           if (prepared !== null && prepared._tag === "Rejected") {

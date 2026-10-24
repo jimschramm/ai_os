@@ -87,6 +87,28 @@ const eventsFor = (task: OperationsTask): readonly unknown[] => {
     return events;
   }
   if (source.completion !== null) {
+    const recordedImplementer = events.some(
+      (event) =>
+        typeof event === "object" &&
+        event !== null &&
+        "type" in event &&
+        event.type === "record_runtime_models" &&
+        "role" in event &&
+        event.role === "implementer",
+    );
+    if (!recordedImplementer) {
+      // The fixture names the model that ran. Production does not infer it.
+      events.push({
+        type: "record_runtime_models",
+        taskId: source.id,
+        attemptId: assignment.attemptId,
+        generation: 1,
+        leaseId: leaseIdFor(1),
+        role: "implementer",
+        requested: assignment.implementerModel,
+        actual: assignment.implementerModel,
+      });
+    }
     events.push({ type: "submit_completion", completion: source.completion });
   }
   if (source.qa !== null && source.qa.availability === "available") {
