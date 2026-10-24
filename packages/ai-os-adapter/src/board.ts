@@ -1,4 +1,9 @@
-import type { AttemptMemoryActivityV1, SequenceState } from "@t3tools/ai-os-contracts";
+import type {
+  AttemptMemoryActivityV1,
+  MemoryFactV1,
+  SequenceState,
+  StewardNoticeV1,
+} from "@t3tools/ai-os-contracts";
 import * as Schema from "effect/Schema";
 
 /**
@@ -10,6 +15,7 @@ export const ADAPTER_BOARD_EVENTS_PATH = "/api/ai-os/board/events";
 export const ADAPTER_BOARD_MOVE_PATH = "/api/ai-os/board/move";
 export const ADAPTER_BOARD_EVENT_PATH = "/api/ai-os/board/event";
 export const ADAPTER_ANTIGRAVITY_MODELS_PATH = "/api/ai-os/antigravity/models";
+export const ADAPTER_MEMORY_RESOLVE_PATH = "/api/ai-os/memory/resolve";
 
 export interface AdapterBoardCard {
   readonly taskId: string;
@@ -21,6 +27,10 @@ export interface AdapterBoardCard {
   readonly updatedAt: string;
   /** Attempt reads and writes joined from memory. Absent on snapshots saved before that join. */
   readonly attempts?: readonly AttemptMemoryActivityV1[];
+  /** Steward notices for this card's project. The Needs you list is the notification channel. */
+  readonly steward?: readonly StewardNoticeV1[];
+  /** Accepted and proposed facts for this card's project. The drawer reads these. */
+  readonly memoryFacts?: readonly MemoryFactV1[];
 }
 
 // State stays unknown here on purpose. Decoding the sequence schema would pull
@@ -35,6 +45,8 @@ const BoardCards = Schema.Array(
     revision: Schema.optional(Schema.Number),
     updatedAt: Schema.String,
     attempts: Schema.optional(Schema.Array(Schema.Unknown)),
+    steward: Schema.optional(Schema.Array(Schema.Unknown)),
+    memoryFacts: Schema.optional(Schema.Array(Schema.Unknown)),
   }),
 );
 

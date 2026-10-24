@@ -12,6 +12,7 @@ import {
   ADAPTER_BOARD_EVENTS_PATH,
   ADAPTER_BOARD_MOVE_PATH,
   ADAPTER_BOARD_PATH,
+  ADAPTER_MEMORY_RESOLVE_PATH,
   decodeAdapterBoard,
   encodeAdapterBoard,
   type AdapterBoardCard,
@@ -35,7 +36,11 @@ import * as EnvironmentAuth from "./auth/EnvironmentAuth.ts";
 import * as AiOsAntigravity from "./aiOsAntigravity.ts";
 import * as AiOsBoard from "./aiOsBoard.ts";
 import { openMemoryDatabase, submitMemorySync } from "./aiOsMemory.ts";
-import { readAttemptActivitySync } from "./aiOsTaskMemory.ts";
+import {
+  readAttemptActivitySync,
+  recordTaskWriteSync,
+  supplyTaskMemorySync,
+} from "./aiOsTaskMemory.ts";
 import * as ServerConfig from "./config.ts";
 
 const activeLaunch = (): AiOsBoard.BoardLaunchResult => ({
@@ -2430,5 +2435,156 @@ describe("ai-os board route", () => {
       false,
     );
     saved.close();
+  });
+
+  it("flags a conflicting write, records the correction, and the next run reads it", async () => {
+    const prompts: string[] = [];
+    const { handler, stateDir } = handlerFor(undefined, {
+      ...allowRuns,
+      launch: (input) => {
+        prompts.push(input.prompt);
+        return Effect.succeed(activeLaunch());
+      },
+    });
+    const at = "2026-10-24T06:00:00Z";
+    const database = openMemoryDatabase(NodePath.join(stateDir, "memory.db"));
+    const request = (attemptId: string, authorId: string, taskId: string) => ({
+      projectId: "usba",
+      taskId,
+      attemptId,
+      authorId,
+      runtime: "codex" as const,
+      repoCommit: exampleRepoCommit,
+      requirements: "The tournament page shows the new schedule.",
+      authorizationScope: "usba-web",
+      createdAt: at,
+    });
+    const finding = (authorId: string, factId: string, body: string) => ({
+      kind: "findings" as const,
+      facts: [
+        {
+          identity: "tournament-start",
+          fact: {
+            acceptance: "proposed" as const,
+            factId,
+            projectId: "usba",
+            kind: "Decision" as const,
+            body,
+            provenance: { actorId: authorId, at },
+            validity: { from: at, until: null },
+          },
+        },
+      ],
+      relationships: [],
+      evidence: [{ evidenceId: `evidence-${factId}`, note: `${authorId} read the schedule.` }],
+    });
+    supplyTaskMemorySync(database, request("attempt-a", "agent-a", "task-a"));
+    expect(
+      recordTaskWriteSync(
+        database,
+        "attempt-a",
+        finding("agent-a", "fact-agent-a", "Saturday games start at 7:00."),
+        "jim",
+      ).outcome,
+    ).toBe("pending");
+    expect(
+      submitMemorySync(
+        database,
+        {
+          version: "v1",
+          submissionId: "submission-accept",
+          idempotencyKey: "key-accept",
+          projectId: "usba",
+          authorId: "jim",
+          taskId: "task-a",
+          attemptId: "attempt-accept",
+          evidence: [{ evidenceId: "evidence-accept", note: "Jim accepted the schedule." }],
+          expectedVersions: [],
+          intent: "accept",
+          facts: [
+            {
+              identity: "tournament-start",
+              fact: {
+                acceptance: "proposed",
+                factId: "fact-accepted",
+                projectId: "usba",
+                kind: "Decision",
+                body: "Saturday games start at 7:00.",
+                provenance: { actorId: "jim", at },
+                validity: { from: at, until: null },
+              },
+            },
+          ],
+          relationships: [],
+        },
+        "jim",
+      ).outcome,
+    ).toBe("accepted");
+    supplyTaskMemorySync(database, request("attempt-b", "agent-b", "task-demo"));
+    expect(
+      recordTaskWriteSync(
+        database,
+        "attempt-b",
+        finding("agent-b", "fact-agent-b", "Saturday games start at 8:30."),
+        "jim",
+      ).outcome,
+    ).toBe("conflict");
+    database.close();
+
+    await reachAssigned(handler);
+    const before = (await readCards(handler)).find((card) => card.taskId === "task-demo");
+    const notice = before?.steward?.find((item) => item.kind === "open_conflict");
+    if (notice?.conflictId == null) throw new Error("expected an open steward conflict");
+    expect(notice.authorId).toBe("agent-b");
+    expect(
+      before?.attempts?.some(
+        (item) => item.attemptId === "attempt-b" && item.write?.outcome === "conflict",
+      ),
+    ).toBe(true);
+    expect(
+      before?.memoryFacts?.some(
+        (fact) => fact.body === "Saturday games start at 7:00." && fact.acceptance === "accepted",
+      ),
+    ).toBe(true);
+    expect(
+      before?.memoryFacts?.some(
+        (fact) =>
+          fact.body === "Saturday games start at 8:30." && fact.provenance.actorId === "agent-b",
+      ),
+    ).toBe(true);
+
+    const resolved = await postJson(handler, ADAPTER_MEMORY_RESOLVE_PATH, {
+      conflictId: notice.conflictId,
+      action: "correct",
+      body: "Saturday games start at 7:30.",
+    });
+    expect(resolved.status).toBe(200);
+    const applied = (await resolved.json()) as { readonly factIds: readonly string[] };
+    expect(applied.factIds.length).toBeGreaterThan(0);
+
+    const after = (await readCards(handler)).find((card) => card.taskId === "task-demo");
+    expect(after?.steward?.find((item) => item.kind === "open_conflict")).toBeUndefined();
+    expect(
+      after?.memoryFacts?.some(
+        (fact) => fact.body === "Saturday games start at 7:30." && fact.acceptance === "accepted",
+      ),
+    ).toBe(true);
+
+    const moved = await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
+      taskId: "task-demo",
+      column: "Running",
+      idempotencyKey: "launch-corrected",
+    });
+    expect(moved.status).toBe(200);
+    expect(prompts).toHaveLength(1);
+    expect(prompts[0]).toContain("Saturday games start at 7:30.");
+    expect(prompts[0]).not.toContain("Saturday games start at 8:30.");
+    expect(prompts[0]).not.toContain("Saturday games start at 7:00.");
+
+    const saved = openMemoryDatabase(NodePath.join(stateDir, "memory.db"));
+    const launch = readAttemptActivitySync(saved).find((item) => item.attemptId === "attempt-1");
+    saved.close();
+    expect(launch?.read.receiptId).toBe("read-attempt-1");
+    expect(launch?.read.memoryVersions).toEqual(expect.arrayContaining([...applied.factIds]));
   });
 });

@@ -1,13 +1,15 @@
 import {
   decodeAttemptMemoryActivityV1,
+  decodeStewardNoticeV1,
   packageFacts,
   type AttemptMemoryActivityV1,
   type MemoryFactV1,
   type MemoryNodeKindV1,
+  type StewardNoticeV1,
 } from "@t3tools/ai-os-contracts";
 import * as Effect from "effect/Effect";
 
-import type { OperationsTask } from "./fixtures";
+import type { NeedsYouItem, OperationsTask } from "./fixtures";
 import {
   AUTHOR_LABELS,
   MEMORY_CONFLICTS,
@@ -18,9 +20,9 @@ import {
   type MemoryRecordMeta,
   type MemoryScope,
 } from "./memoryFixtures";
-
-export type { MemoryScope };
 import { formatInstant } from "./model";
+
+export type { MemoryConflict, MemoryScope };
 
 export type MemoryTypeFilter =
   | "instructions"
@@ -324,6 +326,107 @@ export function boardAttemptActivity(
     }
   }
   return activity;
+}
+
+/** Steward notices carried on the board snapshot. */
+export function boardStewardNotices(
+  cards: readonly { readonly steward?: readonly unknown[] }[],
+): readonly StewardNoticeV1[] {
+  const seen = new Set<string>();
+  const notices: StewardNoticeV1[] = [];
+  for (const card of cards) {
+    for (const item of card.steward ?? []) {
+      try {
+        const decoded = decodeStewardNoticeV1(item);
+        if (seen.has(decoded.noticeId)) continue;
+        seen.add(decoded.noticeId);
+        notices.push(decoded);
+      } catch {
+        // Leave a field that is not a steward notice out of the drawer.
+      }
+    }
+  }
+  return notices;
+}
+
+/** Facts carried on the board snapshot. The drawer lists these instead of the fixture. */
+export function boardMemoryFacts(
+  cards: readonly { readonly memoryFacts?: readonly unknown[] }[],
+): readonly MemoryFactV1[] {
+  const seen = new Set<string>();
+  const facts: MemoryFactV1[] = [];
+  for (const card of cards) {
+    for (const item of card.memoryFacts ?? []) {
+      if (typeof item !== "object" || item === null || !("factId" in item)) continue;
+      const factId = item.factId;
+      if (typeof factId !== "string" || seen.has(factId)) continue;
+      seen.add(factId);
+      facts.push(item as MemoryFactV1);
+    }
+  }
+  return facts;
+}
+
+export function stewardConflicts(
+  notices: readonly StewardNoticeV1[],
+  facts: readonly MemoryFactV1[],
+  projectId: string,
+): readonly MemoryConflict[] {
+  return notices.flatMap((notice) => {
+    if (notice.kind !== "open_conflict" || notice.projectId !== projectId) return [];
+    if (notice.conflictId === null) return [];
+    const acceptedId = notice.acceptedFactId ?? notice.conflictId;
+    const proposedId = notice.proposedFactId ?? notice.conflictId;
+    const acceptedBody = facts.find((fact) => fact.factId === acceptedId)?.body;
+    const proposedBody = facts.find((fact) => fact.factId === proposedId)?.body;
+    return [
+      {
+        id: notice.conflictId,
+        projectId: notice.projectId,
+        summary: notice.summary,
+        factIds: [acceptedId, proposedId] as const,
+        authorId: notice.authorId,
+        ...(acceptedBody === undefined ? {} : { acceptedBody }),
+        ...(proposedBody === undefined ? {} : { proposedBody }),
+      },
+    ];
+  });
+}
+
+export function rowsFromFacts(
+  facts: readonly MemoryFactV1[],
+  projectId: string,
+  conflictFactIds: ReadonlySet<string>,
+): readonly MemoryRow[] {
+  return facts.flatMap((fact) => {
+    if (fact.projectId !== projectId) return [];
+    const meta: MemoryRecordMeta = {
+      factId: fact.factId,
+      scope: "project",
+      taskId: null,
+      sources: [authorLabel(fact.provenance.actorId)],
+      evidence: [],
+    };
+    return [
+      {
+        fact,
+        meta,
+        status: conflictFactIds.has(fact.factId) ? "conflicting" : fact.acceptance,
+        type: memoryType(fact.kind),
+      },
+    ];
+  });
+}
+
+/** Needs you rows for steward notices. The existing card is the notification channel. */
+export function stewardNeedsYou(notices: readonly StewardNoticeV1[]): readonly NeedsYouItem[] {
+  return notices.map((notice) => ({
+    id: notice.noticeId,
+    kind: notice.kind === "open_conflict" ? "decision" : "blocker",
+    summary: notice.summary,
+    nextAction: notice.summary,
+    actionLabel: notice.kind === "open_conflict" ? "Resolve" : "Review",
+  }));
 }
 
 export function attemptActivityFor(

@@ -10,6 +10,7 @@ export * from "./progress.ts";
 export * from "./memory.ts";
 export * from "./submission.ts";
 export * from "./taskMemory.ts";
+export * from "./steward.ts";
 export * from "./usage.ts";
 export * from "./control.ts";
 export * from "./reworkCap.ts";

@@ -186,6 +186,7 @@ interface PublishPlan {
     readonly next: SubmissionFactV1;
     readonly previous: FactRevisionV1;
   }>;
+  readonly kept: ReadonlyArray<{ readonly identity: string; readonly factId: string }>;
   readonly conflicts: ReadonlyArray<{
     readonly accepted: FactRevisionV1;
     readonly proposed: SubmissionFactV1;
@@ -321,6 +322,7 @@ const planSubmission = (ledger: MemoryLedgerV1, submission: SubmissionV1): Publi
   });
   const replacements: Array<{ next: SubmissionFactV1; previous: FactRevisionV1 }> = [];
   const conflicts: Array<{ accepted: FactRevisionV1; proposed: SubmissionFactV1 }> = [];
+  const kept: Array<{ identity: string; factId: string }> = [];
   const facts: SubmissionFactV1[] = [];
   for (const item of submission.facts) {
     const current = currentRevision(ledger, item.identity, submission.projectId);
@@ -337,6 +339,21 @@ const planSubmission = (ledger: MemoryLedgerV1, submission: SubmissionV1): Publi
         return named?.identity === item.identity && named.projectId === submission.projectId;
       });
       if (!namedStaleRevision) {
+        const expected = submission.expectedVersions.find(
+          (version) => version.factId === current.factId,
+        );
+        const versionMatches = expected !== undefined && expected.revision === current.revision;
+        const open = ledger.conflicts.some(
+          (conflict) =>
+            conflict.resolvedBySubmissionId === null &&
+            conflict.projectId === submission.projectId &&
+            conflict.identity === item.identity,
+        );
+        // Keeping the accepted text resolves the open conflict and does not
+        // write another copy of the fact.
+        if (submission.intent === "accept" && versionMatches && stale.length === 0 && open) {
+          kept.push({ identity: item.identity, factId: current.factId });
+        }
         continue;
       }
       conflicts.push({ accepted: current, proposed: item });
@@ -358,7 +375,7 @@ const planSubmission = (ledger: MemoryLedgerV1, submission: SubmissionV1): Publi
     conflicts.push({ accepted: current, proposed: item });
     facts.push(item);
   }
-  if (facts.length === 0 && submission.relationships.length === 0) {
+  if (facts.length === 0 && submission.relationships.length === 0 && kept.length === 0) {
     return "That statement is already accepted.";
   }
   if (stale.length > 0 && facts.length === 0) {
@@ -394,18 +411,22 @@ const planSubmission = (ledger: MemoryLedgerV1, submission: SubmissionV1): Publi
   if (mode === "conflict" && conflicts.length === 0) {
     return "The conflicting statement could not be paired with an accepted fact.";
   }
+  const keptFacts = mode === "accepted" ? kept : [];
   return {
     mode,
     facts,
     replacements: mode === "accepted" ? replacements : [],
+    kept: keptFacts,
     conflicts: mode === "conflict" ? conflicts : [],
     relationships: submission.relationships,
     detail:
       mode === "conflict"
         ? "The accepted statement was kept. The submission is an open conflict."
-        : mode === "accepted"
-          ? "Accepted a new version."
-          : "Recorded as a proposal. Accepted knowledge was not changed.",
+        : mode === "accepted" && replacements.length === 0 && keptFacts.length > 0
+          ? "Kept the accepted statement."
+          : mode === "accepted"
+            ? "Accepted a new version."
+            : "Recorded as a proposal. Accepted knowledge was not changed.",
   };
 };
 
@@ -555,12 +576,14 @@ const publish = (
       plan.mode === "accepted"
         ? ledger.conflicts.map((conflict) =>
             conflict.resolvedBySubmissionId === null &&
-            plan.replacements.some(
-              (replacement) =>
-                replacement.previous.projectId === conflict.projectId &&
-                (replacement.previous.factId === conflict.acceptedFactId ||
-                  replacement.previous.identity === conflict.identity),
-            )
+            conflict.projectId === submission.projectId &&
+            (plan.kept.some((item) => item.identity === conflict.identity) ||
+              plan.replacements.some(
+                (replacement) =>
+                  replacement.previous.projectId === conflict.projectId &&
+                  (replacement.previous.factId === conflict.acceptedFactId ||
+                    replacement.previous.identity === conflict.identity),
+              ))
               ? { ...conflict, resolvedBySubmissionId: submission.submissionId }
               : conflict,
           )
@@ -608,7 +631,10 @@ export const applySubmission = (
           : invalid("The submission does not fit the memory graph."),
       ),
     );
-    const factIds = plan.facts.map((item) => item.fact.factId);
+    const factIds =
+      plan.facts.length > 0
+        ? plan.facts.map((item) => item.fact.factId)
+        : plan.kept.map((item) => item.factId);
     const relationshipIds = [
       ...plan.relationships.map((relationship) => relationship.relationshipId),
       ...published.graph.relationships
