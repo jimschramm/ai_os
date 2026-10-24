@@ -114,6 +114,8 @@ Context is readable and linked to its evidence. A new session is rebuilt from me
 
 ContextPackages are built only from exact graph queries over accepted, current, non-superseded facts. TAM's Chroma index may suggest nodes to a human or to the orchestrator. Those suggestions never enter a ContextPackage, never establish acceptance, and are never authoritative. Vector retrieval is only partially accurate for context.
 
+A registered local worker reads that package for its own project and can propose facts without a board attempt. The worker token is scoped to one project and is accepted only from localhost. A proposal stays out of the package until the steward or an explicit accept records it, or until a per-project auto-accept policy the owner saved matches that fact. The default policy accepts nothing. A policy does not reach back and accept proposals that were already stored. `SUPERSEDES` still keeps the older fact queryable and out of the current package.
+
 TAM stores the graph now. A dedicated store such as Postgres remains a later candidate, and only when real queries justify it. It would be a rebuildable projection of the graph, or it would have clear ownership of the records it holds. The graph stays the source of truth.
 
 ## Storage

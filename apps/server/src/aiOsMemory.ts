@@ -165,6 +165,57 @@ export const submitMemorySync = (
   }
 };
 
+/**
+ * Replace the ledger after an in-place acceptance.
+ * A proposal is already a submission. Accepting it is not a second submission,
+ * and it must not rewrite the proposal receipt. The event row is the acceptance.
+ */
+export const saveMemoryLedgerSync = (
+  database: NodeSqlite.DatabaseSync,
+  ledger: MemoryLedgerV1,
+  events: ReadonlyArray<{
+    readonly idempotencyKey: string;
+    readonly submissionId: string;
+    readonly projectId: string;
+    readonly outcome: string;
+    readonly receipt: unknown;
+  }>,
+): void => {
+  const encoded = JSON.stringify(Effect.runSync(decodeMemoryLedgerV1(ledger)));
+  database.exec("BEGIN IMMEDIATE");
+  try {
+    const insert = database.prepare(
+      `INSERT INTO ai_os_memory_event
+        (idempotency_key, submission_id, project_id, outcome, receipt_json)
+       VALUES (?, ?, ?, ?, ?)`,
+    );
+    for (const event of events) {
+      insert.run(
+        event.idempotencyKey,
+        event.submissionId,
+        event.projectId,
+        event.outcome,
+        JSON.stringify(event.receipt),
+      );
+    }
+    database
+      .prepare(
+        `INSERT INTO ai_os_memory_snapshot (id, ledger_json)
+         VALUES (1, ?)
+         ON CONFLICT(id) DO UPDATE SET ledger_json = excluded.ledger_json`,
+      )
+      .run(encoded);
+    database.exec("COMMIT");
+  } catch (error) {
+    rollback(database);
+    if (isConstraint(error)) {
+      throw invalid("That acceptance was already recorded.");
+    }
+    if (isContractTransitionError(error)) throw error;
+    throw invalid("The memory database could not record the acceptance.");
+  }
+};
+
 export const submitMemory = (
   database: NodeSqlite.DatabaseSync,
   submission: unknown,

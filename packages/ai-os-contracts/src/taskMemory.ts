@@ -31,7 +31,11 @@ import {
   SubmissionV1,
 } from "./submission.ts";
 
-export const TaskRuntimeV1 = Schema.Literals(["codex", "cursor", "antigravity"]);
+/**
+ * Board launches stay on codex, cursor, or antigravity.
+ * `local-worker` is a registered process that is not a board attempt.
+ */
+export const TaskRuntimeV1 = Schema.Literals(["codex", "cursor", "antigravity", "local-worker"]);
 export type TaskRuntimeV1 = typeof TaskRuntimeV1.Type;
 
 export const TaskMemoryRequestV1 = Schema.Struct({

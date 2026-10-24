@@ -7,7 +7,12 @@ import {
   ADAPTER_BOARD_EVENTS_PATH,
   ADAPTER_BOARD_MOVE_PATH,
   ADAPTER_BOARD_PATH,
+  ADAPTER_MEMORY_ACCEPT_PATH,
+  ADAPTER_MEMORY_CONTEXT_PATH,
+  ADAPTER_MEMORY_POLICY_PATH,
+  ADAPTER_MEMORY_PROPOSE_PATH,
   ADAPTER_MEMORY_RESOLVE_PATH,
+  ADAPTER_MEMORY_WORKERS_PATH,
   ADAPTER_MEMORY_WRITE_PATH,
   type AdapterBoardCard,
 } from "@t3tools/ai-os-adapter/board";
@@ -70,6 +75,7 @@ import * as Data from "effect/Data";
 import * as Hex from "effect/encoding/Hex";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Option from "effect/Option";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
@@ -90,6 +96,20 @@ import {
 } from "./aiOsAntigravity.ts";
 import { memoryDatabasePath, openMemoryDatabase, readMemoryLedger } from "./aiOsMemory.ts";
 import { resolveMemoryConflictSync } from "./aiOsSteward.ts";
+import {
+  acceptFactForOwnerSync,
+  authenticateWorkerSync,
+  localWorkerHttpAllowed,
+  policyForOwnerSync,
+  proposeWorkerMemorySync,
+  readWorkerContextSync,
+  registerWorkerSync,
+  WORKER_LOCAL_DETAIL,
+  WORKER_TOKEN_DETAIL,
+  workerCallFailed,
+  workerTokenFromAuthorization,
+  writePolicySync,
+} from "./aiOsWorkerMemory.ts";
 import {
   attemptWriteTokenSync,
   commitTaskReadSync,
@@ -368,7 +388,7 @@ const isColumn = (value: unknown): value is KanbanColumn =>
 const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 const decodeJson = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 
-const json = (status: number, body: Record<string, unknown>) =>
+const json = (status: number, body: object) =>
   HttpServerResponse.text(encodeJson(body), {
     status,
     contentType: "application/json",
@@ -2130,6 +2150,232 @@ export const layer = Layer.unwrap(
         ),
       ),
     );
+    const memoryFile = () => taskMemoryFile(config.stateDir);
+    const workerIsLocal = (request: HttpServerRequest.HttpServerRequest) => {
+      const forwarded = request.headers["x-forwarded-for"];
+      // Fetch hides the Host header. The request URL is the host in that case.
+      // A Node socket still reports Host, and a non-loopback peer is refused below.
+      const headerHost =
+        typeof request.headers.host === "string" ? request.headers.host : undefined;
+      let host = headerHost;
+      if (host === undefined || host.trim() === "") {
+        try {
+          host = new URL(request.originalUrl).host;
+        } catch {
+          host = undefined;
+        }
+      }
+      return localWorkerHttpAllowed({
+        host,
+        remoteAddress: Option.getOrUndefined(request.remoteAddress),
+        forwardedFor: typeof forwarded === "string" ? forwarded : undefined,
+      });
+    };
+    const bearer = (request: HttpServerRequest.HttpServerRequest) =>
+      workerTokenFromAuthorization(
+        typeof request.headers.authorization === "string"
+          ? request.headers.authorization
+          : undefined,
+      );
+    const rejectWorker = (error: ContractTransitionError) => {
+      const failed = workerCallFailed(error);
+      return json(failed.status, { _tag: "Rejected", detail: failed.detail });
+    };
+    const readContext = Effect.gen(function* () {
+      const request = yield* HttpServerRequest.HttpServerRequest;
+      if (!workerIsLocal(request)) return json(403, { detail: WORKER_LOCAL_DETAIL });
+      const token = bearer(request);
+      if (token === null) return json(401, { detail: WORKER_TOKEN_DETAIL });
+      const url = Option.getOrUndefined(HttpServerRequest.toURL(request));
+      if (url === undefined) return json(400, { detail: "Expected a context read." });
+      const projectId = url.searchParams.get("projectId")?.trim() ?? "";
+      if (projectId.length === 0) {
+        return json(400, { detail: "Expected projectId." });
+      }
+      const asOf = yield* stamped;
+      const read = yield* withTaskMemory(memoryFile(), (database) => {
+        const worker = authenticateWorkerSync(database, token);
+        if (worker === null) return { _tag: "Unauthorized" as const };
+        return {
+          _tag: "Package" as const,
+          packaged: readWorkerContextSync(
+            database,
+            worker,
+            {
+              schemaVersion: url.searchParams.get("schemaVersion"),
+              projectId,
+              repoCommit: url.searchParams.get("repoCommit"),
+              requirements: url.searchParams.get("requirements"),
+              authorizationScope: url.searchParams.get("authorizationScope"),
+            },
+            asOf,
+          ),
+        };
+      }).pipe(
+        Effect.map((value) => ({ _tag: "Ok" as const, value })),
+        Effect.catch((error) => Effect.succeed({ _tag: "No" as const, error })),
+      );
+      if (read._tag === "No") return rejectWorker(read.error);
+      if (read.value._tag === "Unauthorized") return json(401, { detail: WORKER_TOKEN_DETAIL });
+      return HttpServerResponse.text(encodeJson(read.value.packaged), {
+        status: 200,
+        contentType: "application/json",
+        headers: { "cache-control": "no-store" },
+      });
+    }).pipe(
+      Effect.catch((cause) =>
+        failEnvironmentInternal("internal_error", cause).pipe(
+          Effect.catchTags({
+            EnvironmentInternalError: (error) => HttpServerRespondable.toResponse(error),
+          }),
+        ),
+      ),
+    );
+    const registerWorker = Effect.gen(function* () {
+      yield* authorize(AuthOrchestrationOperateScope);
+      const request = yield* HttpServerRequest.HttpServerRequest;
+      const text = yield* request.text.pipe(Effect.orElseSucceed(() => ""));
+      const createdAt = yield* stamped;
+      return yield* writes.withPermits(1)(
+        Effect.gen(function* () {
+          const body = readJson(text);
+          const registered = yield* withTaskMemory(memoryFile(), (database) =>
+            registerWorkerSync(database, body, createdAt),
+          ).pipe(
+            Effect.map((value) => ({ _tag: "Ok" as const, value })),
+            Effect.catch((error) => Effect.succeed({ _tag: "No" as const, error })),
+          );
+          if (registered._tag === "No") return rejectWorker(registered.error);
+          return json(200, { ...registered.value });
+        }),
+      );
+    }).pipe(
+      Effect.catchTags(authResponse),
+      Effect.catch((cause) =>
+        failEnvironmentInternal("internal_error", cause).pipe(
+          Effect.catchTags({
+            EnvironmentInternalError: (error) => HttpServerRespondable.toResponse(error),
+          }),
+        ),
+      ),
+    );
+    const proposeMemory = Effect.gen(function* () {
+      const request = yield* HttpServerRequest.HttpServerRequest;
+      if (!workerIsLocal(request)) return json(403, { detail: WORKER_LOCAL_DETAIL });
+      const token = bearer(request);
+      if (token === null) return json(401, { detail: WORKER_TOKEN_DETAIL });
+      const text = yield* request.text.pipe(Effect.orElseSucceed(() => ""));
+      const createdAt = yield* stamped;
+      return yield* writes.withPermits(1)(
+        Effect.gen(function* () {
+          const body = readJson(text);
+          const proposed = yield* withTaskMemory(memoryFile(), (database) => {
+            const worker = authenticateWorkerSync(database, token);
+            if (worker === null) return { _tag: "Unauthorized" as const };
+            return {
+              _tag: "Proposed" as const,
+              result: proposeWorkerMemorySync(database, worker, body, createdAt),
+            };
+          }).pipe(
+            Effect.map((value) => ({ _tag: "Ok" as const, value })),
+            Effect.catch((error) => Effect.succeed({ _tag: "No" as const, error })),
+          );
+          if (proposed._tag === "No") return rejectWorker(proposed.error);
+          if (proposed.value._tag === "Unauthorized") {
+            return json(401, { detail: WORKER_TOKEN_DETAIL });
+          }
+          if (proposed.value.result.outcome === "rejected") {
+            return json(409, { _tag: "Rejected", detail: proposed.value.result.detail });
+          }
+          return json(200, { _tag: "Applied", ...proposed.value.result });
+        }),
+      );
+    }).pipe(
+      Effect.catch((cause) =>
+        failEnvironmentInternal("internal_error", cause).pipe(
+          Effect.catchTags({
+            EnvironmentInternalError: (error) => HttpServerRespondable.toResponse(error),
+          }),
+        ),
+      ),
+    );
+    const acceptFact = Effect.gen(function* () {
+      yield* authorize(AuthOrchestrationOperateScope);
+      const request = yield* HttpServerRequest.HttpServerRequest;
+      const text = yield* request.text.pipe(Effect.orElseSucceed(() => ""));
+      const createdAt = yield* stamped;
+      return yield* writes.withPermits(1)(
+        Effect.gen(function* () {
+          const body = readJson(text);
+          const accepted = yield* withTaskMemory(memoryFile(), (database) =>
+            acceptFactForOwnerSync(database, body, createdAt),
+          ).pipe(
+            Effect.map((value) => ({ _tag: "Ok" as const, value })),
+            Effect.catch((error) => Effect.succeed({ _tag: "No" as const, error })),
+          );
+          if (accepted._tag === "No") return rejectWorker(accepted.error);
+          publishAttempts();
+          return json(200, {
+            _tag: "Applied",
+            outcome: "accepted",
+            schemaVersion: "v1",
+            factId: accepted.value.factId,
+            projectId: accepted.value.projectId,
+          });
+        }),
+      );
+    }).pipe(
+      Effect.catchTags(authResponse),
+      Effect.catch((cause) =>
+        failEnvironmentInternal("internal_error", cause).pipe(
+          Effect.catchTags({
+            EnvironmentInternalError: (error) => HttpServerRespondable.toResponse(error),
+          }),
+        ),
+      ),
+    );
+    const readPolicy = Effect.gen(function* () {
+      yield* authorize(AuthOrchestrationReadScope);
+      const request = yield* HttpServerRequest.HttpServerRequest;
+      const url = Option.getOrUndefined(HttpServerRequest.toURL(request));
+      const projectId = url?.searchParams.get("projectId")?.trim() ?? "";
+      if (projectId.length === 0) return json(400, { detail: "Expected projectId." });
+      const policy = yield* withTaskMemory(memoryFile(), (database) =>
+        policyForOwnerSync(database, projectId),
+      ).pipe(
+        Effect.map((value) => ({ _tag: "Ok" as const, value })),
+        Effect.catch((error) => Effect.succeed({ _tag: "No" as const, error })),
+      );
+      if (policy._tag === "No") return rejectWorker(policy.error);
+      return json(200, { ...policy.value });
+    }).pipe(Effect.catchTags(authResponse));
+    const writePolicy = Effect.gen(function* () {
+      yield* authorize(AuthOrchestrationOperateScope);
+      const request = yield* HttpServerRequest.HttpServerRequest;
+      const text = yield* request.text.pipe(Effect.orElseSucceed(() => ""));
+      return yield* writes.withPermits(1)(
+        Effect.gen(function* () {
+          const body = readJson(text);
+          const saved = yield* withTaskMemory(memoryFile(), (database) =>
+            writePolicySync(database, body),
+          ).pipe(
+            Effect.map((value) => ({ _tag: "Ok" as const, value })),
+            Effect.catch((error) => Effect.succeed({ _tag: "No" as const, error })),
+          );
+          if (saved._tag === "No") return rejectWorker(saved.error);
+          return json(200, { ...saved.value });
+        }),
+      );
+    }).pipe(
+      Effect.catchTags(authResponse),
+      Effect.catch((cause) =>
+        failEnvironmentInternal("internal_error", cause).pipe(
+          Effect.catchTags({
+            EnvironmentInternalError: (error) => HttpServerRespondable.toResponse(error),
+          }),
+        ),
+      ),
+    );
     return Layer.mergeAll(
       HttpRouter.add("GET", ADAPTER_BOARD_PATH, snapshot),
       HttpRouter.add("POST", ADAPTER_BOARD_PATH, replace),
@@ -2138,6 +2384,12 @@ export const layer = Layer.unwrap(
       HttpRouter.add("POST", ADAPTER_BOARD_EVENT_PATH, workflowEvent),
       HttpRouter.add("POST", ADAPTER_MEMORY_RESOLVE_PATH, resolveConflict),
       HttpRouter.add("POST", ADAPTER_MEMORY_WRITE_PATH, writeMemory),
+      HttpRouter.add("GET", ADAPTER_MEMORY_CONTEXT_PATH, readContext),
+      HttpRouter.add("POST", ADAPTER_MEMORY_WORKERS_PATH, registerWorker),
+      HttpRouter.add("POST", ADAPTER_MEMORY_PROPOSE_PATH, proposeMemory),
+      HttpRouter.add("POST", ADAPTER_MEMORY_ACCEPT_PATH, acceptFact),
+      HttpRouter.add("GET", ADAPTER_MEMORY_POLICY_PATH, readPolicy),
+      HttpRouter.add("POST", ADAPTER_MEMORY_POLICY_PATH, writePolicy),
       HttpRouter.add("GET", ADAPTER_ANTIGRAVITY_MODELS_PATH, models),
       Layer.effectDiscard(
         Effect.gen(function* () {

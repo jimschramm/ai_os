@@ -10,6 +10,8 @@ Agents writing to total-agent-memory must follow these node kinds and relationsh
 - Artifact, Source, Verification
 - Agent, User, Procedure
 
+There is no Constraint node kind. A constraint is a Decision or an Instruction, plus a `CONSTRAINS` relationship to the task, requirement, or project it bounds. The fact and the relationship are proposed until accepted. `CONSTRAINS` does not replace an older fact. Replacing the text is a new fact and a `SUPERSEDES` edge, and the older fact stays in the graph.
+
 ## Allowed relationships
 
 - BELONGS_TO, DEPLOYED_IN
@@ -24,6 +26,9 @@ Agents writing to total-agent-memory must follow these node kinds and relationsh
 - A proposed relationship is not accepted knowledge until explicitly accepted.
 - SUPERSEDES marks a newer fact or decision that replaces an older one; both remain queryable.
 - Agents retrieve a context package of current (non-superseded, accepted) facts relevant to the task; they do not interpret the raw graph ad-hoc.
+- A package is scoped to one project. A worker for that project does not receive another project's nodes.
+- Chroma may suggest candidates. Those suggestions are not part of the package and are not authoritative.
+- A local worker's write carries provenance and schema version `v1`. It is a proposal until it is accepted. Nothing is accepted just because it was written.
 - A Task carries `taskType`: `implementation` or `advisory`. QA follows that declaration.
 - Review delivered records the exact revision reviewed and the linked findings. It is not `ACCEPTED_BY` and does not satisfy independent QA.
 - An implementation is `VERIFIED_BY` only after QA by a different base model than the implementer's actual model from the runtime, on the exact submitted revision. Both actual base models have to be known, different, and the same as the trusted run records. An unknown actual does not apply the verdict: the review stays incomplete, keeps its findings, and waits for a verified reviewer. Completion is not submitted until the implementer's actual model is known. A later verified reviewer can replace an unknown one, and the earlier findings stay advisory. A stored verdict that has both runtime records is checked again. Advisory findings are not independent QA. A finding that asks for a change is a new implementation task, and that implementation goes through the same QA.
