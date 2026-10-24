@@ -36,6 +36,7 @@ import { DeliveryAckV1, ResultDeliveryV1, ackFor, deliveryFingerprint } from "./
 import {
   ContractName,
   ContractTransitionError,
+  QA_INCOMPLETE_LABEL,
   RECOVERY_PENDING_LABEL,
   REVIEW_DELIVERED_LABEL,
   SequencePhase,
@@ -50,7 +51,7 @@ import {
   ProgressReportV1,
   WorkerFailV1,
 } from "./progress.ts";
-import { QaAcceptV1, QaReworkV1, QaUnavailableV1, QaVerdictV1 } from "./qa.ts";
+import { QaAcceptV1, QaFindingV1, QaReworkV1, QaUnavailableV1, QaVerdictV1 } from "./qa.ts";
 import { UsageMeasurementV1 } from "./usage.ts";
 
 export const KanbanColumn = Schema.Literals([
@@ -181,29 +182,29 @@ const independentQa = (
     } => {
   const implementer = run.implementerRuntime?.actual ?? null;
   const reviewer = run.reviewerRuntime?.actual ?? null;
-  if (implementer !== null && reviewer !== null && sameBaseModel(reviewer, implementer)) {
-    return {
-      reason: "qa_same_model",
-      detail: "QA must use a different base model than the implementer that ran.",
-    };
-  }
-  if (implementer !== null && !sameModelName(qa.implementerModel, implementer)) {
-    return {
-      reason: "implementer_mismatch",
-      detail: "The QA payload names a different implementer than the runtime.",
-    };
-  }
-  if (reviewer !== null && !sameModelName(qa.qaModel, reviewer)) {
-    return {
-      reason: "implementer_mismatch",
-      detail: "The QA payload names a different reviewer than the runtime.",
-    };
-  }
   if (implementer === null || reviewer === null) {
     return {
       reason: "qa_model_unknown",
       detail:
         "Independent QA needs the implementer's actual model and the reviewer's actual model from the runtime.",
+    };
+  }
+  if (sameBaseModel(reviewer, implementer)) {
+    return {
+      reason: "qa_same_model",
+      detail: "QA must use a different base model than the implementer that ran.",
+    };
+  }
+  if (!sameModelName(qa.implementerModel, implementer)) {
+    return {
+      reason: "implementer_mismatch",
+      detail: "The QA payload names a different implementer than the runtime.",
+    };
+  }
+  if (!sameModelName(qa.qaModel, reviewer)) {
+    return {
+      reason: "implementer_mismatch",
+      detail: "The QA payload names a different reviewer than the runtime.",
     };
   }
   return true;
@@ -218,17 +219,13 @@ const storedIndependence = (state: {
   readonly qa: {
     readonly qaModel: ModelRef | string;
     readonly implementerModel: ModelRef | string;
-    readonly verdict: "rework" | "accept";
   };
 }): true | string => {
   if (state.run.implementerRuntime === undefined || state.run.reviewerRuntime === undefined) {
     return true;
   }
   const checked = independentQa(state.run, state.qa);
-  if (checked === true) return true;
-  // Rework cannot approve the work, so a missing actual does not block the stored card.
-  if (checked.reason === "qa_model_unknown" && state.qa.verdict === "rework") return true;
-  return checked.detail;
+  return checked === true ? true : checked.detail;
 };
 
 const workerRecordMatchesRun = (
@@ -388,6 +385,34 @@ export const AwaitingQaState = Schema.Struct({
 );
 export type AwaitingQaState = typeof AwaitingQaState.Type;
 
+export const QaIncompleteState = Schema.Struct({
+  phase: Schema.Literal("qa_incomplete"),
+  intake: Intake,
+  acknowledgment: IntakeAcknowledgmentV1,
+  assignment: AssignmentV1,
+  completion: CompletionSubmissionV1,
+  findings: Schema.Array(QaFindingV1),
+  artifactRevision: ArtifactRevisionV1,
+  attemptedVerdict: Schema.Literals(["rework", "accept"]),
+  reworkRevision: Schema.NullOr(ArtifactRevisionV1),
+  run: RunV1,
+  commands: Schema.Array(AppliedCommandV1),
+  qaLabel: Schema.Literal(QA_INCOMPLETE_LABEL),
+}).check(
+  Schema.makeFilter((state) => {
+    const match = payloadMatches(state.acknowledgment, state.assignment, state.completion);
+    if (match !== true) return match;
+    if (!sameRevision(state.artifactRevision, state.completion.artifactRevision)) {
+      return "QA is bound to the exact revision in the completion submission.";
+    }
+    if (state.attemptedVerdict === "rework" && state.findings.length === 0) {
+      return "Rework findings stay with the incomplete review.";
+    }
+    return workerRecordMatchesRun(state.run, state.completion);
+  }),
+);
+export type QaIncompleteState = typeof QaIncompleteState.Type;
+
 export const ReworkState = Schema.Struct({
   phase: Schema.Literal("rework"),
   intake: Intake,
@@ -520,6 +545,7 @@ export const SequenceState = Schema.Union([
   AssignedState,
   ExecutingState,
   AwaitingQaState,
+  QaIncompleteState,
   ReworkState,
   AcceptedState,
   ReviewDeliveredState,
@@ -550,6 +576,7 @@ export const LEGAL_EVENTS = {
     "transfer_ownership",
   ],
   awaiting_qa: ["qa", "cancel", "record_runtime_models"],
+  qa_incomplete: ["qa", "cancel", "record_runtime_models"],
   rework: ["start_execution", "cancel"],
   accepted: ["start_execution", "deliver"],
   review_delivered: [],
@@ -577,6 +604,7 @@ export const kanbanColumn = (phase: SequencePhase): KanbanColumn | null => {
     case "failed":
       return "Blocked";
     case "awaiting_qa":
+    case "qa_incomplete":
       return "Review";
     case "accepted":
     case "review_delivered":
@@ -834,7 +862,7 @@ const applyQa = (
   event: Extract<SequenceEvent, { type: "qa" }>,
 ): Effect.Effect<SequenceState, ContractTransitionError> =>
   Effect.gen(function* () {
-    if (state.phase !== "awaiting_qa") {
+    if (state.phase !== "awaiting_qa" && state.phase !== "qa_incomplete") {
       return yield* reject(state, event, "illegal_transition", `Cannot qa from ${state.phase}.`);
     }
     if (workerRecordMatchesRun(state.run, state.completion) !== true) {
@@ -892,7 +920,23 @@ const applyQa = (
       );
     }
     const checked = independentQa(state.run, qa);
-    if (checked !== true && !(qa.verdict === "rework" && checked.reason === "qa_model_unknown")) {
+    if (checked !== true && checked.reason === "qa_model_unknown") {
+      return {
+        phase: "qa_incomplete" as const,
+        intake: state.intake,
+        acknowledgment: state.acknowledgment,
+        assignment: state.assignment,
+        completion: state.completion,
+        findings: qa.findings,
+        artifactRevision: qa.artifactRevision,
+        attemptedVerdict: qa.verdict,
+        reworkRevision: state.reworkRevision,
+        run: state.run,
+        commands: state.commands,
+        qaLabel: QA_INCOMPLETE_LABEL,
+      };
+    }
+    if (checked !== true) {
       return yield* reject(state, event, checked.reason, checked.detail);
     }
     if (qa.verdict === "rework") {
@@ -1202,7 +1246,7 @@ const applyRuntimeModels = (
       }
       return { ...executing, run: { ...executing.run, implementerRuntime: recorded } };
     }
-    if (state.phase !== "awaiting_qa") {
+    if (state.phase !== "awaiting_qa" && state.phase !== "qa_incomplete") {
       return yield* reject(
         state,
         event,
@@ -1292,6 +1336,7 @@ const applyCancel = (
       state.phase !== "assigned" &&
       state.phase !== "executing" &&
       state.phase !== "awaiting_qa" &&
+      state.phase !== "qa_incomplete" &&
       state.phase !== "rework"
     ) {
       return yield* reject(
@@ -1686,6 +1731,7 @@ const PHASES = [
   "assigned",
   "executing",
   "awaiting_qa",
+  "qa_incomplete",
   "rework",
   "accepted",
   "review_delivered",

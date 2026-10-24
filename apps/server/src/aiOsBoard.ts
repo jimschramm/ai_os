@@ -745,7 +745,7 @@ export const layer = Layer.unwrap(
         if (event.qa.availability !== "available") {
           return { _tag: "Ready" as const, state, book };
         }
-        if (state.phase !== "awaiting_qa") {
+        if (state.phase !== "awaiting_qa" && state.phase !== "qa_incomplete") {
           return { _tag: "Ready" as const, state, book };
         }
         const view = yield* runs

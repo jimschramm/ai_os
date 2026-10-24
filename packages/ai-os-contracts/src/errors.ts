@@ -21,6 +21,7 @@ export const SequencePhase = Schema.Literals([
   "assigned",
   "executing",
   "awaiting_qa",
+  "qa_incomplete",
   "rework",
   "accepted",
   "review_delivered",
@@ -55,6 +56,8 @@ export type ContractErrorReason = typeof ContractErrorReason.Type;
 export const RECOVERY_PENDING_LABEL = "Execution status unknown";
 
 export const REVIEW_DELIVERED_LABEL = "Review delivered";
+
+export const QA_INCOMPLETE_LABEL = "Awaiting a verified reviewer";
 
 export class ContractTransitionError extends Schema.TaggedError<ContractTransitionError>()(
   "ContractTransitionError",
