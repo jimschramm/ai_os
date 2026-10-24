@@ -2355,4 +2355,36 @@ describe("ai-os board route", () => {
     expect(cursor?.attempts?.map((item) => item.attemptId)).toEqual(["attempt-cursor"]);
     expect(cursor?.attempts?.[0]?.authorId).toBe("t3-codex");
   });
+
+  it("does not save a read receipt when the launch is rejected before the prompt is sent", async () => {
+    const prompts: string[] = [];
+    const { handler, stateDir } = handlerFor(undefined, {
+      ...allowRuns,
+      launch: (input) => {
+        prompts.push(input.prompt);
+        return Effect.fail(
+          new AiOsBoard.BoardRunError({ detail: "HTTP 409 sentToProvider:false" }),
+        );
+      },
+    });
+    await reachAssigned(handler);
+    const moved = await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
+      taskId: "task-demo",
+      column: "Running",
+      idempotencyKey: "launch-rejected",
+    });
+    expect(moved.status).toBe(409);
+    expect(await moved.json()).toMatchObject({
+      detail: expect.stringMatching(/sentToProvider:false/),
+    });
+    expect(prompts).toHaveLength(1);
+    expect(prompts[0]).toContain(assignmentExample.contextPackage.requirements);
+    expect(prompts[0]).toContain(assignmentExample.contextPackage.repoCommit);
+    expect(await phaseOfHandler(handler)).toBe("assigned");
+    const saved = openMemoryDatabase(NodePath.join(stateDir, "memory.db"));
+    expect(readAttemptActivitySync(saved).some((item) => item.attemptId === "attempt-1")).toBe(
+      false,
+    );
+    saved.close();
+  });
 });

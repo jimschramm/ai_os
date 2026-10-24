@@ -42,6 +42,7 @@ import {
   SequenceState,
   type AttemptMemoryActivityV1,
   type ContextPackageSnapshotV1,
+  type PreparedTaskMemory,
   type SequenceEvent,
   type KanbanColumn,
   type KanbanMoveLedger,
@@ -435,8 +436,8 @@ const readBoardAttempts = (file: string): readonly AttemptMemoryActivityV1[] => 
 };
 
 /**
- * Build the package, and commit the read only when the prompt that will be
- * sent already contains it. A launch that never includes the package gets no receipt.
+ * Build the package and the prompt that carries it. Nothing is written here.
+ * The read receipt is stored only after the adapter accepts this prompt.
  */
 const suppliedForLaunch = (file: string, state: BoardSequence) =>
   Effect.gen(function* () {
@@ -462,13 +463,9 @@ const suppliedForLaunch = (file: string, state: BoardSequence) =>
     const prepared = yield* withTaskMemory(file, (database) =>
       prepareTaskMemorySync(database, request),
     );
-    const launchOf = (candidate: typeof prepared) => {
-      const lines = orientationText(candidate.package);
-      const prompt = renderSuppliedPrompt(state.intake, candidate.contextPackage, lines);
-      return { prepared: candidate, prompt, lines };
-    };
-    const launch = launchOf(prepared);
-    if (!promptCarriesMemory(launch.prepared.package, launch.prompt)) {
+    const lines = orientationText(prepared.package);
+    const prompt = renderSuppliedPrompt(state.intake, prepared.contextPackage, lines);
+    if (!promptCarriesMemory(prepared.package, prompt)) {
       return yield* new ContractTransitionError({
         contract: "memory",
         reason: "invalid_payload",
@@ -477,21 +474,15 @@ const suppliedForLaunch = (file: string, state: BoardSequence) =>
         detail: "The launch prompt does not include the memory package.",
       });
     }
-    const stored = yield* withTaskMemory(file, (database) =>
-      commitTaskReadSync(database, prepared),
-    );
-    const sent = stored.receipt.digest === prepared.receipt.digest ? launch : launchOf(stored);
-    if (!promptCarriesMemory(sent.prepared.package, sent.prompt)) {
-      return yield* new ContractTransitionError({
-        contract: "memory",
-        reason: "invalid_payload",
-        from: "idle",
-        event: "submit",
-        detail: "The launch prompt does not include the memory package.",
-      });
-    }
-    return sent;
+    return { prepared, prompt, lines };
   });
+
+/** Store the read after the adapter has accepted the prompt that carries this package. */
+const commitSuppliedRead = (file: string, prepared: PreparedTaskMemory) =>
+  withTaskMemory(file, (database) => commitTaskReadSync(database, prepared)).pipe(
+    Effect.map(() => ({ _tag: "Ok" as const })),
+    Effect.catch((error) => Effect.succeed({ _tag: "No" as const, detail: error.message })),
+  );
 
 const rememberExplanation = (
   file: string,
@@ -1241,6 +1232,11 @@ export const layer = Layer.unwrap(
               if (opened.status === "unavailable") {
                 return rejectedMove(opened.detail, rejectedState, book);
               }
+              const recorded = yield* commitSuppliedRead(
+                taskMemoryFile(config.stateDir),
+                supplied.value.prepared,
+              );
+              if (recorded._tag === "No") return rejectedMove(recorded.detail, rejectedState, book);
               const started = yield* applyBoardWorkflowEvent(
                 queued,
                 { type: "start_execution" },
@@ -1449,6 +1445,12 @@ export const layer = Layer.unwrap(
                         ledger,
                       );
                     }
+                    const recorded = yield* commitSuppliedRead(
+                      taskMemoryFile(config.stateDir),
+                      supplied.value.prepared,
+                    );
+                    if (recorded._tag === "No")
+                      return rejectedMove(recorded.detail, queued, ledger);
                     launchedThread = launched.value.threadId;
                     launchedRun = runId;
                     const watched = yield* runs
@@ -1843,6 +1845,13 @@ export const layer = Layer.unwrap(
             });
             if (opened.status === "unavailable") {
               return json(409, { _tag: "Rejected", detail: opened.detail });
+            }
+            const recorded = yield* commitSuppliedRead(
+              taskMemoryFile(config.stateDir),
+              supplied.value.prepared,
+            );
+            if (recorded._tag === "No") {
+              return json(409, { _tag: "Rejected", detail: recorded.detail });
             }
             const started = yield* applyBoardWorkflowEvent(
               queued,
