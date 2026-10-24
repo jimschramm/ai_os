@@ -5,7 +5,11 @@ import type { MemoryFactV1 } from "./memory.ts";
 import type { MemoryLedgerV1 } from "./submission.ts";
 import type { AttemptMemoryActivityV1 } from "./taskMemory.ts";
 
-export const StewardNoticeKindV1 = Schema.Literals(["open_conflict", "missing_write"]);
+export const StewardNoticeKindV1 = Schema.Literals([
+  "open_conflict",
+  "missing_write",
+  "needs_worker",
+]);
 export type StewardNoticeKindV1 = typeof StewardNoticeKindV1.Type;
 
 /**
@@ -128,3 +132,20 @@ export const reviewSteward = (
   }
   return notices;
 };
+
+/** The card stays put. The existing Needs you list is what asks Jim. */
+export const needsWorkerNotice = (projectId: string, taskId: string): StewardNoticeV1 =>
+  decodeStewardNoticeV1({
+    noticeId: fitId("needs-worker", taskId),
+    projectId,
+    taskId,
+    kind: "needs_worker",
+    authorId: "ai-os",
+    summary: clip(
+      `Ask Jim to choose an implementer for ${projectId}. No eligible worker is configured.`,
+    ),
+    conflictId: null,
+    attemptId: null,
+    acceptedFactId: null,
+    proposedFactId: null,
+  });

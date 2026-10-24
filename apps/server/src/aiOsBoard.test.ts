@@ -12,6 +12,8 @@ import {
   ADAPTER_BOARD_EVENTS_PATH,
   ADAPTER_BOARD_MOVE_PATH,
   ADAPTER_BOARD_PATH,
+  ADAPTER_REQUEST_PATH,
+  ADAPTER_ROLES_PATH,
   ADAPTER_MEMORY_COMMIT_PATH,
   ADAPTER_MEMORY_RESOLVE_PATH,
   ADAPTER_MEMORY_SUPPLY_PATH,
@@ -3100,5 +3102,207 @@ describe("ai-os board route", () => {
     expect(prompts[0]).toContain(ADAPTER_MEMORY_WRITE_PATH);
     expect(prompts[0]).toContain("This attempt has one write");
     expect(prompts[0]).toContain("Memory write token:");
+  });
+});
+
+describe("ai-os request route", () => {
+  const SUBMITTED = "d".repeat(40);
+  const sol = { workerId: "codex-t3", instanceId: "codex", model: "gpt-5.6-sol" };
+  const astra = { workerId: "codex-astra", instanceId: "codex", model: "gpt-6-astra" };
+
+  const finding = {
+    defect: "The schedule omits the final round.",
+    evidence: "The preview still lists Saturday only.",
+    expectedBehavior: "The page lists Saturday and Sunday.",
+  };
+
+  const verdictText = (qaModel: string) =>
+    JSON.stringify({
+      version: "v1",
+      taskId: "task-demo",
+      attemptId: "task-demo-attempt-1",
+      availability: "available",
+      qaModel,
+      implementerModel: "gpt-5.6-sol",
+      verdict: "rework",
+      artifactRevision: { type: "git", sha: SUBMITTED },
+      findings: [finding],
+    });
+
+  const runsFor = (
+    qa: {
+      readonly actual: string | null;
+      readonly status?: "running" | "completed";
+      readonly text?: string | null;
+    } | null,
+  ) => {
+    const launches: Array<{ model: string; instanceId: string; prompt: string }> = [];
+    const runs: AiOsBoard.BoardRuns["Service"] = {
+      ...allowRuns,
+      launch: (input) => {
+        launches.push({
+          model: input.model,
+          instanceId: input.instanceId,
+          prompt: input.prompt,
+        });
+        const reviewing = input.model === "gpt-6-astra";
+        return Effect.succeed({
+          threadId: reviewing ? "thread-qa" : "thread-impl",
+          runId: reviewing ? "run-qa" : "run-impl",
+          disposition: reviewing && qa?.status !== "running" ? "completed" : "active",
+          summary: reviewing ? (qa?.text ?? null) : "Shipped the page.",
+        });
+      },
+      watchThread: (threadId) =>
+        Effect.succeed(
+          threadId === "thread-qa"
+            ? {
+                threadId,
+                runId: "run-qa",
+                status: qa?.status ?? "running",
+                text: qa?.text ?? null,
+                revision: SUBMITTED,
+                requestedModel: "gpt-6-astra",
+                actualModel: qa?.actual ?? null,
+              }
+            : {
+                threadId,
+                runId: "run-impl",
+                status: "completed" as const,
+                text: "Shipped the page.",
+                revision: SUBMITTED,
+                requestedModel: "gpt-5.6-sol",
+                actualModel: "gpt-5.6-sol",
+              },
+        ),
+    };
+    return { runs, launches };
+  };
+
+  const configure = (handler: (request: Request) => Promise<Response>, qa = astra) =>
+    postJson(handler, ADAPTER_ROLES_PATH, {
+      projectId: "usba",
+      implementer: sol,
+      qa,
+    });
+
+  const ask = (handler: (request: Request) => Promise<Response>, key = "request-1") =>
+    postJson(handler, ADAPTER_REQUEST_PATH, {
+      taskId: "task-demo",
+      title: "Demo task",
+      idempotencyKey: key,
+      repoCommit: exampleRepoCommit,
+      intake: intakeV2Example,
+    });
+
+  const demo = async (handler: (request: Request) => Promise<Response>) =>
+    (await readCards(handler)).find((card) => card.taskId === "task-demo");
+
+  it("turns one request into a launched attempt and starts QA on that revision", async () => {
+    const { runs, launches } = runsFor({ actual: null, status: "running" });
+    const { handler } = handlerFor(undefined, runs);
+    expect((await configure(handler)).status).toBe(200);
+    const started = await ask(handler);
+    expect(started.status).toBe(200);
+
+    const card = await demo(handler);
+    expect(card?.state.phase).toBe("awaiting_qa");
+    if (card?.state.phase !== "awaiting_qa") throw new Error("expected review");
+    expect(card.state.assignment.workerId).toBe("codex-t3");
+    expect(card.state.completion.artifactRevision).toEqual({ type: "git", sha: SUBMITTED });
+    expect(card.state.recordedVerdict).toBeUndefined();
+    expect(card.qaRun).toEqual({
+      threadId: "thread-qa",
+      runId: "run-qa",
+      commitSha: SUBMITTED,
+    });
+    expect(
+      card.attempts?.some((item) => item.attemptId === "task-demo-attempt-1" && item.read),
+    ).toBe(true);
+    expect(launches.map((item) => [item.instanceId, item.model])).toEqual([
+      ["codex", "gpt-5.6-sol"],
+      ["codex", "gpt-6-astra"],
+    ]);
+    expect(launches[0]?.prompt).toContain("Memory write:");
+    expect(launches[0]?.prompt).toContain(ADAPTER_MEMORY_WRITE_PATH);
+    expect(launches[1]?.prompt).toContain(`Review this exact submitted revision: ${SUBMITTED}`);
+    expect(launches[1]?.prompt).toContain("Memory write:");
+
+    const again = await ask(handler);
+    expect(again.status).toBe(200);
+    expect(launches).toHaveLength(2);
+  });
+
+  it("asks Jim and does not launch when no implementer is configured", async () => {
+    const { runs, launches } = runsFor(null);
+    const { handler } = handlerFor(undefined, runs);
+    const started = await ask(handler);
+    expect(started.status).toBe(200);
+    expect(await started.json()).toMatchObject({
+      _tag: "NeedsYou",
+      detail: expect.stringMatching(/Ask Jim/),
+    });
+    const card = await demo(handler);
+    expect(card?.state.phase).toBe("acknowledged");
+    expect(card?.steward?.some((notice) => notice.kind === "needs_worker")).toBe(true);
+    expect(card?.steward?.[0]?.summary).toContain("Ask Jim");
+    expect(launches).toEqual([]);
+  });
+
+  it("leaves QA incomplete when the reviewer model is unknown", async () => {
+    const { runs } = runsFor({
+      actual: null,
+      status: "completed",
+      text: verdictText("gpt-6-astra"),
+    });
+    const { handler } = handlerFor(undefined, runs);
+    expect((await configure(handler)).status).toBe(200);
+    const started = await ask(handler);
+    expect(started.status).toBe(200);
+    const card = await demo(handler);
+    expect(card?.state.phase).toBe("qa_incomplete");
+    if (card?.state.phase !== "qa_incomplete") throw new Error("expected incomplete QA");
+    expect(card.state.findings).toEqual([finding]);
+    expect(card.state.artifactRevision).toEqual({ type: "git", sha: SUBMITTED });
+    expect(card.qaRun?.commitSha).toBe(SUBMITTED);
+  });
+
+  it("rejects QA that ran the implementer's model and does not count it", async () => {
+    const { runs } = runsFor({
+      actual: "gpt-5.6-sol",
+      status: "completed",
+      text: verdictText("gpt-6-astra"),
+    });
+    const { handler } = handlerFor(undefined, runs);
+    expect((await configure(handler)).status).toBe(200);
+    const started = await ask(handler);
+    expect(started.status).toBe(409);
+    expect(await started.json()).toMatchObject({
+      detail: expect.stringMatching(/different base model/),
+    });
+    const card = await demo(handler);
+    expect(card?.state.phase).toBe("awaiting_qa");
+    if (card?.state.phase !== "awaiting_qa") throw new Error("expected the card to stay in review");
+    expect(card.state.recordedVerdict).toBeUndefined();
+    expect(card.state.run.reviewerRuntime?.actual ?? null).toBeNull();
+    expect(card.qaRun).toMatchObject({ commitSha: SUBMITTED, settled: "rejected" });
+  });
+
+  it("records an independent QA verdict and leaves the card in review", async () => {
+    const { runs } = runsFor({
+      actual: "gpt-6-astra",
+      status: "completed",
+      text: verdictText("gpt-6-astra"),
+    });
+    const { handler } = handlerFor(undefined, runs);
+    expect((await configure(handler)).status).toBe(200);
+    const started = await ask(handler);
+    expect(started.status).toBe(200);
+    const card = await demo(handler);
+    expect(card?.state.phase).toBe("awaiting_qa");
+    if (card?.state.phase !== "awaiting_qa") throw new Error("expected the card to stay in review");
+    expect(card.state.recordedVerdict?.verdict).toBe("rework");
+    expect(card.state.recordedVerdict?.artifactRevision).toEqual({ type: "git", sha: SUBMITTED });
+    expect(card.qaRun?.commitSha).toBe(SUBMITTED);
   });
 });

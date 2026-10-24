@@ -2,6 +2,7 @@ import {
   applyBoardWorkflowEvent,
   ContractId,
   ContractText,
+  GitSha,
   IsoDateTime,
   openBoardTask,
   SequenceEvent,
@@ -44,6 +45,17 @@ const WireCards = Schema.Array(
     attempts: Schema.optional(Schema.Array(AttemptMemoryActivityV1)),
     steward: Schema.optional(Schema.Array(StewardNoticeV1)),
     memoryFacts: Schema.optional(Schema.Array(MemoryFactV1)),
+    attention: Schema.optional(Schema.Array(StewardNoticeV1)),
+    qaRun: Schema.optional(
+      Schema.NullOr(
+        Schema.Struct({
+          threadId: RuntimeId,
+          runId: RuntimeId,
+          commitSha: GitSha,
+          settled: Schema.optional(Schema.Literal("rejected")),
+        }),
+      ),
+    ),
   }),
 );
 
@@ -69,6 +81,8 @@ export const encodeAdapterBoardWire = (cards: readonly AdapterBoardCard[]): stri
       ...(card.attempts === undefined ? {} : { attempts: card.attempts }),
       ...(card.steward === undefined ? {} : { steward: card.steward }),
       ...(card.memoryFacts === undefined ? {} : { memoryFacts: card.memoryFacts }),
+      ...(card.attention === undefined ? {} : { attention: card.attention }),
+      ...(card.qaRun === undefined || card.qaRun === null ? {} : { qaRun: card.qaRun }),
     })),
   );
 
@@ -114,6 +128,17 @@ export const decodeAdapterBoardWire = (text: string): readonly AdapterBoardCard[
     ...(card.attempts === undefined ? {} : { attempts: card.attempts }),
     ...(card.steward === undefined ? {} : { steward: card.steward }),
     ...(card.memoryFacts === undefined ? {} : { memoryFacts: card.memoryFacts }),
+    ...(card.attention === undefined ? {} : { attention: card.attention }),
+    ...(card.qaRun === undefined || card.qaRun === null
+      ? {}
+      : {
+          qaRun: {
+            threadId: card.qaRun.threadId,
+            runId: card.qaRun.runId,
+            commitSha: card.qaRun.commitSha,
+            ...(card.qaRun.settled === undefined ? {} : { settled: card.qaRun.settled }),
+          },
+        }),
   }));
 };
 
@@ -297,6 +322,10 @@ export const acceptBoardEvent = (
         runId,
         revision,
         updatedAt,
+        ...(existing?.attention === undefined ? {} : { attention: existing.attention }),
+        ...(existing?.qaRun === undefined || existing.qaRun === null
+          ? {}
+          : { qaRun: existing.qaRun }),
       };
       const order =
         existing === undefined

@@ -14,6 +14,7 @@ export * from "./steward.ts";
 export * from "./usage.ts";
 export * from "./control.ts";
 export * from "./reworkCap.ts";
+export * from "./roles.ts";
 export * from "./delivery.ts";
 export * from "./sequence.ts";
 export * from "./kanbanMove.ts";

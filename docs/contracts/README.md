@@ -63,6 +63,8 @@ A formal verdict, rework or accept, compares the implementer's actual base model
 
 The comparison runs for both verdicts. A stored `rework` or `accepted` card is checked again when both `implementerRuntime` and `reviewerRuntime` are present. A card saved before those fields existed still decodes. A stored accepted card whose runtime actuals share a base does not.
 
+An automatic QA run records a verdict that passed that check on the card as `recordedVerdict` and leaves the phase `awaiting_qa`. That record is not rework, acceptance, escalation, or delivery. A Sol implementer (`*-sol`) is reviewed by Astra (`gpt-6-astra` on Codex). Any other implementer uses the QA worker configured for the project, then the same check. An unknown actual becomes `qa_incomplete`. A same-base actual is rejected and is not stored as QA. An advisory result is not QA.
+
 ## Progress
 
 `ProgressReportV1` is a snapshot for the open generation and lease: `working` or `blocked`, blockers, and partial artifacts. A blocked report needs at least one blocker. A blocker names the summary, the owner, and a concrete next action. A working report cannot carry blockers. Partial artifacts use the same revision types as completion, so an abbreviated git id is rejected. The stored report is frozen.
