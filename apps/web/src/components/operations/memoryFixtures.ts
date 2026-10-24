@@ -1,5 +1,6 @@
 import type {
   AcceptedRelationshipV1,
+  AttemptMemoryActivityV1,
   MemoryFactV1,
   MemoryGraphV1,
   MemoryNodeKindV1,
@@ -561,4 +562,29 @@ export const AUTHOR_LABELS: Readonly<Record<string, string>> = {
   "qa-reviewer": "QA reviewer",
   "grok-bot": "Grok Bot",
   "codex-t3": "Codex via T3",
+  "codex-vscode": "Codex in VS Code",
+  cursor: "Cursor",
+  antigravity: "Antigravity",
 };
+
+export const ATTEMPT_ACTIVITY: readonly AttemptMemoryActivityV1[] = [
+  {
+    projectId: "usba",
+    taskId: "saturday-copy",
+    attemptId: "saturday-copy-attempt-1",
+    authorId: "codex-t3",
+    runtime: "codex",
+    read: {
+      receiptId: "read-saturday-copy-attempt-1",
+      digest: "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+      suppliedAt: "2026-10-21T16:00:00Z",
+      memoryVersions: ["fact-governing-copy", "fact-saturday-start"],
+    },
+    write: {
+      submissionId: "write-saturday-copy-attempt-1",
+      outcome: "pending",
+      detail: "Recorded as a proposal. Accepted knowledge was not changed.",
+      factIds: ["fact-saturday-note"],
+    },
+  },
+];

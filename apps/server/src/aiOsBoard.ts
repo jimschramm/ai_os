@@ -1,3 +1,6 @@
+// @effect-diagnostics nodeBuiltinImport:off - The production memory file is under the home directory, and tests keep theirs in the temp state dir.
+import * as NodeOS from "node:os";
+
 import {
   ADAPTER_ANTIGRAVITY_MODELS_PATH,
   ADAPTER_BOARD_EVENT_PATH,
@@ -16,7 +19,7 @@ import {
   antigravitySupports,
   launchCommandId,
   observationEvents,
-  renderPrompt,
+  renderSuppliedPrompt,
   T3_LAUNCH_DEFAULTS,
   threadViewFromProjection,
   type T3ThreadView,
@@ -29,11 +32,17 @@ import {
   decodeSequenceState,
   executionGeneration,
   executionLaunchKey,
+  ContractTransitionError,
   openBoardTask,
+  orientationText,
+  promptCarriesMemory,
   requestKanbanMove,
+  runtimeForAssignment,
   sameModelName,
   SequenceState,
+  type AttemptMemoryActivityV1,
   type ContextPackageSnapshotV1,
+  type PreparedTaskMemory,
   type SequenceEvent,
   type KanbanColumn,
   type KanbanMoveLedger,
@@ -74,7 +83,15 @@ import {
   applyAdvisoryStop,
   type AdvisoryOpen,
 } from "./aiOsAntigravity.ts";
-import type { AdvisoryExecution } from "@t3tools/ai-os-adapter";
+import { memoryDatabasePath, openMemoryDatabase } from "./aiOsMemory.ts";
+import {
+  commitTaskReadSync,
+  prepareTaskMemorySync,
+  readAttemptActivitySync,
+  recordTaskWriteSync,
+  withTaskMemory,
+} from "./aiOsTaskMemory.ts";
+import type { AdvisoryExecution, AdvisorySuccess } from "@t3tools/ai-os-adapter";
 import * as EnvironmentAuth from "./auth/EnvironmentAuth.ts";
 import {
   failEnvironmentAuthInvalid,
@@ -383,6 +400,113 @@ const evidenceRef = (threadId: string): string => {
   return /^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(ref) && ref.length <= 128 ? ref : "thread:t3";
 };
 
+const taskMemoryFile = (stateDir: string): string =>
+  process.env.VITEST === "true" || process.env.NODE_ENV === "test"
+    ? `${stateDir}/memory.db`
+    : memoryDatabasePath(process.env, NodeOS.homedir());
+
+const memoryRequest = (state: BoardSequence, createdAt: string) => {
+  if (!("assignment" in state)) return null;
+  const projectId = projectIdOf(state);
+  if (projectId === null) return null;
+  return {
+    projectId,
+    taskId: state.assignment.taskId,
+    attemptId: state.assignment.attemptId,
+    authorId: state.assignment.workerId,
+    runtime: runtimeForAssignment(state.assignment),
+    repoCommit: state.assignment.contextPackage.repoCommit,
+    requirements: state.assignment.contextPackage.requirements,
+    authorizationScope: state.assignment.contextPackage.authorizationScope,
+    createdAt,
+  };
+};
+
+const readBoardAttempts = (file: string): readonly AttemptMemoryActivityV1[] => {
+  try {
+    const database = openMemoryDatabase(file);
+    try {
+      return readAttemptActivitySync(database);
+    } finally {
+      database.close();
+    }
+  } catch {
+    return [];
+  }
+};
+
+/**
+ * Build the package and the prompt that carries it. Nothing is written here.
+ * The read receipt is stored only after the adapter accepts this prompt.
+ */
+const suppliedForLaunch = (file: string, state: BoardSequence) =>
+  Effect.gen(function* () {
+    if (!("assignment" in state) || !("intake" in state)) {
+      return yield* new ContractTransitionError({
+        contract: "memory",
+        reason: "invalid_payload",
+        from: "idle",
+        event: "submit",
+        detail: "This run has no assignment.",
+      });
+    }
+    const request = memoryRequest(state, DateTime.formatIso(yield* DateTime.now));
+    if (request === null) {
+      return yield* new ContractTransitionError({
+        contract: "memory",
+        reason: "invalid_payload",
+        from: "idle",
+        event: "submit",
+        detail: "This run has no project.",
+      });
+    }
+    const prepared = yield* withTaskMemory(file, (database) =>
+      prepareTaskMemorySync(database, request),
+    );
+    const lines = orientationText(prepared.package);
+    const prompt = renderSuppliedPrompt(state.intake, prepared.contextPackage, lines);
+    if (!promptCarriesMemory(prepared.package, prompt)) {
+      return yield* new ContractTransitionError({
+        contract: "memory",
+        reason: "invalid_payload",
+        from: "idle",
+        event: "submit",
+        detail: "The launch prompt does not include the memory package.",
+      });
+    }
+    return { prepared, prompt, lines };
+  });
+
+/** Store the read after the adapter has accepted the prompt that carries this package. */
+const commitSuppliedRead = (file: string, prepared: PreparedTaskMemory) =>
+  withTaskMemory(file, (database) => commitTaskReadSync(database, prepared)).pipe(
+    Effect.map(() => ({ _tag: "Ok" as const })),
+    Effect.catch((error) => Effect.succeed({ _tag: "No" as const, detail: error.message })),
+  );
+
+const rememberExplanation = (
+  file: string,
+  state: BoardSequence,
+  explanation: string,
+  evidenceId: string,
+) =>
+  withTaskMemory(file, (database) => {
+    if (!("assignment" in state)) return;
+    const attemptId = state.assignment.attemptId;
+    const existing = readAttemptActivitySync(database).find((item) => item.attemptId === attemptId);
+    if (existing === undefined || existing.write !== null) return;
+    recordTaskWriteSync(
+      database,
+      attemptId,
+      {
+        kind: "no_durable_change",
+        explanation: claimText(explanation, "The run recorded no durable memory change."),
+        evidence: [{ evidenceId, note: "Recorded when the run finished." }],
+      },
+      "jim",
+    );
+  });
+
 const rejectedMove = (
   detail: string,
   state: BoardSequence,
@@ -400,6 +524,7 @@ const recordConfirmedRun = (input: {
   readonly disposition: BoardLaunchDisposition;
   readonly summary: string | null;
   readonly ledger: KanbanMoveLedger;
+  readonly memoryFile: string;
   /** Model the run was asked to use. Null when the thread did not report one. */
   readonly implementerRequested?: string | null;
   /** Provider-reported model. A finished run without one is not submitted for QA. */
@@ -452,6 +577,18 @@ const recordConfirmedRun = (input: {
           )
         : started;
     if (recorded._tag !== "Applied" || recorded.state.phase !== "executing") return recorded;
+    if (input.disposition === "completed" && actual !== null) {
+      const wrote = yield* rememberExplanation(
+        input.memoryFile,
+        recorded.state,
+        claimText(input.summary, "The run finished."),
+        evidenceRef(input.threadId),
+      ).pipe(
+        Effect.map(() => ({ _tag: "Ok" as const })),
+        Effect.catch((error) => Effect.succeed({ _tag: "No" as const, detail: error.message })),
+      );
+      if (wrote._tag === "No") return rejectedMove(wrote.detail, recorded.state, recorded.ledger);
+    }
     if (input.disposition === "completed" && actual === null) {
       return yield* applyBoardWorkflowEvent(
         recorded.state,
@@ -596,6 +733,7 @@ export const layer = Layer.unwrap(
     const filePath = path.join(config.stateDir, BOARD_FILE);
     yield* fs.makeDirectory(path.dirname(filePath), { recursive: true }).pipe(Effect.ignore);
     const hub = makeAdapterBoardHub();
+    let publishAttempts: () => void = () => undefined;
     const existing = yield* fs.readFileString(filePath).pipe(Effect.orElseSucceed(() => ""));
     let ledger: KanbanMoveLedger = {};
     if (existing.length > 0) {
@@ -626,6 +764,7 @@ export const layer = Layer.unwrap(
       });
     const snapshot = Effect.gen(function* () {
       yield* authorize(AuthOrchestrationReadScope);
+      publishAttempts();
       return HttpServerResponse.text(hub.snapshot(), { contentType: "application/json" });
     }).pipe(Effect.catchTags(authResponse));
     const replace = Effect.gen(function* () {
@@ -655,6 +794,7 @@ export const layer = Layer.unwrap(
               }),
             ),
           );
+          publishAttempts();
           return HttpServerResponse.text(hub.snapshot(), {
             status: 200,
             contentType: "application/json",
@@ -673,15 +813,28 @@ export const layer = Layer.unwrap(
     );
     const events = Effect.gen(function* () {
       yield* authorize(AuthOrchestrationReadScope);
+      publishAttempts();
       return yield* hub.events;
     }).pipe(Effect.catchTags(authResponse));
     const cardsNow = () => decodeAdapterBoardWire(hub.snapshot()) ?? [];
+    const withAttempts = (cards: readonly AdapterBoardCard[]): readonly AdapterBoardCard[] => {
+      const activity = readBoardAttempts(taskMemoryFile(config.stateDir));
+      return cards.map((card) => ({
+        ...card,
+        attempts: activity.filter((item) => item.taskId === card.taskId),
+      }));
+    };
+    publishAttempts = () => {
+      const current = cardsNow();
+      const next = encodeAdapterBoardWire(withAttempts(current));
+      if (next !== hub.snapshot()) hub.replace(next);
+    };
     const commitCard = (card: AdapterBoardCard) => {
       const current = cardsNow();
       const next = current.some((item) => item.taskId === card.taskId)
         ? current.map((item) => (item.taskId === card.taskId ? card : item))
         : [...current, card];
-      return hub.replace(encodeAdapterBoardWire(next));
+      return hub.replace(encodeAdapterBoardWire(withAttempts(next)));
     };
     const persistApplied = (
       outcome: KanbanMoveResult & { readonly _tag: "Applied" },
@@ -743,6 +896,21 @@ export const layer = Layer.unwrap(
           allowLapse: view.status === "interrupted",
           workerId: state.assignment.workerId,
         });
+        const completion = planned.find((item) => item.event.type === "submit_completion");
+        if (completion?.event.type === "submit_completion") {
+          const wrote = yield* rememberExplanation(
+            taskMemoryFile(config.stateDir),
+            state,
+            completion.event.completion.claimedOutcome,
+            completion.event.completion.evidence[0].ref,
+          ).pipe(
+            Effect.map(() => ({ _tag: "Ok" as const })),
+            Effect.catch((error) => Effect.succeed({ _tag: "No" as const, detail: error.message })),
+          );
+          if (wrote._tag === "No") {
+            return { state, book, changed, runId: view.runId };
+          }
+        }
         let next: BoardSequence = state;
         let nextBook = book;
         let nextChanged = changed;
@@ -903,31 +1071,43 @@ export const layer = Layer.unwrap(
         if (applied._tag !== "Applied") return { _tag: "Rejected" as const, outcome: applied };
         return { _tag: "Ready" as const, state: applied.state, book: applied.ledger };
       });
+    const finishedReview = (execution: AdvisoryExecution): execution is AdvisorySuccess =>
+      execution.status === "completed" || execution.status === "model_mismatch";
     const settleAdvisory = (
       state: BoardSequence,
       book: KanbanMoveLedger,
       execution: AdvisoryExecution,
       work: { readonly taskId: string; readonly workerId: string },
     ) => {
-      switch (execution.status) {
-        case "completed":
-        case "model_mismatch":
-          return applyAdvisoryExecution({
-            state,
-            taskId: work.taskId,
-            ledger: book,
-            execution,
-            workerId: work.workerId,
-          });
-        default:
-          return applyAdvisoryStop({
-            state,
-            taskId: work.taskId,
-            ledger: book,
-            execution,
-            workerId: work.workerId,
-          });
+      if (!finishedReview(execution)) {
+        return applyAdvisoryStop({
+          state,
+          taskId: work.taskId,
+          ledger: book,
+          execution,
+          workerId: work.workerId,
+        });
       }
+      const finished = execution;
+      return Effect.gen(function* () {
+        const wrote = yield* rememberExplanation(
+          taskMemoryFile(config.stateDir),
+          state,
+          finished.summary,
+          "advisory-review",
+        ).pipe(
+          Effect.map(() => ({ _tag: "Ok" as const })),
+          Effect.catch((error) => Effect.succeed({ _tag: "No" as const, detail: error.message })),
+        );
+        if (wrote._tag === "No") return rejectedMove(wrote.detail, state, book);
+        return yield* applyAdvisoryExecution({
+          state,
+          taskId: work.taskId,
+          ledger: book,
+          execution: finished,
+          workerId: work.workerId,
+        });
+      });
     };
     const settleOpenAdvisory = Effect.gen(function* () {
       for (const card of cardsNow()) {
@@ -1030,17 +1210,33 @@ export const layer = Layer.unwrap(
               const requested =
                 typed.length > 0 ? typed : (queued.assignment.advisoryModel?.model ?? undefined);
               const generation = executionGeneration(queued);
+              const supplied = yield* suppliedForLaunch(
+                taskMemoryFile(config.stateDir),
+                queued,
+              ).pipe(
+                Effect.map((value) => ({ _tag: "Ok" as const, value })),
+                Effect.catch((error) =>
+                  Effect.succeed({ _tag: "No" as const, detail: error.message }),
+                ),
+              );
+              if (supplied._tag === "No") return rejectedMove(supplied.detail, rejectedState, book);
               const opened = yield* reviews.start({
                 projectId,
                 taskId,
                 generation,
                 intake: queued.intake,
-                context: queued.assignment.contextPackage,
+                context: supplied.value.prepared.contextPackage,
+                orientation: supplied.value.lines,
                 requestedModel: requested,
               });
               if (opened.status === "unavailable") {
                 return rejectedMove(opened.detail, rejectedState, book);
               }
+              const recorded = yield* commitSuppliedRead(
+                taskMemoryFile(config.stateDir),
+                supplied.value.prepared,
+              );
+              if (recorded._tag === "No") return rejectedMove(recorded.detail, rejectedState, book);
               const started = yield* applyBoardWorkflowEvent(
                 queued,
                 { type: "start_execution" },
@@ -1195,6 +1391,17 @@ export const layer = Layer.unwrap(
                         ledger,
                       );
                     }
+                    const supplied = yield* suppliedForLaunch(
+                      taskMemoryFile(config.stateDir),
+                      queued,
+                    ).pipe(
+                      Effect.map((value) => ({ _tag: "Ok" as const, value })),
+                      Effect.catch((error) =>
+                        Effect.succeed({ _tag: "No" as const, detail: error.message }),
+                      ),
+                    );
+                    if (supplied._tag === "No")
+                      return rejectedMove(supplied.detail, queued, ledger);
                     const launched = yield* asRun(
                       runs.launch({
                         idempotencyKey: executionLaunchKey(
@@ -1204,10 +1411,10 @@ export const layer = Layer.unwrap(
                         ),
                         projectId,
                         title: card.title,
-                        prompt: renderPrompt(queued.intake, queued.assignment.contextPackage),
+                        prompt: supplied.value.prompt,
                         model: queued.assignment.implementerModel.model,
                         instanceId: queued.assignment.instanceId ?? T3_LAUNCH_DEFAULTS.instanceId,
-                        contextPackage: queued.assignment.contextPackage,
+                        contextPackage: supplied.value.prepared.contextPackage,
                       }),
                     );
                     if (launched._tag === "No") {
@@ -1238,6 +1445,12 @@ export const layer = Layer.unwrap(
                         ledger,
                       );
                     }
+                    const recorded = yield* commitSuppliedRead(
+                      taskMemoryFile(config.stateDir),
+                      supplied.value.prepared,
+                    );
+                    if (recorded._tag === "No")
+                      return rejectedMove(recorded.detail, queued, ledger);
                     launchedThread = launched.value.threadId;
                     launchedRun = runId;
                     const watched = yield* runs
@@ -1250,6 +1463,7 @@ export const layer = Layer.unwrap(
                       disposition: launched.value.disposition,
                       summary: launched.value.summary,
                       ledger,
+                      memoryFile: taskMemoryFile(config.stateDir),
                       implementerRequested: watched?.requestedModel ?? null,
                       implementerActual: watched?.actualModel ?? null,
                     });
@@ -1461,6 +1675,22 @@ export const layer = Layer.unwrap(
               return json(409, { _tag: "Rejected", detail: confirmed.detail });
             }
           }
+          if (!replay && stored._tag === "Ok" && decoded.event.type === "submit_completion") {
+            const wrote = yield* rememberExplanation(
+              taskMemoryFile(config.stateDir),
+              stored.state,
+              decoded.event.completion.claimedOutcome,
+              decoded.event.completion.evidence[0].ref,
+            ).pipe(
+              Effect.map(() => ({ _tag: "Ok" as const })),
+              Effect.catch((error) =>
+                Effect.succeed({ _tag: "No" as const, detail: error.message }),
+              ),
+            );
+            if (wrote._tag === "No") {
+              return json(409, { _tag: "Rejected", detail: wrote.detail });
+            }
+          }
           if (
             !replay &&
             stored._tag === "Ok" &&
@@ -1595,16 +1825,33 @@ export const layer = Layer.unwrap(
             const typed = stringField(body, "model")?.trim() ?? "";
             const requested =
               typed.length > 0 ? typed : (queued.assignment.advisoryModel?.model ?? undefined);
+            const supplied = yield* suppliedForLaunch(taskMemoryFile(config.stateDir), queued).pipe(
+              Effect.map((value) => ({ _tag: "Ok" as const, value })),
+              Effect.catch((error) =>
+                Effect.succeed({ _tag: "No" as const, detail: error.message }),
+              ),
+            );
+            if (supplied._tag === "No") {
+              return json(409, { _tag: "Rejected", detail: supplied.detail });
+            }
             const opened = yield* reviews.start({
               projectId,
               taskId,
               generation: executionGeneration(queued),
               intake: queued.intake,
-              context: queued.assignment.contextPackage,
+              context: supplied.value.prepared.contextPackage,
+              orientation: supplied.value.lines,
               requestedModel: requested,
             });
             if (opened.status === "unavailable") {
               return json(409, { _tag: "Rejected", detail: opened.detail });
+            }
+            const recorded = yield* commitSuppliedRead(
+              taskMemoryFile(config.stateDir),
+              supplied.value.prepared,
+            );
+            if (recorded._tag === "No") {
+              return json(409, { _tag: "Rejected", detail: recorded.detail });
             }
             const started = yield* applyBoardWorkflowEvent(
               queued,

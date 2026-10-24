@@ -3,10 +3,13 @@ import { Button } from "~/components/ui/button";
 import { Input } from "~/components/ui/input";
 import { useRef, useState } from "react";
 
+import type { AttemptMemoryActivityV1 } from "@t3tools/ai-os-contracts";
+
 import {
   MEMORY_SCOPE_FILTERS,
   MEMORY_STATUS_FILTERS,
   MEMORY_TYPE_FILTERS,
+  attemptActivityFor,
   authorLabel,
   filterRows,
   formatProvenance,
@@ -38,6 +41,7 @@ export function MemoryBrowser({
   projectLabel,
   currentTaskId,
   currentTaskTitle,
+  activity,
   review,
   selectedId,
   notes,
@@ -53,6 +57,7 @@ export function MemoryBrowser({
   projectLabel: string;
   currentTaskId: string | null;
   currentTaskTitle: string | null;
+  activity: readonly AttemptMemoryActivityV1[];
   review: MemoryReviewState;
   selectedId: string | null;
   notes: Readonly<Record<string, string>>;
@@ -78,7 +83,10 @@ export function MemoryBrowser({
     currentTaskId,
   });
   const conflicts = openConflicts(projectId, review);
+  const attempts = attemptActivityFor(activity, projectId, scope === "task" ? currentTaskId : null);
   const selected = rows.find((row) => row.fact.factId === selectedId) ?? null;
+  const selectedAttempt =
+    attempts.find((item) => `attempt:${item.attemptId}` === selectedId) ?? null;
 
   return (
     <>
@@ -210,6 +218,36 @@ export function MemoryBrowser({
                 </ul>
               )}
             </section>
+            <section aria-labelledby="memory-attempts-heading" className="mt-4">
+              <h3 id="memory-attempts-heading" className="text-sm font-semibold">
+                Attempts
+              </h3>
+              {attempts.length === 0 ? (
+                <p className="mt-2 text-sm text-muted-foreground">No attempt receipts.</p>
+              ) : (
+                <ul className="mt-2 flex flex-col gap-2">
+                  {attempts.map((item) => (
+                    <li key={item.attemptId}>
+                      <button
+                        type="button"
+                        aria-pressed={`attempt:${item.attemptId}` === selectedId}
+                        onClick={() => onSelect(`attempt:${item.attemptId}`)}
+                        className="w-full rounded-lg border border-border/80 bg-background/40 px-3 py-2 text-left transition-colors duration-150 hover:bg-accent/40 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring focus-visible:outline-none"
+                      >
+                        <span className="block text-sm">
+                          {item.write === null
+                            ? "Read context"
+                            : "Read context and wrote a proposal"}
+                        </span>
+                        <span className="mt-1 block text-xs text-muted-foreground">
+                          {authorLabel(item.authorId)} · {item.attemptId}
+                        </span>
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </section>
             <section aria-labelledby="memory-results-heading" className="mt-4">
               <h3 id="memory-results-heading" className="text-sm font-semibold">
                 Records
@@ -242,7 +280,9 @@ export function MemoryBrowser({
             </section>
           </div>
           <div className="min-h-0 overflow-auto px-4 py-4">
-            {selected === null ? (
+            {selectedAttempt !== null ? (
+              <AttemptDetail item={selectedAttempt} />
+            ) : selected === null ? (
               <p className="text-sm text-muted-foreground">Select a record to read it.</p>
             ) : (
               <RecordDetail
@@ -258,6 +298,47 @@ export function MemoryBrowser({
         </div>
       </aside>
     </>
+  );
+}
+
+function AttemptDetail({ item }: { item: AttemptMemoryActivityV1 }) {
+  return (
+    <article aria-labelledby="memory-attempt-title" className="flex flex-col gap-4">
+      <div>
+        <h3 id="memory-attempt-title" className="text-base font-semibold">
+          {item.write === null ? "Context supplied" : "Context supplied, proposal recorded"}
+        </h3>
+        <p className="mt-1 text-xs text-muted-foreground">
+          {authorLabel(item.authorId)} · {item.runtime} · {item.attemptId}
+        </p>
+      </div>
+      <section aria-labelledby="attempt-read-heading">
+        <h4 id="attempt-read-heading" className="text-xs font-medium text-muted-foreground">
+          Read receipt
+        </h4>
+        <p className="mt-1 text-sm">
+          {item.read.memoryVersions.length} versions supplied. The receipt records that this context
+          was handed to the attempt.
+        </p>
+        <ul className="mt-2 flex flex-col gap-1 text-sm">
+          {item.read.memoryVersions.map((factId) => (
+            <li key={factId}>{factById(factId)?.body ?? factId}</li>
+          ))}
+        </ul>
+      </section>
+      <section aria-labelledby="attempt-write-heading">
+        <h4 id="attempt-write-heading" className="text-xs font-medium text-muted-foreground">
+          Write receipt
+        </h4>
+        {item.write === null ? (
+          <p className="mt-1 text-sm text-muted-foreground">No write for this attempt.</p>
+        ) : (
+          <p className="mt-1 text-sm">
+            {item.write.outcome}. {item.write.detail}
+          </p>
+        )}
+      </section>
+    </article>
   );
 }
 

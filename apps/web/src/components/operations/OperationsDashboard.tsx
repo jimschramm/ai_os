@@ -24,7 +24,7 @@ import { hasLiveBoard, tasksForBoard } from "./adapterBoard";
 import { KanbanBoard } from "./KanbanBoard";
 import { useAdapterBoard } from "./adapterFeed";
 import type { NeedsYouItem, OperationsAgent, OperationsTask } from "./fixtures";
-import { INITIAL_MEMORY_REVIEW, type MemoryReviewState } from "./memoryModel";
+import { INITIAL_MEMORY_REVIEW, boardAttemptActivity, type MemoryReviewState } from "./memoryModel";
 import {
   activeAgentCount,
   findProject,
@@ -224,6 +224,7 @@ export function OperationsDashboard() {
         projectLabel={memoryProject.label}
         currentTaskId={currentTaskId}
         currentTaskTitle={currentTask?.title ?? null}
+        activity={boardAttemptActivity(cards)}
         review={review}
         selectedId={memoryId}
         notes={memoryNotes}

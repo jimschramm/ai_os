@@ -6,6 +6,7 @@ import {
   openBoardTask,
   SequenceEvent,
   SequenceState,
+  AttemptMemoryActivityV1,
   type KanbanMoveLedger,
 } from "@t3tools/ai-os-contracts";
 import * as Effect from "effect/Effect";
@@ -38,6 +39,7 @@ const WireCards = Schema.Array(
       Schema.withDecodingDefault(Effect.succeed(0)),
     ),
     updatedAt: IsoDateTime,
+    attempts: Schema.optional(Schema.Array(AttemptMemoryActivityV1)),
   }),
 );
 
@@ -60,6 +62,7 @@ export const encodeAdapterBoardWire = (cards: readonly AdapterBoardCard[]): stri
       runId: card.runId ?? null,
       revision: card.revision ?? 0,
       updatedAt: card.updatedAt,
+      ...(card.attempts === undefined ? {} : { attempts: card.attempts }),
     })),
   );
 
@@ -91,8 +94,20 @@ const decodeCards = (text: string): readonly WireCard[] | null => {
 };
 
 /** Strict decode. The loose board decoder does not turn model strings back into model objects. */
-export const decodeAdapterBoardWire = (text: string): readonly AdapterBoardCard[] | null =>
-  decodeCards(text);
+export const decodeAdapterBoardWire = (text: string): readonly AdapterBoardCard[] | null => {
+  const cards = decodeCards(text);
+  if (cards === null) return null;
+  return cards.map((card) => ({
+    taskId: card.taskId,
+    title: card.title,
+    state: card.state,
+    threadId: card.threadId,
+    runId: card.runId,
+    revision: card.revision,
+    updatedAt: card.updatedAt,
+    ...(card.attempts === undefined ? {} : { attempts: card.attempts }),
+  }));
+};
 
 /** In-memory snapshot and server-sent-event fanout. Callers authenticate first. */
 export const makeAdapterBoardHub = (): AdapterBoardHub => {

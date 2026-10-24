@@ -14,7 +14,7 @@ import {
   type Intake,
 } from "@t3tools/ai-os-contracts";
 
-import { renderPrompt as renderTaskPrompt } from "./grokT3.ts";
+import { renderSuppliedPrompt } from "./grokT3.ts";
 import type { WorkerCapability } from "./worker.ts";
 
 /** What the advisory CLI worker implements. It does not resume or heartbeat. */
@@ -732,6 +732,7 @@ export const runAdvisoryReview = async (input: {
   readonly isolationRoot: string;
   readonly context: ContextPackageSnapshotV1;
   readonly intake: Intake;
+  readonly orientation?: readonly string[];
   readonly requestedModel: string | undefined;
   readonly configuredModel: string | undefined;
   readonly timeLimit?: string;
@@ -822,7 +823,7 @@ export const runAdvisoryReview = async (input: {
       `Scratch: ${scratch}`,
       "Return findings in the required schema. Each finding names files, the evidence, and a suggested action.",
       "",
-      renderTaskPrompt(input.intake, input.context),
+      renderSuppliedPrompt(input.intake, input.context, input.orientation ?? []),
     ].join("\n");
     const args = reviewArguments({
       prompt,
