@@ -1,6 +1,8 @@
 // @effect-diagnostics nodeBuiltinImport:off globalTimers:off - This runner spawns the Antigravity CLI and arms a SIGKILL watchdog.
 import { execFile, spawn } from "node:child_process";
-import { chmod, mkdir, readdir, stat, writeFile } from "node:fs/promises";
+import { randomBytes } from "node:crypto";
+import { chmod, lstat, mkdir, readdir, rm, writeFile } from "node:fs/promises";
+import type { Stats } from "node:fs";
 import path from "node:path";
 import type { Readable } from "node:stream";
 
@@ -13,6 +15,18 @@ import {
 } from "@t3tools/ai-os-contracts";
 
 import { renderPrompt as renderTaskPrompt } from "./grokT3.ts";
+import type { WorkerCapability } from "./worker.ts";
+
+/** What the advisory CLI worker actually implements. It does not resume or heartbeat. */
+export const ANTIGRAVITY_CAPABILITIES: ReadonlySet<WorkerCapability> = new Set([
+  "start",
+  "cancel",
+  "report_status",
+  "return_artifacts",
+  "report_usage",
+  "receive_context",
+  "idempotency",
+]);
 
 export interface AntigravityModel {
   readonly slug: string;
@@ -122,45 +136,53 @@ const FINDINGS_SCHEMA = {
 export const isAnthropicModel = (model: AntigravityModel): boolean =>
   ANTHROPIC.test(model.slug) || ANTHROPIC.test(model.label);
 
-/** `agy models` prints `slug<spaces>label`. Anthropic rows are dropped. */
+/**
+ * `agy models` prints one model per line: slug, a tab, then the display name.
+ * Lines that are not that shape are skipped. Anthropic rows are dropped.
+ */
 export const parseModelList = (text: string): readonly AntigravityModel[] => {
   const models: AntigravityModel[] = [];
   for (const line of text.split(/\r?\n/)) {
     const trimmed = line.trim();
     if (trimmed.length === 0 || trimmed.startsWith("#")) continue;
-    const matched = /^([A-Za-z0-9][A-Za-z0-9._-]*)(?:\s+(\S.*))?$/.exec(trimmed);
-    if (matched === null || matched[1] === undefined) continue;
-    const slug = matched[1].toLowerCase();
-    if (parseModelRef(slug) === null) continue;
-    const model = { slug, label: (matched[2] ?? matched[1]).trim() };
+    const tab = trimmed.indexOf("\t");
+    if (tab <= 0) continue;
+    const slug = trimmed.slice(0, tab).trim().toLowerCase();
+    const label = trimmed.slice(tab + 1).trim();
+    if (label.length === 0 || parseModelRef(slug) === null) continue;
+    const model = { slug, label };
     if (!isAnthropicModel(model)) models.push(model);
   }
   return models;
 };
 
-const definedEnv = (env: Readonly<Record<string, string | undefined>>): Record<string, string> => {
-  const next: Record<string, string> = {};
-  for (const [key, value] of Object.entries(env)) {
-    if (value !== undefined) next[key] = value;
+const AGY_ENV_ALLOWLIST = [...KEPT_ENV, "HOME"] as const;
+
+/**
+ * Every `agy` invocation, including `agy models`, gets this allowlist and
+ * nothing else. Tokens and deploy credentials are not copied.
+ */
+export const agyEnvironment = (
+  parent: Readonly<Record<string, string | undefined>>,
+): Record<string, string> => {
+  const env: Record<string, string> = {};
+  for (const key of AGY_ENV_ALLOWLIST) {
+    const value = parent[key];
+    if (value !== undefined && value.length > 0) env[key] = value;
   }
-  return next;
+  return env;
 };
 
 /**
  * The review process gets a fresh HOME so it does not rewrite Jim's CLI
- * settings. Keyring variables stay so an existing Google sign-in can be read.
- * Tokens and deploy credentials are not copied.
+ * settings. Discovery keeps the parent HOME from the same allowlist.
  */
 export const advisoryEnvironment = (
   parent: Readonly<Record<string, string | undefined>>,
   home: string,
   scratch: string,
 ): Record<string, string> => {
-  const env: Record<string, string> = {};
-  for (const key of KEPT_ENV) {
-    const value = parent[key];
-    if (value !== undefined && value.length > 0) env[key] = value;
-  }
+  const env = agyEnvironment(parent);
   env.HOME = home;
   env.TMPDIR = scratch;
   env.GIT_CONFIG_GLOBAL = path.join(home, "gitconfig");
@@ -172,6 +194,12 @@ export const advisoryEnvironment = (
   return env;
 };
 
+/**
+ * Headless `agy -p` arguments.
+ * Flags, including repeatable `--add-dir`: https://antigravity.google/docs/cli/reference/
+ * Print mode: https://antigravity.google/docs/cli/headless/
+ * `agy models` output: https://antigravity.google/docs/models/
+ */
 export const reviewArguments = (input: {
   readonly prompt: string;
   readonly model: string;
@@ -436,14 +464,27 @@ const defaultGit: GitRunner = {
     }),
 };
 
-const makeReadOnly = async (root: string): Promise<void> => {
-  const info = await stat(root);
-  await chmod(root, info.isDirectory() ? 0o555 : 0o444);
+const walkTree = async (
+  root: string,
+  visit: (abs: string, info: Stats) => Promise<void>,
+): Promise<void> => {
+  const info = await lstat(root);
+  if (info.isSymbolicLink()) return;
+  await visit(root, info);
   if (!info.isDirectory()) return;
   for (const entry of await readdir(root, { withFileTypes: true })) {
-    await makeReadOnly(path.join(root, entry.name));
+    if (entry.isSymbolicLink()) continue;
+    await walkTree(path.join(root, entry.name), visit);
   }
 };
+
+const makeReadOnly = (root: string): Promise<void> =>
+  walkTree(root, (abs, info) => chmod(abs, info.isDirectory() ? 0o555 : 0o444));
+
+const restoreWritable = (root: string): Promise<void> =>
+  walkTree(root, (abs, info) => chmod(abs, info.isDirectory() ? 0o755 : 0o644)).catch(
+    () => undefined,
+  );
 
 const gitFailure = (result: GitResult, command: string): string => {
   const detail = (result.stderr || result.stdout).trim();
@@ -488,7 +529,7 @@ export const listAntigravityModels = async (input: {
 }): Promise<AntigravityCatalog> => {
   const spawner = input.spawner ?? nodeCliSpawner;
   const cwd = input.cwd ?? process.cwd();
-  const env = definedEnv(input.env ?? process.env);
+  const env = agyEnvironment(input.env ?? process.env);
   try {
     const spawned = spawner.spawn({
       command: input.command ?? "agy",
@@ -616,135 +657,147 @@ export const runAdvisoryReview = async (input: {
   if (input.signal?.aborted) return stop("canceled", "The review was canceled.", [], choice.slug);
 
   const git = input.git ?? defaultGit;
-  const source = path.join(input.isolationRoot, "source");
-  const scratch = path.join(input.isolationRoot, "scratch");
-  const home = path.join(input.isolationRoot, "home");
-  const verified = await git.run(["rev-parse", "--verify", `${commit}^{commit}`], input.repoRoot);
-  if (verified.code !== 0) return stop("failed", gitFailure(verified, "rev-parse"));
-  await mkdir(input.isolationRoot, { recursive: true });
-  const added = await git.run(["worktree", "add", "--detach", source, commit], input.repoRoot);
-  if (added.code !== 0) return stop("failed", gitFailure(added, "worktree add"));
-  const head = await git.run(["rev-parse", "HEAD"], source);
-  const checkedOut = canonicalGitSha(head.stdout);
-  if (head.code !== 0 || checkedOut !== commit) {
-    return stop(
-      "failed",
-      `The workspace is at ${head.stdout.trim() || "an unknown commit"}, not ${commit}.`,
-    );
-  }
-  await makeReadOnly(source);
-  await mkdir(scratch, { recursive: true, mode: 0o700 });
-  await mkdir(home, { recursive: true, mode: 0o700 });
-  const settings = {
-    toolPermission: "request-review",
-    enableTerminalSandbox: true,
-    allowNonWorkspaceAccess: false,
-    permissions: {
-      allow: [
-        `read_file(${source})`,
-        `write_file(${scratch})`,
-        "command(npm test)",
-        "command(npm run test)",
-        "command(pnpm test)",
-        "command(pnpm run test)",
-        "command(vp test)",
-      ],
-      deny: [`write_file(${source})`, "command(git push)", "command(git merge)"],
-    },
-  };
-  const settingsDir = path.join(home, ".gemini", "antigravity-cli");
-  await mkdir(settingsDir, { recursive: true });
-  await writeFile(path.join(settingsDir, "settings.json"), JSON.stringify(settings, null, 2));
-  await writeFile(path.join(home, "gitconfig"), "");
-  const schemaPath = path.join(home, "findings.schema.json");
-  await writeFile(schemaPath, JSON.stringify(FINDINGS_SCHEMA));
-  const prompt = [
-    "Advisory repository review. Read the source. Do not merge, push, or deploy.",
-    "The source tree is read-only. Put tests only in the scratch directory.",
-    `Scratch: ${scratch}`,
-    "Return findings in the required schema. Each finding names files, the evidence, and a suggested action.",
-    "",
-    renderTaskPrompt(input.intake, input.context),
-  ].join("\n");
-  const args = reviewArguments({
-    prompt,
-    model: choice.slug,
-    scratch,
-    schemaPath,
-    ...(input.timeLimit === undefined ? {} : { timeLimit: input.timeLimit }),
-  });
-  let spawned: SpawnedCli;
+  const attempt = path.join(input.isolationRoot, randomBytes(8).toString("hex"));
+  const source = path.join(attempt, "source");
+  const scratch = path.join(attempt, "scratch");
+  const home = path.join(attempt, "home");
+  let linked = false;
   try {
-    spawned = spawner.spawn({
-      command,
-      args,
-      cwd: source,
-      env: advisoryEnvironment(parent, home, scratch),
-    });
-  } catch (cause) {
-    const detail =
-      cause instanceof Error ? cause.message : "The Antigravity CLI could not be started.";
-    return stop("failed", detail, [], choice.slug);
-  }
-  const collected = await collect(spawned, input.signal);
-  if (input.signal?.aborted) {
-    return stop("canceled", "The review was canceled.", [], choice.slug);
-  }
-  const parsed = parseCliRun(collected.stdout, commit);
-  const requestedModel = choice.slug;
-  const actualModel = parsed.model;
-  const base = {
-    requestedModel,
-    actualModel,
-    unverified: choice.unverified,
-    commit,
-    summary: parsed.structured?.summary ?? "",
-    findings: parsed.structured?.findings ?? [],
-    progressNote: parsed.progressNote,
-    conversationId: parsed.conversationId,
-    inputTokens: parsed.inputTokens,
-    outputTokens: parsed.outputTokens,
-    sourcePath: source,
-    scratchPath: scratch,
-  };
-  if (parsed.status === "CANCELED" || parsed.status === "INTERRUPTED") {
-    return stop(
-      "canceled",
-      parsed.error ?? "The review was canceled.",
-      [],
-      requestedModel,
-      actualModel,
-    );
-  }
-  if (parsed.status === "ERROR" || (parsed.status === null && collected.code !== 0)) {
-    const detail = parsed.error ?? (collected.stderr.trim() || "The Antigravity CLI failed.");
-    const unavailable = /invalid model selection|not recognized as a known model/i.test(detail);
-    return stop(
-      unavailable ? "unavailable" : "failed",
-      detail,
-      catalog.models.map((model) => model.slug),
-      requestedModel,
-      actualModel,
-    );
-  }
-  if (parsed.structured === null) {
-    const excerpt = parsed.response.trim().slice(0, 500);
-    return stop(
-      "failed",
-      excerpt.length > 0
-        ? `The review did not return structured findings. ${excerpt}`
-        : "The review did not return structured findings.",
-      [],
-      requestedModel,
-      actualModel,
-    );
-  }
-  if (actualModel !== null && !sameModelName(actualModel, requestedModel)) {
-    return {
-      ...base,
-      status: "model_mismatch",
-      detail: `Antigravity ran ${actualModel}, not the requested ${requestedModel}. Choose again. Nothing was substituted.`,
+    const verified = await git.run(["rev-parse", "--verify", `${commit}^{commit}`], input.repoRoot);
+    if (verified.code !== 0) return stop("failed", gitFailure(verified, "rev-parse"));
+    await mkdir(attempt, { recursive: true });
+    const added = await git.run(["worktree", "add", "--detach", source, commit], input.repoRoot);
+    if (added.code !== 0) return stop("failed", gitFailure(added, "worktree add"));
+    linked = true;
+    const head = await git.run(["rev-parse", "HEAD"], source);
+    const checkedOut = canonicalGitSha(head.stdout);
+    if (head.code !== 0 || checkedOut !== commit) {
+      return stop(
+        "failed",
+        `The workspace is at ${head.stdout.trim() || "an unknown commit"}, not ${commit}.`,
+      );
+    }
+    await makeReadOnly(source);
+    await mkdir(scratch, { recursive: true, mode: 0o700 });
+    await mkdir(home, { recursive: true, mode: 0o700 });
+    const settings = {
+      toolPermission: "request-review",
+      enableTerminalSandbox: true,
+      allowNonWorkspaceAccess: false,
+      permissions: {
+        allow: [
+          `read_file(${source})`,
+          `write_file(${scratch})`,
+          "command(npm test)",
+          "command(npm run test)",
+          "command(pnpm test)",
+          "command(pnpm run test)",
+          "command(vp test)",
+        ],
+        deny: [`write_file(${source})`, "command(git push)", "command(git merge)"],
+      },
     };
+    const settingsDir = path.join(home, ".gemini", "antigravity-cli");
+    await mkdir(settingsDir, { recursive: true });
+    await writeFile(path.join(settingsDir, "settings.json"), JSON.stringify(settings, null, 2));
+    await writeFile(path.join(home, "gitconfig"), "");
+    const schemaPath = path.join(home, "findings.schema.json");
+    await writeFile(schemaPath, JSON.stringify(FINDINGS_SCHEMA));
+    const prompt = [
+      "Advisory repository review. Read the source. Do not merge, push, or deploy.",
+      "The source tree is read-only. Put tests only in the scratch directory.",
+      `Scratch: ${scratch}`,
+      "Return findings in the required schema. Each finding names files, the evidence, and a suggested action.",
+      "",
+      renderTaskPrompt(input.intake, input.context),
+    ].join("\n");
+    const args = reviewArguments({
+      prompt,
+      model: choice.slug,
+      scratch,
+      schemaPath,
+      ...(input.timeLimit === undefined ? {} : { timeLimit: input.timeLimit }),
+    });
+    let spawned: SpawnedCli;
+    try {
+      spawned = spawner.spawn({
+        command,
+        args,
+        cwd: source,
+        env: advisoryEnvironment(parent, home, scratch),
+      });
+    } catch (cause) {
+      const detail =
+        cause instanceof Error ? cause.message : "The Antigravity CLI could not be started.";
+      return stop("failed", detail, [], choice.slug);
+    }
+    const collected = await collect(spawned, input.signal);
+    if (input.signal?.aborted) {
+      return stop("canceled", "The review was canceled.", [], choice.slug);
+    }
+    const parsed = parseCliRun(collected.stdout, commit);
+    const requestedModel = choice.slug;
+    const actualModel = parsed.model;
+    const base = {
+      requestedModel,
+      actualModel,
+      unverified: choice.unverified,
+      commit,
+      summary: parsed.structured?.summary ?? "",
+      findings: parsed.structured?.findings ?? [],
+      progressNote: parsed.progressNote,
+      conversationId: parsed.conversationId,
+      inputTokens: parsed.inputTokens,
+      outputTokens: parsed.outputTokens,
+      sourcePath: source,
+      scratchPath: scratch,
+    };
+    if (parsed.status === "CANCELED" || parsed.status === "INTERRUPTED") {
+      return stop(
+        "canceled",
+        parsed.error ?? "The review was canceled.",
+        [],
+        requestedModel,
+        actualModel,
+      );
+    }
+    if (parsed.status === "ERROR" || (parsed.status === null && collected.code !== 0)) {
+      const detail = parsed.error ?? (collected.stderr.trim() || "The Antigravity CLI failed.");
+      const unavailable = /invalid model selection|not recognized as a known model/i.test(detail);
+      return stop(
+        unavailable ? "unavailable" : "failed",
+        detail,
+        catalog.models.map((model) => model.slug),
+        requestedModel,
+        actualModel,
+      );
+    }
+    if (parsed.structured === null) {
+      const excerpt = parsed.response.trim().slice(0, 500);
+      return stop(
+        "failed",
+        excerpt.length > 0
+          ? `The review did not return structured findings. ${excerpt}`
+          : "The review did not return structured findings.",
+        [],
+        requestedModel,
+        actualModel,
+      );
+    }
+    if (actualModel !== null && !sameModelName(actualModel, requestedModel)) {
+      return {
+        ...base,
+        status: "model_mismatch",
+        detail: `Antigravity ran ${actualModel}, not the requested ${requestedModel}. Choose again. Nothing was substituted.`,
+      };
+    }
+    return { ...base, status: "completed", detail: null };
+  } finally {
+    if (linked) {
+      await restoreWritable(source);
+      await git.run(["worktree", "remove", "--force", source], input.repoRoot);
+    }
+    await git.run(["worktree", "prune"], input.repoRoot);
+    await rm(attempt, { recursive: true, force: true }).catch(() => undefined);
   }
-  return { ...base, status: "completed", detail: null };
 };

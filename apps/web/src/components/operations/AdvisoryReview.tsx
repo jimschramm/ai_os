@@ -63,16 +63,15 @@ async function readCatalog(): Promise<ModelCatalog> {
 
 export function AdvisoryReviewSection({ task, live }: { task: OperationsTask; live: boolean }) {
   const review = task.advisory ?? null;
+  const taskType =
+    task.assignment?.taskType ?? (task.assignment?.role === "advisory" ? "advisory" : undefined);
   const canChoose =
-    live &&
-    task.assignment?.instanceId === "antigravity" &&
-    task.assignment.role === "advisory" &&
-    (task.phase === "assigned" || task.phase === "rework");
+    live && taskType === "advisory" && (task.phase === "assigned" || task.phase === "rework");
   if (review === null && !canChoose) return null;
   return (
     <section aria-labelledby="advisory-heading">
       <h3 id="advisory-heading" className="text-sm font-semibold">
-        Advisory review
+        {task.phase === "review_delivered" ? "Review delivered" : "Advisory review"}
       </h3>
       <p className="mt-2 text-sm text-muted-foreground">
         Findings from this review do not replace independent QA.

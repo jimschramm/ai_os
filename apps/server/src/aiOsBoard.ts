@@ -22,6 +22,7 @@ import {
 import {
   applyBoardWorkflowEvent,
   commitInterruptedMove,
+  declaredTaskType,
   decodeSequenceEvent,
   decodeSequenceState,
   executionGeneration,
@@ -62,7 +63,12 @@ import {
   HttpServerRespondable,
 } from "effect/http";
 
-import { AntigravityReviews, applyAdvisoryExecution } from "./aiOsAntigravity.ts";
+import {
+  AntigravityReviews,
+  applyAdvisoryExecution,
+  applyAdvisoryStop,
+} from "./aiOsAntigravity.ts";
+import type { AdvisoryExecution } from "@t3tools/ai-os-adapter";
 import * as EnvironmentAuth from "./auth/EnvironmentAuth.ts";
 import {
   failEnvironmentAuthInvalid,
@@ -665,6 +671,78 @@ export const layer = Layer.unwrap(
           runId: view.runId ?? runId,
         };
       });
+    const settleAdvisory = (
+      state: BoardSequence,
+      book: KanbanMoveLedger,
+      execution: AdvisoryExecution,
+      work: { readonly taskId: string; readonly workerId: string },
+    ) => {
+      switch (execution.status) {
+        case "completed":
+        case "model_mismatch":
+          return applyAdvisoryExecution({
+            state,
+            taskId: work.taskId,
+            ledger: book,
+            execution,
+            workerId: work.workerId,
+          });
+        default:
+          return applyAdvisoryStop({
+            state,
+            taskId: work.taskId,
+            ledger: book,
+            execution,
+            workerId: work.workerId,
+          });
+      }
+    };
+    const settleOpenAdvisory = Effect.gen(function* () {
+      for (const card of cardsNow()) {
+        if (card.state.phase !== "executing") continue;
+        if (declaredTaskType(card.state.assignment) !== "advisory") continue;
+        yield* writes.withPermits(1)(
+          Effect.gen(function* () {
+            const fresh = cardsNow().find((item) => item.taskId === card.taskId);
+            if (fresh === undefined || fresh.state.phase !== "executing") return;
+            if (declaredTaskType(fresh.state.assignment) !== "advisory") return;
+            const watched = yield* reviews.watch(fresh.taskId);
+            const decoded = yield* decodeState(fresh.state);
+            if (decoded._tag === "Bad" || decoded.state.phase !== "executing") return;
+            const outcome =
+              watched === null
+                ? yield* applyBoardWorkflowEvent(
+                    decoded.state,
+                    {
+                      type: "lease_expired",
+                      lease: {
+                        taskId: fresh.taskId,
+                        attemptId: decoded.state.assignment.attemptId,
+                        generation: decoded.state.run.generation,
+                        leaseId: decoded.state.run.leaseId,
+                      },
+                    },
+                    `agy-recover-${fresh.taskId}-${decoded.state.run.generation}`,
+                    fresh.taskId,
+                    ledger,
+                  )
+                : watched.status === "running"
+                  ? null
+                  : yield* settleAdvisory(decoded.state, ledger, watched.execution, {
+                      taskId: fresh.taskId,
+                      workerId: decoded.state.assignment.workerId,
+                    });
+            if (outcome === null || outcome._tag !== "Applied" || !outcome.changed) return;
+            yield* persistApplied(outcome, fresh, {
+              taskId: fresh.taskId,
+              title: fresh.title,
+              threadId: fresh.threadId,
+              runId: fresh.runId ?? null,
+            });
+          }),
+        );
+      }
+    });
     const move = Effect.gen(function* () {
       yield* authorize(AuthOrchestrationOperateScope);
       const request = yield* HttpServerRequest.HttpServerRequest;
@@ -698,6 +776,21 @@ export const layer = Layer.unwrap(
           const outcome =
             asked._tag === "NeedsInterrupt"
               ? yield* Effect.gen(function* () {
+                  if (
+                    "assignment" in decoded.state &&
+                    declaredTaskType(decoded.state.assignment) === "advisory"
+                  ) {
+                    const stopped = yield* asRun(reviews.cancel(taskId));
+                    if (stopped._tag === "No") {
+                      return {
+                        _tag: "Rejected" as const,
+                        detail: stopped.detail,
+                        state: decoded.state,
+                        ledger,
+                      };
+                    }
+                    return yield* commitInterruptedMove(decoded.state, requestInput);
+                  }
                   const threadId = card.threadId;
                   const runId = card.runId ?? null;
                   if (threadId === null || runId === null) {
@@ -756,20 +849,13 @@ export const layer = Layer.unwrap(
                         ledger,
                       );
                     }
-                    if (queued.assignment.instanceId === "antigravity") {
-                      if (queued.assignment.role !== "advisory") {
-                        return rejectedMove(
-                          "Only advisory review runs on Antigravity in this phase. The card stays Ready.",
-                          queued,
-                          ledger,
-                        );
-                      }
+                    if (declaredTaskType(queued.assignment) === "advisory") {
                       const typed = stringField(body, "model")?.trim() ?? "";
                       const requested =
                         typed.length > 0
                           ? typed
                           : (queued.assignment.advisoryModel?.model ?? undefined);
-                      const reviewed = yield* reviews.review({
+                      const opened = yield* reviews.start({
                         projectId,
                         taskId,
                         generation: executionGeneration(queued),
@@ -777,16 +863,44 @@ export const layer = Layer.unwrap(
                         context: queued.assignment.contextPackage,
                         requestedModel: requested,
                       });
-                      if (reviewed.status === "completed" || reviewed.status === "model_mismatch") {
-                        return yield* applyAdvisoryExecution({
-                          state: queued,
-                          taskId,
-                          ledger,
-                          execution: reviewed,
-                          workerId: queued.assignment.workerId,
-                        });
+                      if (opened.status === "unavailable") {
+                        return rejectedMove(opened.detail, queued, ledger);
                       }
-                      return rejectedMove(reviewed.detail ?? "The review stopped.", queued, ledger);
+                      const generation = executionGeneration(queued);
+                      const started = yield* applyBoardWorkflowEvent(
+                        queued,
+                        { type: "start_execution" },
+                        `agy-start-${taskId}-${generation}`,
+                        taskId,
+                        ledger,
+                      );
+                      if (started._tag !== "Applied" || started.state.phase !== "executing") {
+                        return started;
+                      }
+                      const watched =
+                        opened.status === "settled"
+                          ? { status: "settled" as const, execution: opened.execution }
+                          : yield* reviews.watch(taskId);
+                      if (watched === null || watched.status === "running") {
+                        launchedRun = opened.runId;
+                        return started;
+                      }
+                      return yield* settleAdvisory(
+                        started.state,
+                        started.ledger,
+                        watched.execution,
+                        {
+                          taskId,
+                          workerId: queued.assignment.workerId,
+                        },
+                      );
+                    }
+                    if (queued.assignment.instanceId === "antigravity") {
+                      return rejectedMove(
+                        "Antigravity does not run implementation tasks. The card stays Ready.",
+                        queued,
+                        ledger,
+                      );
                     }
                     const launched = yield* asRun(
                       runs.launch({
@@ -997,29 +1111,36 @@ export const layer = Layer.unwrap(
             stored._tag === "Ok" &&
             (decoded.event.type === "cancel" || decoded.event.type === "lease_expired")
           ) {
-            if (threadId === null || runId === null) {
-              return json(409, {
-                _tag: "Rejected",
-                detail: "This card has no T3 run to interrupt.",
-              });
-            }
-            const projectId = projectIdOf(stored.state);
-            if (projectId === null) {
-              return json(409, {
-                _tag: "Rejected",
-                detail: "This card has no project, so the run cannot be interrupted.",
-              });
-            }
-            const interrupted = yield* asRun(
-              runs.interrupt({
-                projectId,
-                threadId,
-                runId,
-                commandId: `board-interrupt-${idempotencyKey}`,
-              }),
-            );
-            if (interrupted._tag === "No") {
-              return json(409, { _tag: "Rejected", detail: interrupted.detail });
+            if (
+              "assignment" in stored.state &&
+              declaredTaskType(stored.state.assignment) === "advisory"
+            ) {
+              yield* reviews.cancel(taskId);
+            } else {
+              if (threadId === null || runId === null) {
+                return json(409, {
+                  _tag: "Rejected",
+                  detail: "This card has no T3 run to interrupt.",
+                });
+              }
+              const projectId = projectIdOf(stored.state);
+              if (projectId === null) {
+                return json(409, {
+                  _tag: "Rejected",
+                  detail: "This card has no project, so the run cannot be interrupted.",
+                });
+              }
+              const interrupted = yield* asRun(
+                runs.interrupt({
+                  projectId,
+                  threadId,
+                  runId,
+                  commandId: `board-interrupt-${idempotencyKey}`,
+                }),
+              );
+              if (interrupted._tag === "No") {
+                return json(409, { _tag: "Rejected", detail: interrupted.detail });
+              }
             }
           }
           const outcome =
@@ -1092,6 +1213,7 @@ export const layer = Layer.unwrap(
       }
     });
     const followLoop = followExecuting.pipe(
+      Effect.andThen(settleOpenAdvisory),
       Effect.catch(() => Effect.void),
       Effect.andThen(Effect.sleep(BOARD_FOLLOW_INTERVAL)),
       Effect.forever,
@@ -1114,6 +1236,7 @@ export const layer = Layer.unwrap(
       HttpRouter.add("GET", ADAPTER_ANTIGRAVITY_MODELS_PATH, models),
       Layer.effectDiscard(
         Effect.gen(function* () {
+          yield* settleOpenAdvisory;
           if (!runs.followRuns) return;
           yield* Effect.forkScoped(followLoop);
         }),

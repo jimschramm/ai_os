@@ -1,6 +1,7 @@
 import {
   kanbanColumn,
   RECOVERY_PENDING_LABEL,
+  REVIEW_DELIVERED_LABEL,
   usageTotals,
   type KanbanColumn,
   type UsageMeasurementV1,
@@ -113,6 +114,7 @@ export function tasksInColumn(
 
 export function qaStatusLabel(task: OperationsTask): string {
   if (task.phase === "recovery_pending") return RECOVERY_PENDING_LABEL;
+  if (task.phase === "review_delivered") return REVIEW_DELIVERED_LABEL;
   if (task.qa === null) return "Not in review";
   if (task.qa.availability === "unavailable") return "QA unavailable";
   if (task.qa.verdict === "rework") return "Rework";

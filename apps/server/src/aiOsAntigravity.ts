@@ -1,6 +1,7 @@
 import {
   advisoryUsage,
   listAntigravityModels,
+  resolveModelChoice,
   runAdvisoryReview,
   type AdvisoryExecution,
   type AdvisorySuccess,
@@ -30,16 +31,31 @@ export class AntigravityReviews extends Context.Service<
   AntigravityReviews,
   {
     readonly listModels: () => Effect.Effect<AntigravityCatalog>;
-    readonly review: (input: {
+    readonly start: (input: {
       readonly projectId: string;
       readonly taskId: string;
       readonly generation: number;
       readonly intake: Intake;
       readonly context: ContextPackageSnapshotV1;
       readonly requestedModel: string | undefined;
-    }) => Effect.Effect<AdvisoryExecution>;
+    }) => Effect.Effect<AdvisoryOpen>;
+    readonly watch: (taskId: string) => Effect.Effect<AdvisoryWatch | null>;
+    readonly cancel: (taskId: string) => Effect.Effect<"requested" | "already_stopped">;
   }
 >()("t3/aiOsAntigravity/AntigravityReviews") {}
+
+export type AdvisoryOpen =
+  | {
+      readonly status: "unavailable";
+      readonly detail: string;
+      readonly models: readonly string[];
+    }
+  | { readonly status: "running"; readonly runId: string }
+  | { readonly status: "settled"; readonly runId: string; readonly execution: AdvisoryExecution };
+
+export type AdvisoryWatch =
+  | { readonly status: "running" }
+  | { readonly status: "settled"; readonly execution: AdvisoryExecution };
 
 const configuredModel = () => process.env.AI_OS_ANTIGRAVITY_MODEL;
 
@@ -53,21 +69,6 @@ const evidenceRef = (value: string): string | null =>
 
 const findingFiles = (files: readonly string[]): [string, ...string[]] | null => {
   const [first, ...rest] = files;
-  return first === undefined ? null : [first, ...rest];
-};
-
-const completionEvidence = (
-  items: ReadonlyArray<{
-    readonly kind: "commit" | "readback";
-    readonly ref: string;
-  }>,
-):
-  | readonly [
-      { readonly kind: "commit" | "readback"; readonly ref: string },
-      ...{ readonly kind: "commit" | "readback"; readonly ref: string }[],
-    ]
-  | null => {
-  const [first, ...rest] = items;
   return first === undefined ? null : [first, ...rest];
 };
 
@@ -89,9 +90,11 @@ export const applyAdvisoryExecution = (input: {
   readonly workerId: string;
 }): Effect.Effect<KanbanMoveResult> =>
   Effect.gen(function* () {
-    const queued =
-      input.state.phase === "assigned" || input.state.phase === "rework" ? input.state : null;
-    if (queued === null) {
+    if (
+      input.state.phase !== "assigned" &&
+      input.state.phase !== "rework" &&
+      input.state.phase !== "executing"
+    ) {
       return rejected(
         "In Progress starts from Ready only after a worker is assigned.",
         input.state,
@@ -99,11 +102,14 @@ export const applyAdvisoryExecution = (input: {
       );
     }
     const execution = input.execution;
-    const generation = executionGeneration(queued);
-    const attemptId = queued.assignment.attemptId;
-    const projectId = queued.intake.projectId;
+    const generation =
+      input.state.phase === "executing"
+        ? input.state.run.generation
+        : executionGeneration(input.state);
+    const attemptId = input.state.assignment.attemptId;
+    const projectId = input.state.intake.projectId;
     let current: KanbanMoveResult = yield* applyBoardWorkflowEvent(
-      queued,
+      input.state,
       { type: "start_execution" },
       `agy-start-${input.taskId}-${generation}`,
       input.taskId,
@@ -249,28 +255,69 @@ export const applyAdvisoryExecution = (input: {
         current.ledger,
       );
     }
-    const submittedEvidence = completionEvidence(evidence);
-    if (submittedEvidence === null) {
-      return rejected("The review commit is not valid evidence.", current.state, current.ledger);
-    }
     return yield* applyBoardWorkflowEvent(
       current.state,
       {
-        type: "submit_completion",
-        completion: {
-          version: "v1",
-          taskId: input.taskId,
-          attemptId,
-          generation: run.generation,
-          leaseId: run.leaseId,
-          claimedOutcome: text(execution.summary, "Advisory review finished."),
-          artifactRevision: { type: "git", sha: execution.commit },
-          evidence: submittedEvidence,
-        },
+        type: "deliver_review",
+        generation: run.generation,
+        leaseId: run.leaseId,
       },
       `agy-done-${input.taskId}-${generation}`,
       input.taskId,
       current.ledger,
+    );
+  });
+
+/** Record a stop after the card is already executing. */
+export const applyAdvisoryStop = (input: {
+  readonly state: SequenceState;
+  readonly taskId: string;
+  readonly ledger: KanbanMoveLedger;
+  readonly execution: Exclude<AdvisoryExecution, AdvisorySuccess>;
+  readonly workerId: string;
+}): Effect.Effect<KanbanMoveResult> =>
+  Effect.gen(function* () {
+    if (input.state.phase !== "executing") {
+      return rejected("The review is no longer running.", input.state, input.ledger);
+    }
+    const run = input.state.run;
+    const attemptId = input.state.assignment.attemptId;
+    if (input.execution.status === "canceled") {
+      return yield* applyBoardWorkflowEvent(
+        input.state,
+        {
+          type: "cancel",
+          command: {
+            command: "cancel",
+            taskId: input.taskId,
+            attemptId,
+            idempotencyKey: `agy-cancel-${input.taskId}-${run.generation}`,
+          },
+        },
+        `agy-cancel-${input.taskId}-${run.generation}`,
+        input.taskId,
+        input.ledger,
+      );
+    }
+    return yield* applyBoardWorkflowEvent(
+      input.state,
+      {
+        type: "fail",
+        failure: {
+          taskId: input.taskId,
+          attemptId,
+          generation: run.generation,
+          leaseId: run.leaseId,
+          blocker: {
+            summary: text(input.execution.detail, "The advisory review stopped."),
+            ownerId: input.workerId,
+            nextAction: "Choose a model and start the review again.",
+          },
+        },
+      },
+      `agy-fail-${input.taskId}-${run.generation}`,
+      input.taskId,
+      input.ledger,
     );
   });
 
@@ -288,51 +335,107 @@ export const liveAntigravity = Layer.effect(
     const projects = yield* ProjectStore.ProjectStoreV2;
     const config = yield* ServerConfig.ServerConfig;
     const path = yield* Path.Path;
+    const scope = yield* Effect.scope;
+    const jobs = new Map<
+      string,
+      {
+        readonly abort: AbortController;
+        readonly runId: string;
+        execution: AdvisoryExecution | null;
+      }
+    >();
     const listModels = () =>
       Effect.promise(() => listAntigravityModels({ configuredModel: configuredModel() }));
-    const review: AntigravityReviews["Service"]["review"] = (input) =>
+    const watch: AntigravityReviews["Service"]["watch"] = (taskId) =>
+      Effect.sync(() => {
+        const job = jobs.get(taskId);
+        if (job === undefined) return null;
+        return job.execution === null
+          ? { status: "running" as const }
+          : { status: "settled" as const, execution: job.execution };
+      });
+    const cancel: AntigravityReviews["Service"]["cancel"] = (taskId) =>
+      Effect.sync(() => {
+        const job = jobs.get(taskId);
+        if (job === undefined || job.execution !== null) return "already_stopped" as const;
+        job.abort.abort();
+        return "requested" as const;
+      });
+    const start: AntigravityReviews["Service"]["start"] = (input) =>
       Effect.gen(function* () {
+        const current = jobs.get(input.taskId);
+        if (current !== undefined && current.execution === null) {
+          return { status: "running" as const, runId: current.runId };
+        }
         const workspace = yield* projects.get(ProjectId.make(input.projectId)).pipe(
           Effect.map((row) => (Option.isSome(row) ? row.value.workspaceRoot : null)),
           Effect.orElseSucceed(() => null),
         );
         if (workspace === null) {
-          return stop(
-            "This project has no workspace on this server.",
-            input.requestedModel ?? null,
-          );
+          return {
+            status: "unavailable" as const,
+            detail: "This project has no workspace on this server.",
+            models: [] as readonly string[],
+          };
         }
+        const catalog = yield* Effect.promise(() =>
+          listAntigravityModels({ configuredModel: configuredModel() }),
+        );
+        const choice = resolveModelChoice({
+          discovered: catalog.source === "cli" ? catalog.models : null,
+          requested: input.requestedModel,
+          configured: configuredModel(),
+        });
+        if (!choice.ok) {
+          return { status: "unavailable" as const, detail: choice.detail, models: choice.models };
+        }
+        const runId = `agy-${input.taskId}-${input.generation}`;
+        const job = {
+          abort: new AbortController(),
+          runId,
+          execution: null as AdvisoryExecution | null,
+        };
+        jobs.set(input.taskId, job);
         const isolationRoot = path.join(
           config.stateDir,
           "antigravity",
           input.taskId,
           String(input.generation),
+          runId,
         );
-        return yield* Effect.callback<AdvisoryExecution>((resume, signal) => {
-          void runAdvisoryReview({
-            repoRoot: workspace,
-            isolationRoot,
-            context: input.context,
-            intake: input.intake,
-            requestedModel: input.requestedModel,
-            configuredModel: configuredModel(),
-            signal,
-          }).then(
-            (value) => resume(Effect.succeed(value)),
-            (error: unknown) =>
-              resume(
-                Effect.succeed(
-                  stop(
-                    error instanceof Error
-                      ? error.message
-                      : "The Antigravity CLI could not be started.",
-                    input.requestedModel ?? null,
-                  ),
-                ),
-              ),
-          );
-        });
+        yield* Effect.forkIn(
+          Effect.callback<void>((resume, signal) => {
+            const abort = () => job.abort.abort();
+            signal.addEventListener("abort", abort, { once: true });
+            void runAdvisoryReview({
+              repoRoot: workspace,
+              isolationRoot,
+              context: input.context,
+              intake: input.intake,
+              requestedModel: choice.slug,
+              configuredModel: configuredModel(),
+              signal: job.abort.signal,
+            }).then(
+              (execution) => {
+                job.execution = execution;
+                resume(Effect.void);
+              },
+              (error: unknown) => {
+                job.execution = stop(
+                  error instanceof Error
+                    ? error.message
+                    : "The Antigravity CLI could not be started.",
+                  choice.slug,
+                );
+                resume(Effect.void);
+              },
+            );
+            return Effect.sync(() => signal.removeEventListener("abort", abort));
+          }),
+          scope,
+        );
+        return { status: "running" as const, runId };
       });
-    return { listModels, review };
+    return { listModels, start, watch, cancel };
   }),
 );

@@ -241,12 +241,13 @@ describe("operations kanban moves", () => {
           taskId: "task-agy",
           title: "Advisory page",
           state: {
-            phase: "awaiting_qa",
+            phase: "review_delivered",
             intake: sample.intake,
             assignment: {
               ...sample.assignment,
               instanceId: "antigravity",
               role: "advisory",
+              taskType: "advisory",
             },
             run: {
               usage: [],
@@ -286,6 +287,7 @@ describe("operations kanban moves", () => {
               ...sample.assignment,
               instanceId: "antigravity",
               role: "advisory",
+              taskType: "advisory",
             },
             heldRun: null,
           } as unknown as AdapterBoardCard["state"],
@@ -314,6 +316,7 @@ describe("operations kanban moves", () => {
       open("Advisory page").click();
     });
     const advisory = document.querySelector("#advisory-heading")?.closest("section");
+    expect(advisory?.textContent).toContain("Review delivered");
     expect(advisory?.textContent).toContain("do not replace independent QA");
     expect(advisory?.textContent).toContain("The page lists Saturday only.");
     expect(advisory?.textContent).toContain("CLI did not report");
@@ -325,7 +328,10 @@ describe("operations kanban moves", () => {
     });
     const field = () => document.querySelector("#antigravity-model-task-agy-ready");
     await expect
-      .poll(() => (field() instanceof HTMLInputElement ? field()?.value : ""))
+      .poll(() => {
+        const input = field();
+        return input instanceof HTMLInputElement ? input.value : "";
+      })
       .toBe("gemini-4-argon-high");
     expect(field()?.closest("div")?.textContent).toContain("unverified");
     await act(async () => {

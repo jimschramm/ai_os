@@ -27,19 +27,19 @@ Work can also start from the dashboard. Jim can keep using Codex in the VS Code 
 
 Jim retains product direction and acceptance authority. Standing authorization lets ordinary work proceed.
 
-| Requirement | Rule |
-| --- | --- |
-| Conversation creates work | Confirm only after a durable receipt. |
-| Agentic orchestration | Planning, delegation, dependencies, QA, and rework are part of the run. |
-| Independent verification | Every code change is QA'd by a separate agent on a different model. |
-| Evidence establishes completion | A claim or model agreement is not evidence. |
-| Shared context survives sessions | Context is provider-independent and rebuildable. |
-| One-screen visibility | Projects, Kanban, activity, blockers, results, and usage. |
-| Failures are actionable | A failure names the blocker, the owner, and the next action. |
-| Low maintenance | One operating path for ordinary work. |
-| Extensibility | New agents and providers enter through contracts and registries. |
-| Reproducibility | Each project has a repo and infrastructure-as-code. |
-| Private execution | Local-only stays local across execution, memory, logging, and QA. |
+| Requirement                      | Rule                                                                    |
+| -------------------------------- | ----------------------------------------------------------------------- |
+| Conversation creates work        | Confirm only after a durable receipt.                                   |
+| Agentic orchestration            | Planning, delegation, dependencies, QA, and rework are part of the run. |
+| Independent verification         | Every code change is QA'd by a separate agent on a different model.     |
+| Evidence establishes completion  | A claim or model agreement is not evidence.                             |
+| Shared context survives sessions | Context is provider-independent and rebuildable.                        |
+| One-screen visibility            | Projects, Kanban, activity, blockers, results, and usage.               |
+| Failures are actionable          | A failure names the blocker, the owner, and the next action.            |
+| Low maintenance                  | One operating path for ordinary work.                                   |
+| Extensibility                    | New agents and providers enter through contracts and registries.        |
+| Reproducibility                  | Each project has a repo and infrastructure-as-code.                     |
+| Private execution                | Local-only stays local across execution, memory, logging, and QA.       |
 
 ## Workspace, projects, and ownership
 
@@ -47,32 +47,32 @@ A workspace contains projects. A project contains tasks, knowledge, and artifact
 
 Core preferences are shared only when that sharing is deliberate. Project knowledge, tools, and permissions stay scoped to the project. Logical ownership is not access isolation. Permissions enforce the boundary.
 
-| Owner | Owns |
-| --- | --- |
-| Main Grok Bot | Intake, and progress back to the conversation. |
-| Vault | Drive and OneDrive file custody. |
-| Web | The website. |
-| Marketing | Content. |
-| Codex in VS Code | Interactive engineering. |
-| ai_os maintainer | Platform health and upkeep. |
+| Owner            | Owns                                           |
+| ---------------- | ---------------------------------------------- |
+| Main Grok Bot    | Intake, and progress back to the conversation. |
+| Vault            | Drive and OneDrive file custody.               |
+| Web              | The website.                                   |
+| Marketing        | Content.                                       |
+| Codex in VS Code | Interactive engineering.                       |
+| ai_os maintainer | Platform health and upkeep.                    |
 
 ## Contracts
 
-Every contract has a versioned schema, valid transitions, error behavior, examples, and executable contract tests. The first sequence is request, assignment, execution, independent QA, rework, accepted result.
+Every contract has a versioned schema, valid transitions, error behavior, examples, and executable contract tests. The first sequence is request, assignment, execution, independent QA, rework, accepted result. A task declares its type. An implementation still requires independent QA by a different base model than the model that ran, on the exact submitted revision. An advisory review finishes as Review delivered, with that revision and its findings. It does not enter QA, approve a change, or satisfy mandatory QA. A finding that asks for a change is a new implementation, and that implementation goes through the same QA.
 
 Build order starts here. Stage 1 begins with Intake, Assignment, Completion submission, and QA verdict/rework.
 
-| Contract | Carries |
-| --- | --- |
-| Intake | Request, constraints, acceptance criteria, authorization, durable receipt. |
-| Assignment | Worker, scope, immutable ContextPackage snapshot. |
-| Progress | Status, heartbeat, blockers, partial artifacts. |
-| Completion submission | Claimed outcome, exact artifact revision, evidence. |
-| QA and rework | Verdict, findings, required corrections, accepted revision. |
-| Shared memory | Retrieval, contributions, provenance, acceptance, supersession. |
-| Usage | Provider and model attribution, measurements, estimates, unknowns. |
-| Control and recovery | Cancel, continue, retries, ownership, failure. |
-| Result delivery | Accepted result back to the dashboard and the originating conversation. |
+| Contract              | Carries                                                                    |
+| --------------------- | -------------------------------------------------------------------------- |
+| Intake                | Request, constraints, acceptance criteria, authorization, durable receipt. |
+| Assignment            | Worker, scope, immutable ContextPackage snapshot.                          |
+| Progress              | Status, heartbeat, blockers, partial artifacts.                            |
+| Completion submission | Claimed outcome, exact artifact revision, evidence.                        |
+| QA and rework         | Verdict, findings, required corrections, accepted revision.                |
+| Shared memory         | Retrieval, contributions, provenance, acceptance, supersession.            |
+| Usage                 | Provider and model attribution, measurements, estimates, unknowns.         |
+| Control and recovery  | Cancel, continue, retries, ownership, failure.                             |
+| Result delivery       | Accepted result back to the dashboard and the originating conversation.    |
 
 The work record is Task, Attempt, and Handoff, with leases and generation fencing, stored as nodes and relationships in TAM. A T3 thread is one Attempt. The thread's diff and log are Artifacts.
 
@@ -90,7 +90,7 @@ Workers run in isolated workspaces and worktrees. Agent-to-agent exchanges are t
 
 Code, including infrastructure-as-code, adapters, and ai_os itself, follows implement, verify, correct, reverify, accept.
 
-QA runs on a different model. It receives the requirements and the actual artifacts, and it runs the checks. A finding is a defect, the evidence, and the expected behavior. Acceptance binds to the exact final revision. A later change reruns the affected checks. Unavailable QA is a visible wait. There is no bypass.
+QA runs on a different base model from the model that actually ran. It receives the requirements and the actual artifacts, and it runs the checks. A finding is a defect, the evidence, and the expected behavior. Acceptance binds to the exact final revision. A later change reruns the affected checks. Unavailable QA is a visible wait. There is no bypass. Which adapter ran the task does not decide whether QA is required.
 
 Evidence is diffs, commits, tests, browser checks, previews, deployment identities, and readbacks. A completion claim does not establish that the work happened. Agreement between models is not sufficient. Non-code deliverables get the verification that fits them.
 
@@ -118,12 +118,12 @@ TAM stores the graph now. A dedicated store such as Postgres remains a later can
 
 ## Storage
 
-| Store | Authority |
-| --- | --- |
-| Google Drive (~5 TB) | Primary file store. Authoritative for USBA knowledge files, references, media, handoffs, and deliverables. A reference is a file ID plus a version. |
-| TAM | Accepted relationships, provenance, status, versions, and coordination. |
-| GitHub | Code and pull requests. |
-| Local private storage | Restricted content. |
+| Store                 | Authority                                                                                                                                           |
+| --------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Google Drive (~5 TB)  | Primary file store. Authoritative for USBA knowledge files, references, media, handoffs, and deliverables. A reference is a file ID plus a version. |
+| TAM                   | Accepted relationships, provenance, status, versions, and coordination.                                                                             |
+| GitHub                | Code and pull requests.                                                                                                                             |
+| Local private storage | Restricted content.                                                                                                                                 |
 
 A project folder uses `PROJECT.md`, `INSTRUCTIONS.md`, `DECISIONS.md`, `CURRENT_STATE.md`, `KNOWLEDGE.md`, `Sources/`, `Handoffs/`, and `Artifacts/`.
 
@@ -133,18 +133,19 @@ No vector store is an authority.
 
 ## Agents, providers, and integrations
 
-| Kind | Examples | Role |
-| --- | --- | --- |
-| Intake | Grok Bot | Only conversational intake. Records the task and returns progress. |
-| Interactive worker | Codex in VS Code | Update-only. Jim drives it, and it reports status and artifacts. |
-| Controlled worker | Independent Codex via T3 | Fully controlled. T3 starts, cancels, resumes, and reads it. |
-| Optional worker | Hermes | Not installed. The console does not depend on it. |
-| Custom worker | OpenAI, xAI, Anthropic, DeepSeek, local Ollama | Provider registry: model, auth reference, limits. |
-| Integrations | GitHub, Drive, OneDrive, email, calendar, AWS, media | Connections with explicit capabilities. |
+| Kind               | Examples                                             | Role                                                                                                                                                                  |
+| ------------------ | ---------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Intake             | Grok Bot                                             | Only conversational intake. Records the task and returns progress.                                                                                                    |
+| Interactive worker | Codex in VS Code                                     | Update-only. Jim drives it, and it reports status and artifacts.                                                                                                      |
+| Controlled worker  | Independent Codex via T3                             | Fully controlled. T3 starts, cancels, resumes, and reads it.                                                                                                          |
+| Advisory worker    | Antigravity CLI (`agy`)                              | Advisory review only. It starts, cancels, returns findings, and reports token usage. It does not resume or heartbeat. A restart leaves the run in `recovery_pending`. |
+| Optional worker    | Hermes                                               | Not installed. The console does not depend on it.                                                                                                                     |
+| Custom worker      | OpenAI, xAI, Anthropic, DeepSeek, local Ollama       | Provider registry: model, auth reference, limits.                                                                                                                     |
+| Integrations       | GitHub, Drive, OneDrive, email, calendar, AWS, media | Connections with explicit capabilities.                                                                                                                               |
 
 Other Grok bots are external update-only workers, the same class as the VS Code Codex sidebar.
 
-An adapter declares the capabilities it implements: start, retrieve assignments, report status, cancel, resume, return artifacts, report usage, receive context, heartbeat, and idempotency. The console calls only capabilities the adapter declares.
+An adapter declares the capabilities it implements: start, retrieve assignments, report status, cancel, resume, return artifacts, report usage, receive context, heartbeat, and idempotency. The console calls only capabilities the adapter declares. Antigravity declares start, cancel, report status, return artifacts, report usage, receive context, and idempotency.
 
 Three paths have to be verified before a worker is trusted: Grok intake and automatic return, Codex interactive versus the independent T3 worker, and subscription versus API auth and billing.
 
@@ -205,16 +206,16 @@ A maintainer agent handles platform health, with independent QA and an external 
 
 ## Build sequence
 
-| Stage | Delivers |
-| --- | --- |
-| 1. Contracts and design | Versioned schemas, transitions, errors, examples, and contract tests. Begins with Intake, Assignment, Completion submission, and QA verdict/rework. |
-| 2. Foundation | Infrastructure-as-code, persistence, projects, Drive references, the TAM graph, Kanban, activity, and usage. |
-| 3. Complete workflow | One Grok request through execution, different-model QA, rework, and delivery. |
-| 4. Continuity and recovery | Leases, fencing, `recovery_pending`, and resume by a fresh agent. |
-| 5. Engineering expansion | VS Code Codex, more workers, GitHub, and the AWS lifecycle. |
-| 6. Private execution | Local companion, Ollama, a sandbox, and local memory and QA. |
-| 7. Creative and automation | The creative pipeline, the workflow library, and automation cards. |
-| 8. Product operation | Maintainer agent, backups, diagnostics, and docs. |
+| Stage                      | Delivers                                                                                                                                            |
+| -------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1. Contracts and design    | Versioned schemas, transitions, errors, examples, and contract tests. Begins with Intake, Assignment, Completion submission, and QA verdict/rework. |
+| 2. Foundation              | Infrastructure-as-code, persistence, projects, Drive references, the TAM graph, Kanban, activity, and usage.                                        |
+| 3. Complete workflow       | One Grok request through execution, different-model QA, rework, and delivery.                                                                       |
+| 4. Continuity and recovery | Leases, fencing, `recovery_pending`, and resume by a fresh agent.                                                                                   |
+| 5. Engineering expansion   | VS Code Codex, more workers, GitHub, and the AWS lifecycle.                                                                                         |
+| 6. Private execution       | Local companion, Ollama, a sandbox, and local memory and QA.                                                                                        |
+| 7. Creative and automation | The creative pipeline, the workflow library, and automation cards.                                                                                  |
+| 8. Product operation       | Maintainer agent, backups, diagnostics, and docs.                                                                                                   |
 
 The first acceptance demo is a disposable project. One Grok request completes with independent QA, returns evidence to the conversation and the dashboard, and a fresh agent continues without a rebriefing.
 

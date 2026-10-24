@@ -1,6 +1,7 @@
 // @effect-diagnostics nodeBuiltinImport:off
 import { execFile } from "node:child_process";
-import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { lstatSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { mkdtemp, mkdir, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -19,7 +20,6 @@ import {
   type CliSpawner,
   type SpawnedCli,
 } from "./antigravity.ts";
-import { defaultRoleModelsAreIndependent } from "./workerRoles.ts";
 
 const lines = (text: string): AsyncIterable<string> => ({
   async *[Symbol.asyncIterator]() {
@@ -72,9 +72,7 @@ const withRepo = async <T>(
   }
 };
 
-const catalog = `gemini-4-argon-high  Gemini 4 Argon High
-claude-opus-4  Claude Opus
-`;
+const catalog = "gemini-4-argon-high\tGemini 4 Argon (High)\nclaude-opus-4-6\tClaude Opus 4.6\n";
 
 const successResult = (model: string) =>
   [
@@ -106,6 +104,9 @@ const parentEnv = {
   GH_TOKEN: "gh-secret",
   GITHUB_TOKEN: "github-secret",
   AWS_SECRET_ACCESS_KEY: "aws-secret",
+  AWS_ACCESS_KEY_ID: "aws-id",
+  GEMINI_API_KEY: "gem-secret",
+  ANTHROPIC_API_KEY: "anthropic-secret",
   SSH_AUTH_SOCK: "/tmp/ssh-agent",
   HOME: "/home/jim",
 };
@@ -113,6 +114,7 @@ const parentEnv = {
 describe("antigravity model rules", () => {
   it("drops Anthropic rows and refuses to substitute a missing model", () => {
     const models = parseModelList(catalog);
+    expect(models).toEqual([{ slug: "gemini-4-argon-high", label: "Gemini 4 Argon (High)" }]);
     expect(models.map((model) => model.slug)).toEqual(["gemini-4-argon-high"]);
     const missing = resolveModelChoice({
       discovered: models,
@@ -150,8 +152,24 @@ describe("antigravity model rules", () => {
     expect(empty.detail).toContain("AI_OS_ANTIGRAVITY_MODEL");
   });
 
-  it("keeps Sol and Astra on different base models", () => {
-    expect(defaultRoleModelsAreIndependent()).toBe(true);
+  it("skips lines that are not a tab-separated slug and name", () => {
+    const parsed = parseModelList(
+      [
+        "gemini-4-argon-high\tGemini 4 Argon (High)",
+        "claude-sonnet-4-6\tClaude Sonnet 4.6",
+        "not a model row",
+        "\tmissing slug",
+        "bad slug!!!\tNope",
+        "gemini-4-argon-low\t",
+        "gemini-4-argon-medium\tGemini 4 Argon (Medium)",
+      ].join("\n"),
+    );
+    expect(parsed).toEqual([
+      { slug: "gemini-4-argon-high", label: "Gemini 4 Argon (High)" },
+      { slug: "gemini-4-argon-medium", label: "Gemini 4 Argon (Medium)" },
+    ]);
+    expect(parseModelList("")).toEqual([]);
+    expect(parseModelList("usage: agy models\n")).toEqual([]);
   });
 
   it("records token counts and leaves subscription quota unknown", () => {
@@ -209,10 +227,30 @@ describe("antigravity advisory review", () => {
         readonly env: Record<string, string>;
         readonly cwd: string;
       }> = [];
+      let sourceMode = 0;
+      let fileMode = 0;
+      let deny: string[] = [];
       const spawner: CliSpawner = {
         spawn: (input) => {
           calls.push({ args: input.args, env: { ...input.env }, cwd: input.cwd });
           if (input.args[0] === "models") return finished(catalog);
+          sourceMode = statSync(input.cwd).mode & 0o777;
+          fileMode = statSync(path.join(input.cwd, "README.md")).mode & 0o777;
+          writeFileSync(path.join(path.dirname(input.cwd), "scratch", "note.txt"), "ok");
+          deny = (
+            JSON.parse(
+              readFileSync(
+                path.join(
+                  path.dirname(input.cwd),
+                  "home",
+                  ".gemini",
+                  "antigravity-cli",
+                  "settings.json",
+                ),
+                "utf8",
+              ),
+            ) as { permissions: { deny: string[] } }
+          ).permissions.deny;
           return finished(successResult("gemini-4-argon-high"));
         },
       };
@@ -239,13 +277,17 @@ describe("antigravity advisory review", () => {
       expect(result.inputTokens).toBe(12);
       const review = calls.find((call) => call.args.includes("-p"));
       expect(review).toBeDefined();
+      const discovery = calls.find((call) => call.args[0] === "models");
+      expect(Object.keys(discovery?.env ?? {}).sort()).toEqual(["HOME", "PATH"]);
+      expect(discovery?.env.GH_TOKEN).toBeUndefined();
+      expect(discovery?.env.GEMINI_API_KEY).toBeUndefined();
       expect(review?.args).toEqual(
         expect.arrayContaining([
           "--model",
           "gemini-4-argon-high",
           "--sandbox",
           "--add-dir",
-          path.join(isolation, "scratch"),
+          path.join(path.dirname(review?.cwd ?? ""), "scratch"),
           "--output-format",
           "stream-json",
           "--print-timeout",
@@ -253,32 +295,90 @@ describe("antigravity advisory review", () => {
         ]),
       );
       expect(review?.args).not.toContain("--dangerously-skip-permissions");
-      expect(review?.cwd).toBe(path.join(isolation, "source"));
+      expect(review?.cwd.startsWith(isolation)).toBe(true);
       expect(review?.env.GH_TOKEN).toBeUndefined();
       expect(review?.env.GITHUB_TOKEN).toBeUndefined();
       expect(review?.env.AWS_SECRET_ACCESS_KEY).toBeUndefined();
+      expect(review?.env.GEMINI_API_KEY).toBeUndefined();
+      expect(review?.env.ANTHROPIC_API_KEY).toBeUndefined();
       expect(review?.env.SSH_AUTH_SOCK).toBeUndefined();
-      expect(review?.env.HOME).toBe(path.join(isolation, "home"));
-      const head = (await git(["rev-parse", "HEAD"], path.join(isolation, "source"))).trim();
-      expect(head).toBe(sha);
-      const sourceMode = (await stat(path.join(isolation, "source"))).mode & 0o777;
-      const fileMode = (await stat(path.join(isolation, "source", "README.md"))).mode & 0o777;
+      expect(review?.env.HOME).toBe(path.join(path.dirname(review?.cwd ?? ""), "home"));
       expect(sourceMode & 0o222).toBe(0);
       expect(fileMode & 0o222).toBe(0);
-      await writeFile(path.join(isolation, "scratch", "note.txt"), "ok");
-      const settings = JSON.parse(
-        await readFile(
-          path.join(isolation, "home", ".gemini", "antigravity-cli", "settings.json"),
-          "utf8",
-        ),
-      ) as { permissions: { deny: string[] } };
-      expect(settings.permissions.deny).toEqual(
+      expect(deny).toEqual(
         expect.arrayContaining([
-          `write_file(${path.join(isolation, "source")})`,
+          `write_file(${review?.cwd})`,
           "command(git push)",
           "command(git merge)",
         ]),
       );
+      await expect(stat(review?.cwd ?? "")).rejects.toThrow();
+      const listed = await git(["worktree", "list", "--porcelain"], repo);
+      expect(listed).not.toContain(review?.cwd ?? "missing");
+    });
+  });
+
+  it("does not follow a symlink out of the worktree", async () => {
+    await withRepo(async ({ repo, sha }) => {
+      const outside = path.join(path.dirname(repo), "outside.txt");
+      await writeFile(outside, "secret\n", { mode: 0o644 });
+      await symlink(outside, path.join(repo, "linked.txt"));
+      await git(["add", "linked.txt"], repo);
+      await git(["commit", "-m", "link"], repo);
+      const linked = (await git(["rev-parse", "HEAD"], repo)).trim();
+      expect(linked).not.toBe(sha);
+      let linkIsSymlink = false;
+      const spawner: CliSpawner = {
+        spawn: (input) => {
+          if (input.args[0] === "models") return finished(catalog);
+          linkIsSymlink = lstatSync(path.join(input.cwd, "linked.txt")).isSymbolicLink();
+          return finished(successResult("gemini-4-argon-high"));
+        },
+      };
+      const result = await runAdvisoryReview({
+        repoRoot: repo,
+        isolationRoot: path.join(path.dirname(repo), "isolation"),
+        context: { ...assignmentExample.contextPackage, repoCommit: linked },
+        intake: intakeV2Example,
+        requestedModel: "gemini-4-argon-high",
+        configuredModel: undefined,
+        spawner,
+        env: parentEnv,
+      });
+      expect(result.status).toBe("completed");
+      expect(linkIsSymlink).toBe(true);
+      expect((await stat(outside)).mode & 0o222).not.toBe(0);
+    });
+  });
+
+  it("removes the worktree so a failed review can be retried", async () => {
+    await withRepo(async ({ repo, sha }) => {
+      let reviews = 0;
+      const spawner: CliSpawner = {
+        spawn: (input) => {
+          if (input.args[0] === "models") return finished(catalog);
+          reviews += 1;
+          return reviews === 1 ? finished("", 1) : finished(successResult("gemini-4-argon-high"));
+        },
+      };
+      const isolation = path.join(path.dirname(repo), "isolation");
+      const input = {
+        repoRoot: repo,
+        isolationRoot: isolation,
+        context: { ...assignmentExample.contextPackage, repoCommit: sha },
+        intake: intakeV2Example,
+        requestedModel: "gemini-4-argon-high" as const,
+        configuredModel: undefined,
+        spawner,
+        env: parentEnv,
+      };
+      const first = await runAdvisoryReview(input);
+      expect(first.status).toBe("failed");
+      expect(await git(["worktree", "list", "--porcelain"], repo)).not.toContain(isolation);
+      const second = await runAdvisoryReview(input);
+      expect(second.status).toBe("completed");
+      expect(await git(["worktree", "list", "--porcelain"], repo)).not.toContain(isolation);
+      expect(await readdir(isolation).catch(() => [])).toEqual([]);
     });
   });
 
@@ -353,7 +453,7 @@ describe("antigravity advisory review", () => {
       const spawner: CliSpawner = {
         spawn: (input) =>
           input.args[0] === "models"
-            ? finished(`${catalog}gemini-3.1-pro-high  Gemini 3.1 Pro High\n`)
+            ? finished(`${catalog}gemini-3.1-pro-high\tGemini 3.1 Pro High\n`)
             : finished(successResult("gemini-3.1-pro-high")),
       };
       const result = await runAdvisoryReview({
@@ -475,6 +575,33 @@ describe("antigravity advisory review", () => {
 });
 
 describe("antigravity listing", () => {
+  it("gives model discovery only the allowlisted environment", async () => {
+    const seen: Array<Record<string, string>> = [];
+    const catalogResult = await listAntigravityModels({
+      env: parentEnv,
+      spawner: {
+        spawn: (input) => {
+          seen.push({ ...input.env });
+          return finished("usage: agy models\nnot a model row\n");
+        },
+      },
+    });
+    expect(seen).toHaveLength(1);
+    expect(Object.keys(seen[0] ?? {}).sort()).toEqual(["HOME", "PATH"]);
+    expect(seen[0]?.GH_TOKEN).toBeUndefined();
+    expect(seen[0]?.GITHUB_TOKEN).toBeUndefined();
+    expect(seen[0]?.AWS_ACCESS_KEY_ID).toBeUndefined();
+    expect(seen[0]?.AWS_SECRET_ACCESS_KEY).toBeUndefined();
+    expect(seen[0]?.GEMINI_API_KEY).toBeUndefined();
+    expect(seen[0]?.ANTHROPIC_API_KEY).toBeUndefined();
+    expect(seen[0]?.SSH_AUTH_SOCK).toBeUndefined();
+    expect(catalogResult).toEqual({
+      source: "cli",
+      models: [],
+      detail: "The CLI listed no usable models after Anthropic models were excluded.",
+    });
+  });
+
   it("keeps a configured slug unverified when agy models exits", async () => {
     const catalogResult = await listAntigravityModels({
       configuredModel: "gemini-4-argon-high",

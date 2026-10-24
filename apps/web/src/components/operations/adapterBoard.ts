@@ -33,6 +33,7 @@ const runOf = (state: SequenceState) => {
     case "rework":
     case "accepted":
     case "recovery_pending":
+    case "review_delivered":
     case "failed":
       return state.run;
     case "assigned":
@@ -93,7 +94,9 @@ const taskFromAdapterCard = (card: AdapterBoardCard): OperationsTask | null => {
     completion,
     qa: qaOf(state),
     advisory: run?.advisory ?? null,
-    revision: completion?.artifactRevision ?? null,
+    revision:
+      completion?.artifactRevision ??
+      (run?.advisory === undefined ? null : { type: "git", sha: run.advisory.commit }),
     facts: [],
     candidates: [],
     usage: run?.usage ?? [],

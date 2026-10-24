@@ -265,10 +265,13 @@ it.effect("keeps advisory findings off the QA count", () =>
           receivedAt: at,
         },
       },
-      { type: "assign", assignment: assignmentExample },
+      {
+        type: "assign",
+        assignment: { ...assignmentExample, taskType: "advisory" as const },
+      },
       { type: "start_execution" },
       { type: "record_advisory", review },
-      { type: "submit_completion", completion: completionExample },
+      { type: "deliver_review", generation: 1, leaseId: leaseIdFor(1) },
     ]);
     const shown = tasksForBoard("usba", [
       {
@@ -280,6 +283,7 @@ it.effect("keeps advisory findings off the QA count", () =>
       },
     ]);
     const task = shown[0];
+    assert.strictEqual(task?.phase, "review_delivered");
     assert.strictEqual(task?.qa, null);
     assert.strictEqual(task?.advisory?.findings.length, 1);
     assert.strictEqual(task?.advisory?.model.actual, null);

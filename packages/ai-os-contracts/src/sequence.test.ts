@@ -162,6 +162,153 @@ it.effect("records an advisory review without creating a QA verdict", () =>
   }),
 );
 
+it.effect("delivers an advisory review without entering QA", () =>
+  Effect.gen(function* () {
+    const advisory = {
+      ...assignmentExample,
+      taskType: "advisory" as const,
+    };
+    const executing = yield* applySequence([
+      happyPathEvents[0]!,
+      happyPathEvents[1]!,
+      { type: "assign", assignment: advisory },
+      { type: "start_execution" },
+    ]);
+    const review = {
+      version: "v1" as const,
+      taskId: assignmentExample.taskId,
+      attemptId: assignmentExample.attemptId,
+      generation: 1,
+      leaseId: leaseIdFor(1),
+      mode: "advisory" as const,
+      commit: exampleRepoCommit,
+      model: {
+        requested: "gemini-4-argon-high",
+        actual: "gemini-4-argon-high",
+        unverified: false,
+      },
+      findings: [
+        {
+          commit: exampleRepoCommit,
+          files: ["src/page.tsx"],
+          evidence: "The page lists Saturday only.",
+          suggestedAction: "Add Sunday to the schedule.",
+        },
+      ],
+      artifacts: [],
+      evidence: [{ kind: "commit" as const, ref: exampleRepoCommit }],
+      sourcePath: "/tmp/source",
+      scratchPath: "/tmp/scratch",
+    };
+    const recorded = yield* applySequenceEvent(executing, { type: "record_advisory", review });
+    const refused = yield* failure(recorded, {
+      type: "submit_completion",
+      completion: completionExample,
+    });
+    assert.strictEqual(refused.reason, "illegal_transition");
+    const delivered = yield* applySequenceEvent(recorded, {
+      type: "deliver_review",
+      generation: 1,
+      leaseId: leaseIdFor(1),
+    });
+    assert.strictEqual(delivered.phase, "review_delivered");
+    if (delivered.phase !== "review_delivered") return;
+    assert.strictEqual(delivered.reviewLabel, "Review delivered");
+    assert.strictEqual(kanbanColumn(delivered.phase), "Done");
+    assert.strictEqual(acceptedRevision(delivered), null);
+    assert.strictEqual(delivered.run.advisory?.commit, exampleRepoCommit);
+    assert.strictEqual(delivered.run.advisory?.findings.length, 1);
+    const approved = yield* failure(delivered, { type: "qa", qa: qaAcceptExample });
+    assert.strictEqual(approved.reason, "illegal_transition");
+
+    const implementation = yield* applySequence([
+      happyPathEvents[0]!,
+      happyPathEvents[1]!,
+      {
+        type: "assign",
+        assignment: { ...assignmentExample, taskType: "implementation" as const },
+      },
+      { type: "start_execution" },
+      { type: "submit_completion", completion: completionExample },
+    ]);
+    assert.strictEqual(implementation.phase, "awaiting_qa");
+  }),
+);
+
+it.effect("compares QA with the model that ran, not only the assigned model", () =>
+  Effect.gen(function* () {
+    const executing = yield* applySequence([
+      happyPathEvents[0]!,
+      happyPathEvents[1]!,
+      {
+        type: "assign",
+        assignment: { ...assignmentExample, implementerModel: "gpt-6-sol" },
+      },
+      { type: "start_execution" },
+      {
+        type: "report_usage",
+        generation: 1,
+        leaseId: leaseIdFor(1),
+        measurement: {
+          kind: "reported_tokens" as const,
+          inputTokens: 4,
+          outputTokens: 2,
+          attribution: {
+            projectId: "usba",
+            taskId: assignmentExample.taskId,
+            attemptId: assignmentExample.attemptId,
+            agentId: "codex-t3",
+            platform: "t3" as const,
+            provider: "openai",
+            model: "gpt-6-astra-high",
+          },
+        },
+      },
+      { type: "submit_completion", completion: completionExample },
+    ]);
+    if (executing.phase !== "awaiting_qa") return yield* Effect.die("Completion must wait for QA.");
+    assert.deepStrictEqual(executing.run.executedModel, { model: "gpt-6-astra-high" });
+    const sameBase = yield* failure(executing, {
+      type: "qa",
+      qa: {
+        ...qaReworkExample,
+        qaModel: "gpt-6-astra",
+        implementerModel: "gpt-6-sol",
+      },
+    });
+    assert.strictEqual(sameBase.reason, "qa_same_model");
+    const namedAssignment = yield* failure(executing, {
+      type: "qa",
+      qa: {
+        ...qaReworkExample,
+        qaModel: "gemini-4-argon-high",
+        implementerModel: "gpt-6-sol",
+      },
+    });
+    assert.strictEqual(namedAssignment.reason, "implementer_mismatch");
+    const reviewed = yield* applySequenceEvent(executing, {
+      type: "qa",
+      qa: {
+        ...qaReworkExample,
+        qaModel: "gemini-4-argon-high",
+        implementerModel: "gpt-6-astra-high",
+      },
+    });
+    assert.strictEqual(reviewed.phase, "rework");
+    const wrongRevision = yield* failure(executing, {
+      type: "qa",
+      qa: {
+        ...qaAcceptExample,
+        qaModel: "gemini-4-argon-high",
+        implementerModel: "gpt-6-astra-high",
+        artifactRevision: { type: "git", sha: "b".repeat(40) },
+        acceptedRevision: { type: "git", sha: "b".repeat(40) },
+      },
+    });
+    assert.strictEqual(wrongRevision.reason, "acceptance_revision_mismatch");
+  }),
+);
+
 it.effect("treats Argon efforts as one base and keeps Sol and Astra distinct", () =>
   Effect.gen(function* () {
     const argon = yield* applySequence([

@@ -2,7 +2,7 @@ import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 
 import { AdvisoryReviewV1 } from "./advisory.ts";
-import { AssignmentV1, freezeSnapshot } from "./assignment.ts";
+import { AssignmentV1, declaredTaskType, freezeSnapshot } from "./assignment.ts";
 import { CompletionSubmissionV1 } from "./completion.ts";
 import {
   AppliedCommandV1,
@@ -24,7 +24,7 @@ import {
   IsoDateTime,
   NonNegativeInt,
   PositiveInt,
-  type ModelRef,
+  ModelRef,
   canonicalGitSha,
   sameBaseModel,
   sameModelName,
@@ -37,6 +37,7 @@ import {
   ContractName,
   ContractTransitionError,
   RECOVERY_PENDING_LABEL,
+  REVIEW_DELIVERED_LABEL,
   SequencePhase,
   type ContractErrorReason,
 } from "./errors.ts";
@@ -86,6 +87,11 @@ export const SequenceEvent = Schema.Union([
     measurement: UsageMeasurementV1,
   }),
   Schema.Struct({ type: Schema.Literal("record_advisory"), review: AdvisoryReviewV1 }),
+  Schema.Struct({
+    type: Schema.Literal("deliver_review"),
+    generation: PositiveInt,
+    leaseId: ContractId,
+  }),
   Schema.Struct({ type: Schema.Literal("cancel"), command: CancelCommandV1 }),
   Schema.Struct({ type: Schema.Literal("continue"), command: ContinueCommandV1 }),
   Schema.Struct({ type: Schema.Literal("retry"), command: RetryCommandV1 }),
@@ -135,16 +141,21 @@ const payloadMatches = (
     : "The payload attempt must match the assignment.";
 };
 
-const independentQa = (
+const modelThatRan = (
   assignment: AssignmentV1,
+  run: { readonly executedModel?: ModelRef | undefined },
+): ModelRef | string => run.executedModel ?? assignment.implementerModel;
+
+const independentQa = (
+  ran: ModelRef | string,
   qa: { readonly qaModel: ModelRef | string; readonly implementerModel: ModelRef | string },
 ): true | string => {
-  if (sameBaseModel(qa.qaModel, assignment.implementerModel)) {
-    return "QA must use a different base model than the implementer.";
+  if (sameBaseModel(qa.qaModel, ran)) {
+    return "QA must use a different base model than the model that ran.";
   }
-  return sameModelName(qa.implementerModel, assignment.implementerModel)
+  return sameModelName(qa.implementerModel, ran)
     ? true
-    : "The QA payload names a different implementer than the assignment.";
+    : "The QA payload names a different implementer than the model that ran.";
 };
 
 const workerRecordMatchesRun = (
@@ -197,6 +208,8 @@ export const RunV1 = Schema.Struct({
   usage: Schema.Array(UsageMeasurementV1),
   // Absent on runs recorded before advisory review existed.
   advisory: Schema.optionalKey(AdvisoryReviewV1),
+  // Set from usage when the worker reports the model that ran. QA uses it.
+  executedModel: Schema.optionalKey(ModelRef),
 }).check(
   Schema.makeFilter((run) => {
     if (run.retryCount > run.retryLimit) {
@@ -315,7 +328,7 @@ export const ReworkState = Schema.Struct({
     if (qaMatch !== true) {
       return qaMatch;
     }
-    const models = independentQa(state.assignment, state.qa);
+    const models = independentQa(modelThatRan(state.assignment, state.run), state.qa);
     if (models !== true) {
       return models;
     }
@@ -348,7 +361,7 @@ export const AcceptedState = Schema.Struct({
     if (qaMatch !== true) {
       return qaMatch;
     }
-    const models = independentQa(state.assignment, state.qa);
+    const models = independentQa(modelThatRan(state.assignment, state.run), state.qa);
     if (models !== true) {
       return models;
     }
@@ -360,6 +373,33 @@ export const AcceptedState = Schema.Struct({
   }),
 );
 export type AcceptedState = typeof AcceptedState.Type;
+
+export const ReviewDeliveredState = Schema.Struct({
+  phase: Schema.Literal("review_delivered"),
+  intake: Intake,
+  acknowledgment: IntakeAcknowledgmentV1,
+  assignment: AssignmentV1,
+  reviewLabel: Schema.Literal(REVIEW_DELIVERED_LABEL),
+  run: RunV1,
+  commands: Schema.Array(AppliedCommandV1),
+}).check(
+  Schema.makeFilter((state) => {
+    const link = assignedTo(state.acknowledgment, state.assignment);
+    if (link !== true) return link;
+    if (declaredTaskType(state.assignment) !== "advisory") {
+      return "Only an advisory task finishes as a delivered review.";
+    }
+    if (state.run.advisory === undefined) {
+      return "A delivered review keeps its findings on the run.";
+    }
+    const reviewed = canonicalGitSha(state.run.advisory.commit);
+    const assigned = canonicalGitSha(state.assignment.contextPackage.repoCommit);
+    return reviewed !== null && reviewed === assigned
+      ? true
+      : "The delivered review is bound to the assigned revision.";
+  }),
+);
+export type ReviewDeliveredState = typeof ReviewDeliveredState.Type;
 
 export const RecoveryPendingState = Schema.Struct({
   phase: Schema.Literal("recovery_pending"),
@@ -406,6 +446,7 @@ export const SequenceState = Schema.Union([
   AwaitingQaState,
   ReworkState,
   AcceptedState,
+  ReviewDeliveredState,
   RecoveryPendingState,
   FailedState,
   CancelledState,
@@ -425,6 +466,7 @@ export const LEGAL_EVENTS = {
     "heartbeat_lapsed",
     "report_usage",
     "record_advisory",
+    "deliver_review",
     "cancel",
     "fail",
     "operator_fail",
@@ -433,6 +475,7 @@ export const LEGAL_EVENTS = {
   awaiting_qa: ["qa", "cancel"],
   rework: ["start_execution", "cancel"],
   accepted: ["start_execution", "deliver"],
+  review_delivered: [],
   recovery_pending: ["resolve_recovery"],
   failed: ["retry"],
   cancelled: ["continue"],
@@ -459,6 +502,7 @@ export const kanbanColumn = (phase: SequencePhase): KanbanColumn | null => {
     case "awaiting_qa":
       return "Review";
     case "accepted":
+    case "review_delivered":
       return "Done";
   }
 };
@@ -484,6 +528,7 @@ const contractFor = (event: SequenceEvent): ContractName => {
     case "report_usage":
       return "usage";
     case "record_advisory":
+    case "deliver_review":
       return "sequence";
     case "cancel":
     case "continue":
@@ -657,6 +702,14 @@ const applyCompletion = (
         `Cannot submit_completion from ${state.phase}.`,
       );
     }
+    if (declaredTaskType(state.assignment) === "advisory") {
+      return yield* reject(
+        state,
+        event,
+        "illegal_transition",
+        "An advisory review does not enter QA. It is delivered with the revision it reviewed.",
+      );
+    }
     if (state.acknowledgment.taskId !== event.completion.taskId) {
       return yield* reject(
         state,
@@ -744,20 +797,14 @@ const applyQa = (
         commands: state.commands,
       };
     }
-    if (sameBaseModel(qa.qaModel, state.assignment.implementerModel)) {
+    const ran = modelThatRan(state.assignment, state.run);
+    const independence = independentQa(ran, qa);
+    if (independence !== true) {
       return yield* reject(
         state,
         event,
-        "qa_same_model",
-        "QA must use a different base model than the implementer.",
-      );
-    }
-    if (!sameModelName(qa.implementerModel, state.assignment.implementerModel)) {
-      return yield* reject(
-        state,
-        event,
-        "implementer_mismatch",
-        "The QA payload names a different implementer than the assignment.",
+        sameBaseModel(qa.qaModel, ran) ? "qa_same_model" : "implementer_mismatch",
+        independence,
       );
     }
     if (!sameRevision(qa.artifactRevision, state.completion.artifactRevision)) {
@@ -986,7 +1033,11 @@ const applyUsage = (
     yield* requireLease(state, event, event);
     return {
       ...state,
-      run: { ...state.run, usage: [...state.run.usage, event.measurement] },
+      run: {
+        ...state.run,
+        usage: [...state.run.usage, event.measurement],
+        executedModel: event.measurement.attribution.model,
+      },
     };
   });
 
@@ -1019,6 +1070,57 @@ const applyAdvisory = (
     return {
       ...state,
       run: { ...state.run, advisory: event.review },
+    };
+  });
+
+const applyDeliverReview = (
+  state: SequenceState,
+  event: Extract<SequenceEvent, { type: "deliver_review" }>,
+): Effect.Effect<SequenceState, ContractTransitionError> =>
+  Effect.gen(function* () {
+    if (state.phase !== "executing") {
+      return yield* reject(
+        state,
+        event,
+        "illegal_transition",
+        `Cannot deliver_review from ${state.phase}.`,
+      );
+    }
+    if (declaredTaskType(state.assignment) !== "advisory") {
+      return yield* reject(
+        state,
+        event,
+        "illegal_transition",
+        "Only an advisory task is delivered as a review. An implementation submits a completion for QA.",
+      );
+    }
+    yield* requireLease(state, event, event);
+    if (state.run.advisory === undefined) {
+      return yield* reject(
+        state,
+        event,
+        "invalid_payload",
+        "A review is delivered only after its findings are recorded.",
+      );
+    }
+    const reviewed = canonicalGitSha(state.run.advisory.commit);
+    const assigned = canonicalGitSha(state.assignment.contextPackage.repoCommit);
+    if (reviewed === null || reviewed !== assigned) {
+      return yield* reject(
+        state,
+        event,
+        "revision_mismatch",
+        "The delivered review is bound to the assigned revision.",
+      );
+    }
+    return {
+      phase: "review_delivered" as const,
+      intake: state.intake,
+      acknowledgment: state.acknowledgment,
+      assignment: state.assignment,
+      reviewLabel: REVIEW_DELIVERED_LABEL,
+      run: state.run,
+      commands: state.commands,
     };
   });
 
@@ -1374,6 +1476,8 @@ const transition = (
         return yield* applyUsage(state, event);
       case "record_advisory":
         return yield* applyAdvisory(state, event);
+      case "deliver_review":
+        return yield* applyDeliverReview(state, event);
       case "cancel":
         return yield* applyCancel(state, event);
       case "continue":
@@ -1402,6 +1506,7 @@ const PHASES = [
   "awaiting_qa",
   "rework",
   "accepted",
+  "review_delivered",
   "recovery_pending",
   "failed",
   "cancelled",
@@ -1447,6 +1552,7 @@ const contractNameOf = (value: unknown): ContractName => {
     case "report_usage":
       return "usage";
     case "record_advisory":
+    case "deliver_review":
       return "sequence";
     case "cancel":
     case "continue":

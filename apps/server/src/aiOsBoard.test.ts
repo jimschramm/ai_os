@@ -45,7 +45,9 @@ const activeLaunch = (): AiOsBoard.BoardLaunchResult => ({
 
 const idleReviews: AiOsAntigravity.AntigravityReviews["Service"] = {
   listModels: () => Effect.succeed({ source: "unverified", models: [], detail: null }),
-  review: () => Effect.die("Antigravity review was not expected."),
+  start: () => Effect.die("Antigravity review was not expected."),
+  watch: () => Effect.succeed(null),
+  cancel: () => Effect.succeed("already_stopped"),
 };
 
 const allowRuns: AiOsBoard.BoardRuns["Service"] = {
@@ -900,30 +902,34 @@ describe("ai-os board route", () => {
       },
       {
         ...idleReviews,
-        review: () => {
+        start: () => {
           reviewed += 1;
           return Effect.succeed({
-            status: "completed",
-            requestedModel: "gemini-4-argon-high",
-            actualModel: "gemini-4-argon-high",
-            unverified: false,
-            commit: exampleRepoCommit,
-            summary: "The schedule page is missing Sunday.",
-            findings: [
-              {
-                commit: exampleRepoCommit,
-                files: ["src/page.tsx"],
-                evidence: "The page lists Saturday only.",
-                suggestedAction: "Add Sunday to the schedule.",
-              },
-            ],
-            progressNote: "Read src/page.tsx.",
-            conversationId: "conv1",
-            inputTokens: 12,
-            outputTokens: 4,
-            sourcePath: "/tmp/source",
-            scratchPath: "/tmp/scratch",
-            detail: null,
+            status: "settled" as const,
+            runId: "agy-run-1",
+            execution: {
+              status: "completed",
+              requestedModel: "gemini-4-argon-high",
+              actualModel: "gemini-4-argon-high",
+              unverified: false,
+              commit: exampleRepoCommit,
+              summary: "The schedule page is missing Sunday.",
+              findings: [
+                {
+                  commit: exampleRepoCommit,
+                  files: ["src/page.tsx"],
+                  evidence: "The page lists Saturday only.",
+                  suggestedAction: "Add Sunday to the schedule.",
+                },
+              ],
+              progressNote: "Read src/page.tsx.",
+              conversationId: "conv1",
+              inputTokens: 12,
+              outputTokens: 4,
+              sourcePath: "/tmp/source",
+              scratchPath: "/tmp/scratch",
+              detail: null,
+            },
           });
         },
       },
@@ -965,6 +971,7 @@ describe("ai-os board route", () => {
               assignmentId: "assignment-agy",
               instanceId: "antigravity",
               role: "advisory",
+              taskType: "advisory",
             },
           },
         })
@@ -978,10 +985,11 @@ describe("ai-os board route", () => {
     });
     expect(moved.status).toBe(200);
     const card = (await readCards(handler)).find((item) => item.taskId === "task-agy");
-    expect(card?.state.phase).toBe("awaiting_qa");
+    expect(card?.state.phase).toBe("review_delivered");
     expect(card?.threadId).toBeNull();
-    if (card?.state.phase !== "awaiting_qa") return;
-    expect(card.state.qa).toBeNull();
+    if (card?.state.phase !== "review_delivered") return;
+    expect(card.state.reviewLabel).toBe("Review delivered");
+    expect("qa" in card.state).toBe(false);
     expect(card.state.run.advisory?.findings).toHaveLength(1);
     expect(card.state.run.advisory?.model.unverified).toBe(false);
     const requested = card.state.run.advisory?.model.requested;
@@ -997,14 +1005,12 @@ describe("ai-os board route", () => {
   it("keeps the card Ready when the Antigravity model is unavailable", async () => {
     const { handler } = handlerFor(undefined, allowRuns, {
       ...idleReviews,
-      review: () =>
+      start: () =>
         Effect.succeed({
-          status: "unavailable",
+          status: "unavailable" as const,
           detail:
             "gemini-missing is not available from the CLI. Choose one of: gemini-4-argon-high",
           models: ["gemini-4-argon-high"],
-          requestedModel: "gemini-missing",
-          actualModel: null,
         }),
     });
     expect(
@@ -1044,6 +1050,7 @@ describe("ai-os board route", () => {
               assignmentId: "assignment-agy",
               instanceId: "antigravity",
               role: "advisory",
+              taskType: "advisory",
             },
           },
         })
@@ -1078,7 +1085,7 @@ describe("ai-os board route", () => {
       },
       {
         ...idleReviews,
-        review: () => {
+        start: () => {
           reviewed += 1;
           return Effect.die("review");
         },
@@ -1121,6 +1128,7 @@ describe("ai-os board route", () => {
               assignmentId: "assignment-agy",
               instanceId: "antigravity",
               role: "implementer",
+              taskType: "implementation",
             },
           },
         })
@@ -1282,5 +1290,144 @@ describe("ai-os board route", () => {
     expect(again.status).toBe(200);
     expect(await again.json()).toMatchObject({ changed: false });
     expect(continued).toEqual(["continue-task-demo-2"]);
+  });
+
+  it("cancels a running advisory review through the board", async () => {
+    let canceled = 0;
+    const { handler } = handlerFor(undefined, allowRuns, {
+      ...idleReviews,
+      start: () => Effect.succeed({ status: "running" as const, runId: "agy-run-1" }),
+      cancel: () => {
+        canceled += 1;
+        return Effect.succeed("requested" as const);
+      },
+    });
+    expect(
+      (
+        await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
+          taskId: "task-agy",
+          title: "Advisory review",
+          idempotencyKey: "intake-agy",
+          event: {
+            type: "intake",
+            intake: { ...intakeV2Example, projectId: "usba", workspaceId: "usba" },
+          },
+        })
+      ).status,
+    ).toBe(200);
+    expect(
+      (
+        await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
+          taskId: "task-agy",
+          column: "Ready",
+          idempotencyKey: "ready-agy",
+        })
+      ).status,
+    ).toBe(200);
+    expect(
+      (
+        await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
+          taskId: "task-agy",
+          title: "Advisory review",
+          idempotencyKey: "assign-agy",
+          event: {
+            type: "assign",
+            assignment: {
+              ...assignmentExample,
+              taskId: "task-agy",
+              attemptId: "attempt-agy",
+              assignmentId: "assignment-agy",
+              instanceId: "antigravity",
+              taskType: "advisory",
+            },
+          },
+        })
+      ).status,
+    ).toBe(200);
+    const running = await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
+      taskId: "task-agy",
+      column: "Running",
+      idempotencyKey: "run-agy",
+      model: "gemini-4-argon-high",
+    });
+    expect(running.status).toBe(200);
+    const card = (await readCards(handler)).find((item) => item.taskId === "task-agy");
+    expect(card?.state.phase).toBe("executing");
+    const stopped = await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
+      taskId: "task-agy",
+      column: "Ready",
+      idempotencyKey: "cancel-agy",
+      confirmed: true,
+    });
+    expect(stopped.status).toBe(200);
+    expect(canceled).toBe(1);
+    const after = (await readCards(handler)).find((item) => item.taskId === "task-agy");
+    expect(after?.state.phase).toBe("assigned");
+  });
+
+  it("leaves an advisory run in recovery_pending when the process restarts", async () => {
+    const first = handlerFor(undefined, allowRuns, {
+      ...idleReviews,
+      start: () => Effect.succeed({ status: "running" as const, runId: "agy-run-1" }),
+    });
+    expect(
+      (
+        await postJson(first.handler, ADAPTER_BOARD_EVENT_PATH, {
+          taskId: "task-agy",
+          title: "Advisory review",
+          idempotencyKey: "intake-agy",
+          event: {
+            type: "intake",
+            intake: { ...intakeV2Example, projectId: "usba", workspaceId: "usba" },
+          },
+        })
+      ).status,
+    ).toBe(200);
+    expect(
+      (
+        await postJson(first.handler, ADAPTER_BOARD_MOVE_PATH, {
+          taskId: "task-agy",
+          column: "Ready",
+          idempotencyKey: "ready-agy",
+        })
+      ).status,
+    ).toBe(200);
+    expect(
+      (
+        await postJson(first.handler, ADAPTER_BOARD_EVENT_PATH, {
+          taskId: "task-agy",
+          title: "Advisory review",
+          idempotencyKey: "assign-agy",
+          event: {
+            type: "assign",
+            assignment: {
+              ...assignmentExample,
+              taskId: "task-agy",
+              attemptId: "attempt-agy",
+              assignmentId: "assignment-agy",
+              taskType: "advisory",
+            },
+          },
+        })
+      ).status,
+    ).toBe(200);
+    expect(
+      (
+        await postJson(first.handler, ADAPTER_BOARD_MOVE_PATH, {
+          taskId: "task-agy",
+          column: "Running",
+          idempotencyKey: "run-agy",
+          model: "gemini-4-argon-high",
+        })
+      ).status,
+    ).toBe(200);
+    const running = (await readCards(first.handler)).find((item) => item.taskId === "task-agy");
+    expect(running?.state.phase).toBe("executing");
+    const second = handlerFor(first.stateDir);
+    const recovered = (await readCards(second.handler)).find((item) => item.taskId === "task-agy");
+    expect(recovered?.state.phase).toBe("recovery_pending");
+    expect(recovered?.state.phase === "recovery_pending" ? recovered.state.recoveryLabel : "").toBe(
+      "Execution status unknown",
+    );
   });
 });
