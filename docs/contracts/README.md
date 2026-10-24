@@ -10,23 +10,25 @@ The package is `@t3tools/ai-os-contracts` (`packages/ai-os-contracts`). Schemas 
 
 Request, assignment, execution, independent QA, rework, accepted result. Progress, usage, control, and delivery extend that sequence. Shared memory is a separate graph.
 
-| Phase            | Kanban  | Legal events                                                                                                                                  |
-| ---------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| idle             |         | intake                                                                                                                                        |
-| requested        |         | acknowledge                                                                                                                                   |
-| acknowledged     | Ready   | assign                                                                                                                                        |
-| assigned         | Ready   | start_execution, cancel, transfer_ownership                                                                                                   |
-| executing        | Running | submit_completion, lease_expired, report_progress, heartbeat, heartbeat_lapsed, report_usage, cancel, fail, operator_fail, transfer_ownership |
-| awaiting_qa      | Review  | qa, cancel                                                                                                                                    |
-| rework           | Ready   | start_execution, cancel                                                                                                                       |
-| accepted         | Done    | start_execution, deliver                                                                                                                      |
-| recovery_pending | Blocked | resolve_recovery                                                                                                                              |
-| failed           |         | retry                                                                                                                                         |
-| cancelled        |         | continue                                                                                                                                      |
+| Phase            | Kanban  | Legal events                                                                                                                                                         |
+| ---------------- | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| idle             |         | intake                                                                                                                                                               |
+| requested        |         | acknowledge                                                                                                                                                          |
+| acknowledged     | Ready   | assign                                                                                                                                                               |
+| assigned         | Ready   | start_execution, cancel, transfer_ownership                                                                                                                          |
+| executing        | Running | submit_completion, lease_expired, report_progress, heartbeat, heartbeat_lapsed, report_usage, record_runtime_models, cancel, fail, operator_fail, transfer_ownership |
+| awaiting_qa      | Review  | qa, cancel, record_runtime_models                                                                                                                                    |
+| qa_incomplete    | Review  | qa, cancel, record_runtime_models                                                                                                                                    |
+| rework           | Ready   | start_execution, cancel                                                                                                                                              |
+| accepted         | Done    | start_execution, deliver                                                                                                                                             |
+| review_delivered | Done    |                                                                                                                                                                      |
+| recovery_pending | Blocked | resolve_recovery                                                                                                                                                     |
+| failed           |         | retry                                                                                                                                                                |
+| cancelled        |         | continue                                                                                                                                                             |
 
 `requested` is the durable receipt of the intake. It is not confirmed, and it is not on the board yet. Acknowledge is the confirmation, and it carries the task link. A later `start_execution` from `accepted` drops the previous acceptance, so a new revision has to be submitted and reviewed again. `failed` and `cancelled` are off the board.
 
-`SequenceState` is a discriminated union on `phase`. A phase only decodes with the records that phase requires. `accepted` requires the assignment, the completion, an available accept verdict, and the delivery acks. `awaiting_qa` can carry only an unavailable verdict. `recovery_pending` requires the label `Execution status unknown`. A payload that is only `{ phase: "accepted" }` does not decode.
+`SequenceState` is a discriminated union on `phase`. A phase only decodes with the records that phase requires. `accepted` requires the assignment, the completion, an available accept verdict, and the delivery acks. `awaiting_qa` can carry only an unavailable verdict. `qa_incomplete` keeps the submitted findings and the label `Awaiting a verified reviewer` until a verified reviewer submits. `review_delivered` is an advisory finish. It has no QA verdict. `recovery_pending` requires the label `Execution status unknown`. A payload that is only `{ phase: "accepted" }` does not decode.
 
 An open attempt has a generation and a lease id minted for that generation (`lease-1` for generation 1). A new start, a retry, and an ownership transfer while executing each move to the next generation and lease, and clear the lease expiry and partial progress. Worker events — progress, heartbeat, heartbeat lapse, usage, completion, lease expiry, and `fail` — carry that generation and lease id. A write that names any other pair is `stale_generation` and leaves the run where it is. Stored progress and stored completion have to name that same generation and lease. A state that forges a different pair does not decode. QA also checks that the completion belongs to the current run. `operator_fail` is not a worker event. It is a control command with an actor and an idempotency key.
 
@@ -42,19 +44,21 @@ An open attempt has a generation and a lease id minted for that generation (`lea
 
 ## Completion submission
 
-`CompletionSubmissionV1` carries the open generation, the open lease id, the claimed outcome, the exact `artifactRevision`, and at least one evidence item (`diff`, `commit`, `test`, `browser`, `preview`, `deployment`, or `readback`). An artifact revision is a git object id, a Drive file id plus version, or a named page, preview, deployment, or document id. A git object id is exactly 40 hex characters (SHA-1) or 64 (SHA-256), stored lowercase. Abbreviated ids are rejected. Drive file ids stay case-sensitive. Submitting a completion moves `executing` to `awaiting_qa`. It does not accept the work. Repeating the revision that QA sent back for rework, including the same full git id in a different case, is `revision_mismatch`. A completion has a claimed outcome. It does not carry an idempotency key.
+`CompletionSubmissionV1` carries the open generation, the open lease id, the claimed outcome, the exact `artifactRevision`, and at least one evidence item (`diff`, `commit`, `test`, `browser`, `preview`, `deployment`, or `readback`). An artifact revision is a git object id, a Drive file id plus version, or a named page, preview, deployment, or document id. A git object id is exactly 40 hex characters (SHA-1) or 64 (SHA-256), stored lowercase. Abbreviated ids are rejected. Drive file ids stay case-sensitive. Submitting a completion moves `executing` to `awaiting_qa` only after the implementer's actual model is recorded. An unknown actual is `qa_model_unknown` and the card stays `executing`. It does not accept the work. Repeating the revision that QA sent back for rework, including the same full git id in a different case, is `revision_mismatch`. A completion has a claimed outcome. It does not carry an idempotency key.
 
 ## QA verdict and rework
 
 `QaVerdictV1` is one of:
 
-| Variant                     | Result                                                                                                                                 |
-| --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
-| `availability: unavailable` | Stays `awaiting_qa`. No verdict and no acceptance.                                                                                     |
-| `verdict: rework`           | Moves to `rework`. Findings are required. The reviewed revision is recorded.                                                           |
-| `verdict: accept`           | Moves to `accepted`. `acceptedRevision` must equal `artifactRevision`, and that revision must be the one in the completion submission. |
+| Variant                     | Result                                                                                                                                                                          |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `availability: unavailable` | Stays `awaiting_qa`. No verdict and no acceptance.                                                                                                                              |
+| `verdict: rework`           | Moves to `rework` when both actuals are known, different, and match the run records. Findings are required. An unknown actual stays `qa_incomplete` with those findings.        |
+| `verdict: accept`           | Moves to `accepted` on that same check. `acceptedRevision` must equal `artifactRevision`, and that revision must be the submitted one. An unknown actual stays `qa_incomplete`. |
 
-QA's model name must differ from the assignment's implementer model name. A model is `{ provider?, model }`. Provider is attribution (`openai/gpt-5.4` and `azure/gpt-5.4` are the same model, and so is a bare `gpt-5.4`). The schema check and the transition both compare those canonical model names. The transition rejects a QA model name equal to the assigned implementer (`qa_same_model`) and a payload that names some other implementer model (`implementer_mismatch`). Acceptance compares canonical revisions, so a full git id matches regardless of case. An unavailable verdict cannot also carry an acceptance. There is no event that skips QA.
+A formal verdict, rework or accept, compares the implementer's actual base model with the reviewer's actual base model. Both come from runtime metadata, not from the assignment, not from a usage measurement, and not from the names on the verdict. The qa event names the submitting session's thread or run. The server records the reviewer from that session's provider metadata, then checks the verdict against the run records. The thread has to belong to this task, and it cannot be the implementer's own thread. If either actual is unknown, the verdict is not applied. The phase becomes `qa_incomplete`, the findings stay attached, and the card waits for a verified reviewer. A later verified session can replace that unknown reviewer. The earlier findings stay on the run as `priorReviews` and do not count as independent QA. A verified reviewer already recorded is not replaced. Nothing is substituted. A model is `{ provider?, model }`. Provider is attribution (`openai/gpt-5.4` and `azure/gpt-5.4` are the same model, and so is a bare `gpt-5.4`). The schema check compares the two model names on the verdict. The transition compares the runtime actuals. It rejects the same base (`qa_same_model`) and a payload that names a different model than the runtime (`implementer_mismatch`) for both verdicts. Acceptance compares canonical revisions, so a full git id matches regardless of case. An unavailable verdict cannot also carry an acceptance. There is no event that skips QA. Advisory findings can flag defects and recommend changes. They are not independent QA.
+
+The comparison runs for both verdicts. A stored `rework` or `accepted` card is checked again when both `implementerRuntime` and `reviewerRuntime` are present. A card saved before those fields existed still decodes. A stored accepted card whose runtime actuals share a base does not.
 
 ## Progress
 
@@ -76,16 +80,16 @@ Node kinds and relationship types are the ones in [the memory schema](../memory-
 
 Control commands carry an idempotency key. That key is not a completion claim. The key is bound to a canonical fingerprint of the whole command payload. The same key and the same payload replay the current state. The same key and any other payload, including a different owner or blocker, is `idempotency_conflict`.
 
-| Command              | From                                     | Result                                                                              |
-| -------------------- | ---------------------------------------- | ----------------------------------------------------------------------------------- |
-| `cancel`             | assigned, executing, awaiting_qa, rework | `cancelled`. Off the board.                                                         |
-| `continue`           | cancelled                                | `assigned` (Ready). This is the only way back from cancelled.                       |
-| `operator_fail`      | executing                                | `failed`, with an actor and a blocker. Off the board. Not fenced by the lease.      |
-| `retry`              | failed                                   | `executing` at the next generation, until `retryCount` reaches `retryLimit` (3).    |
-| `transfer_ownership` | assigned, executing                      | The worker changes. An executing transfer also advances the generation.             |
-| `resolve_recovery`   | recovery_pending                         | `continue` returns to Ready, `cancel` leaves the board, `fail` records the blocker. |
+| Command              | From                                                    | Result                                                                                                                                                                             |
+| -------------------- | ------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `cancel`             | assigned, executing, awaiting_qa, qa_incomplete, rework | `cancelled`. Off the board.                                                                                                                                                        |
+| `continue`           | cancelled                                               | `assigned` (Ready). This is the only way back from cancelled.                                                                                                                      |
+| `operator_fail`      | executing                                               | `failed`, with an actor and a blocker. Off the board. Not fenced by the lease.                                                                                                     |
+| `retry`              | failed                                                  | `executing` at the next generation, until `retryCount` reaches `retryLimit` (3).                                                                                                   |
+| `transfer_ownership` | assigned, executing                                     | The worker changes. An executing transfer also advances the generation.                                                                                                            |
+| `resolve_recovery`   | recovery_pending                                        | `continue` returns to Ready, `cancel` leaves the board, `fail` records the blocker. An advisory continue supplies `nextAttemptId`. A non-advisory continue keeps the open attempt. |
 
-`recovery_pending` accepts no other event. An expired lease or a lapsed heartbeat does not become Ready on its own. A retry past the limit is `retry_limit_reached` and stays `failed`.
+`recovery_pending` accepts no other event. An expired lease, a lapsed heartbeat, or a lost advisory process does not become Ready on its own. Advisory work still uses a process and a worktree, so a retry waits until that process is confirmed stopped, removes the worktree, and starts a new attempt. A late result from the old attempt is `attempt_mismatch`. A retry past the limit is `retry_limit_reached` and stays `failed`.
 
 ## Result delivery
 
@@ -93,27 +97,28 @@ Control commands carry an idempotency key. That key is not a completion claim. T
 
 ## Errors
 
-Invalid payloads fail schema decode. These transition errors are `ContractTransitionError`:
+Invalid payloads fail schema decode. A failed transition is `ContractTransitionError`. An unknown actual model is the exception: the verdict is not applied, and the card becomes `qa_incomplete` with its findings kept.
 
-| Reason                                | When                                                                                                               |
-| ------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
-| `confirmation_before_durable_receipt` | Acknowledge before the intake is recorded.                                                                         |
-| `illegal_transition`                  | The event is not legal for the phase.                                                                              |
-| `task_mismatch`                       | The payload task or usage project is not the acknowledged work.                                                    |
-| `attempt_mismatch`                    | The payload attempt is not the open assignment.                                                                    |
-| `implementer_mismatch`                | QA names a different implementer than the assignment.                                                              |
-| `qa_same_model`                       | QA uses the implementer's model.                                                                                   |
-| `revision_mismatch`                   | Rework submits the same artifact revision again.                                                                   |
-| `acceptance_revision_mismatch`        | QA or acceptance names a revision other than the submitted one, or the revision already sent back for rework.      |
-| `recovery_pending_not_ready`          | Any event other than `resolve_recovery` while recovery is pending.                                                 |
-| `invalid_payload`                     | The state, event, or result does not match its schema.                                                             |
-| `stale_generation`                    | A worker event names a generation or lease other than the open run.                                                |
-| `retry_limit_reached`                 | Retry was asked at the retry limit.                                                                                |
-| `idempotency_conflict`                | The idempotency key was already used for a different payload.                                                      |
-| `delivery_revision_mismatch`          | Delivery names a revision other than the accepted one.                                                             |
-| `delivery_origin_mismatch`            | A conversation delivery does not name the intake's originating conversation.                                       |
-| `memory_not_eligible`                 | The event is not acceptance of a proposed fact, or not a same-project supersession of two distinct accepted facts. |
-| `invalid_graph`                       | SUPERSEDES edges disagree with fact status, leave their project, point at themselves, or form a cycle.             |
+| Reason                                | When                                                                                                                                                                                                       |
+| ------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `confirmation_before_durable_receipt` | Acknowledge before the intake is recorded.                                                                                                                                                                 |
+| `illegal_transition`                  | The event is not legal for the phase.                                                                                                                                                                      |
+| `task_mismatch`                       | The payload task or usage project is not the acknowledged work.                                                                                                                                            |
+| `attempt_mismatch`                    | The payload attempt is not the open assignment.                                                                                                                                                            |
+| `implementer_mismatch`                | QA names a different implementer or reviewer than the runtime.                                                                                                                                             |
+| `qa_same_model`                       | The reviewer's actual base model is the implementer's actual base model.                                                                                                                                   |
+| `qa_model_unknown`                    | Completion was submitted before the implementer's actual model was recorded, or a verdict was asked with an actual missing. Completion stays put. A verdict becomes `qa_incomplete` and the findings stay. |
+| `revision_mismatch`                   | Rework submits the same artifact revision again.                                                                                                                                                           |
+| `acceptance_revision_mismatch`        | QA or acceptance names a revision other than the submitted one, or the revision already sent back for rework.                                                                                              |
+| `recovery_pending_not_ready`          | Any event other than `resolve_recovery` while recovery is pending.                                                                                                                                         |
+| `invalid_payload`                     | The state, event, or result does not match its schema.                                                                                                                                                     |
+| `stale_generation`                    | A worker event names a generation or lease other than the open run.                                                                                                                                        |
+| `retry_limit_reached`                 | Retry was asked at the retry limit.                                                                                                                                                                        |
+| `idempotency_conflict`                | The idempotency key was already used for a different payload.                                                                                                                                              |
+| `delivery_revision_mismatch`          | Delivery names a revision other than the accepted one.                                                                                                                                                     |
+| `delivery_origin_mismatch`            | A conversation delivery does not name the intake's originating conversation.                                                                                                                               |
+| `memory_not_eligible`                 | The event is not acceptance of a proposed fact, or not a same-project supersession of two distinct accepted facts.                                                                                         |
+| `invalid_graph`                       | SUPERSEDES edges disagree with fact status, leave their project, point at themselves, or form a cycle.                                                                                                     |
 
 ## Tests
 

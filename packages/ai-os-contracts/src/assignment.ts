@@ -77,10 +77,27 @@ export const AssignmentV1 = Schema.Struct({
   implementerModel: ModelRef,
   // The provider instance the worker resolved. Absent on assignments recorded before it was stored.
   instanceId: Schema.optionalKey(InstanceId),
+  // Worker role. QA is not decided from this field.
+  role: Schema.optionalKey(Schema.Literals(["implementer", "qa", "advisory"])),
+  // Declared work. Absent on older assignments: advisory role meant an advisory task, otherwise implementation.
+  taskType: Schema.optionalKey(Schema.Literals(["implementation", "advisory"])),
+  // Per-task Antigravity model. Implementation assignments leave it unset.
+  advisoryModel: Schema.optionalKey(ModelRef),
   scope: ContractText,
   contextPackage: ContextPackageSnapshotV1,
 }).check(freezeDecoded);
 export type AssignmentV1 = typeof AssignmentV1.Type;
+
+/** QA follows this declaration, not the adapter that ran the task. */
+export const declaredTaskType = (assignment: {
+  readonly taskType?: "implementation" | "advisory" | undefined;
+  readonly role?: "implementer" | "qa" | "advisory" | undefined;
+}): "implementation" | "advisory" => {
+  if (assignment.taskType === "implementation" || assignment.taskType === "advisory") {
+    return assignment.taskType;
+  }
+  return assignment.role === "advisory" ? "advisory" : "implementation";
+};
 
 export const decodeAssignmentV1 = Schema.decodeUnknownEffect(AssignmentV1, strictParse);
 export const decodeContextPackageSnapshotV1 = Schema.decodeUnknownEffect(

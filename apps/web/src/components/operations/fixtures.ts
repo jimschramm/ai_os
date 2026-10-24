@@ -7,6 +7,7 @@ import {
   type IntakeV2,
   type MemoryCandidateV1,
   type ProgressReportV1,
+  type AdvisoryReviewV1,
   type QaVerdictV1,
   type SequencePhase,
   type UsageMeasurementV1,
@@ -55,6 +56,8 @@ export interface OperationsTask {
   readonly progress: readonly ProgressReportV1[];
   readonly completion: CompletionSubmissionV1 | null;
   readonly qa: QaVerdictV1 | null;
+  /** Advisory findings. Absent on fixtures. They are not a QA verdict. */
+  readonly advisory?: AdvisoryReviewV1 | null;
   readonly revision: ArtifactRevisionV1 | null;
   readonly facts: readonly OperationsFact[];
   readonly candidates: readonly MemoryCandidateV1[];

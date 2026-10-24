@@ -199,9 +199,12 @@ export function progressIndex(phase: SequencePhase): {
       return { index: 2, stalled: true };
     case "awaiting_qa":
       return { index: 3, stalled: false };
+    case "qa_incomplete":
+      return { index: 3, stalled: true };
     case "rework":
       return { index: 4, stalled: false };
     case "accepted":
+    case "review_delivered":
       return { index: 5, stalled: false };
     case "failed":
     case "cancelled":
@@ -217,8 +220,10 @@ const PROGRESS_PERCENT = {
   executing: 55,
   recovery_pending: 48,
   awaiting_qa: 80,
+  qa_incomplete: 80,
   rework: 62,
   accepted: 100,
+  review_delivered: 100,
   failed: 48,
   cancelled: 20,
 } as const satisfies Record<SequencePhase, number>;

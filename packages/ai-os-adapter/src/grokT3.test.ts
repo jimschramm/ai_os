@@ -2,11 +2,13 @@ import * as NodeHttpServer from "@effect/platform-node/NodeHttpServer";
 import { assert, it } from "@effect/vitest";
 import {
   assignmentExample,
+  applySequence,
   decodeAssignmentV1,
   decodeCompletionSubmissionV1,
   decodeIntake,
   decodeSequenceState,
   executionLaunchKey,
+  happyPathEvents,
   intakeV2Example,
   leaseIdFor,
   type KanbanMoveLedger,
@@ -29,7 +31,9 @@ import {
   ORCHESTRATION_V2_WS_METHODS,
   OrchestrationV2ThreadProjection,
   ProjectId,
+  ProviderDriverKind,
   ProviderInstanceId,
+  ProviderSessionId,
   ProviderThreadId,
   ProviderTurnId,
   RpcScopeAuthorization,
@@ -67,8 +71,10 @@ import {
   GrokT3Error,
   decodeAdapterBoard,
   memorySessionStore,
+  observationEvents,
   readAdapterBoard,
   requireCapability,
+  threadViewFromProjection,
   wsT3LocalClient,
   type WorkerAdapter,
 } from "./index.ts";
@@ -196,7 +202,113 @@ const projectionFor = (threadId: string, thread: StoredThread) => {
     attempts: [],
     nodes: [],
     subagents: [],
-    providerSessions: [],
+    // A finished run reports the model the provider session used.
+    providerSessions:
+      thread.status === "completed"
+        ? [
+            {
+              id: ProviderSessionId.make("session-1"),
+              driver: ProviderDriverKind.make("codex"),
+              providerInstanceId: INSTANCE,
+              status: "stopped" as const,
+              cwd: "/tmp",
+              model: thread.model,
+              capabilities: {
+                sessions: {
+                  supportsMultipleProviderThreadsPerSession: false,
+                  supportsModelSwitchInSession: false,
+                  supportsProviderSwitchingViaHandoff: false,
+                  supportsRuntimeModeSwitchInSession: false,
+                  pendingRequestsSurviveRestart: false,
+                },
+                threads: {
+                  canCreateEmptyThread: true,
+                  canReadThreadSnapshot: false,
+                  canRollbackThread: false,
+                  canForkThread: false,
+                  canForkFromTurn: false,
+                  canForkFromSubagentThread: false,
+                  exposesNativeThreadId: true,
+                },
+                turns: {
+                  exposesNativeTurnId: false,
+                  emitsTurnStarted: true,
+                  emitsTurnCompleted: true,
+                  supportsInterrupt: true,
+                  supportsActiveSteering: false,
+                  supportsSteeringByInterruptRestart: false,
+                  supportsQueuedMessages: false,
+                  terminalStatusQuality: "strong" as const,
+                },
+                streaming: {
+                  streamsAssistantText: true,
+                  streamsReasoning: false,
+                  streamsToolOutput: false,
+                  streamsPlanText: false,
+                  emitsMessageCompleted: true,
+                },
+                tools: {
+                  exposesToolItemIds: false,
+                  emitsToolStarted: false,
+                  emitsToolCompleted: false,
+                  emitsToolOutput: false,
+                  supportsMcpTools: false,
+                  supportsDynamicToolCallbacks: false,
+                },
+                approvals: {
+                  supportsCommandApproval: false,
+                  supportsFileReadApproval: false,
+                  supportsFileChangeApproval: false,
+                  supportsApplyPatchApproval: false,
+                  approvalsHaveNativeRequestIds: false,
+                  approvalCallbacksAreLiveOnly: true,
+                  approvalsCanOriginateFromSubagents: false,
+                },
+                planning: {
+                  emitsPlanUpdated: false,
+                  emitsTodoList: false,
+                  emitsProposedPlan: false,
+                  supportsStructuredQuestions: false,
+                  planDeltasHaveItemIds: false,
+                },
+                subagents: {
+                  supportsSubagents: false,
+                  exposesSubagentThreadIds: false,
+                  emitsSubagentLifecycle: false,
+                  canWaitForSubagents: false,
+                  canCloseSubagents: false,
+                  canForkSubagentThread: false,
+                },
+                context: {
+                  acceptsSystemContext: false,
+                  acceptsDeveloperContext: false,
+                  acceptsSyntheticUserContext: false,
+                  canGenerateSummaries: false,
+                  canConsumeHandoffSummaries: false,
+                  supportsDeltaHandoff: false,
+                  supportsFullThreadHandoff: false,
+                  maxRecommendedHandoffChars: null,
+                },
+                checkpointing: {
+                  appCanCheckpointFilesystem: false,
+                  supportsNestedCheckpointScopes: false,
+                  providerCanRollbackConversation: false,
+                  providerRollbackReturnsSnapshot: false,
+                  providerCanReadConversationSnapshot: false,
+                },
+                identity: {
+                  nativeThreadIds: "weak" as const,
+                  nativeTurnIds: "weak" as const,
+                  nativeItemIds: "weak" as const,
+                  nativeRequestIds: "weak" as const,
+                },
+              },
+              createdAt: NOW,
+              updatedAt: NOW,
+              lastError: null,
+            },
+          ]
+        : [],
     providerThreads: [],
     providerTurns:
       thread.inputTokens === undefined || thread.outputTokens === undefined
@@ -706,11 +818,12 @@ it.effect("launches one T3 thread and reads the completion back", () =>
       assert.strictEqual(working.state.phase, "executing");
       if (working.state.phase !== "executing") return;
       assert.strictEqual(working.state.run.progress?.status, "working");
-      assert.strictEqual(working.state.run.usage.length, 1);
-      assert.strictEqual(working.state.run.usage[0]?.kind, "reported_tokens");
+      assert.strictEqual(working.state.run.usage.length, 0);
+      assert.strictEqual(working.state.run.implementerRuntime?.requested?.model, TEST_MODEL);
+      assert.strictEqual(working.state.run.implementerRuntime?.actual, null);
       const again = yield* adapter.observe(recorded.taskId);
       if (again.state.phase !== "executing") return;
-      assert.strictEqual(again.state.run.usage.length, 1);
+      assert.strictEqual(again.state.run.usage.length, 0);
 
       const stale = yield* adapter
         .reportProgress(recorded.taskId, {
@@ -1206,4 +1319,138 @@ it.effect("publishes board cards on the T3 origin", () =>
       assert.strictEqual(readAdapterBoard().length, 2);
     }),
   ),
+);
+
+it.effect("attributes tokens to the provider session model and not the request", () =>
+  Effect.gen(function* () {
+    const executing = yield* applySequence(happyPathEvents.slice(0, 4));
+    const view = {
+      threadId: "thread-1",
+      runId: "run-1",
+      status: "running" as const,
+      text: null,
+      revision: null,
+      inputTokens: 3,
+      outputTokens: 1,
+      requestedModel: "gpt-5.4",
+      actualModel: "gpt-6-sol",
+    };
+    const planned = observationEvents({
+      taskId: "task-usba-page",
+      threadId: "thread-1",
+      state: executing,
+      view,
+      allowLapse: false,
+      workerId: "codex-t3",
+    });
+    const usage = planned.find((item) => item.event.type === "report_usage");
+    if (usage === undefined || usage.event.type !== "report_usage") {
+      return yield* Effect.die("Usage must name the model the runtime reported.");
+    }
+    if (usage.event.measurement.kind !== "reported_tokens") {
+      return yield* Effect.die("The measurement must be reported tokens.");
+    }
+    assert.strictEqual(usage.event.measurement.attribution.model.model, "gpt-6-sol");
+    const unreported = observationEvents({
+      taskId: "task-usba-page",
+      threadId: "thread-1",
+      state: executing,
+      view: { ...view, actualModel: null },
+      allowLapse: false,
+      workerId: "codex-t3",
+    });
+    assert.strictEqual(
+      unreported.some((item) => item.event.type === "report_usage"),
+      false,
+    );
+    const reported = threadViewFromProjection("thread-1", {
+      thread: { modelSelection: { model: "gpt-6-astra" } },
+      runs: [{ id: "run-1", status: "running", modelSelection: { model: "gpt-5.4" } }],
+      messages: [],
+      checkpoints: [],
+      providerTurns: [],
+      providerSessions: [{ model: null }, { model: "gpt-6-sol" }],
+    } as unknown as OrchestrationV2ThreadProjection);
+    assert.strictEqual(reported.requestedModel, "gpt-5.4");
+    assert.strictEqual(reported.actualModel, "gpt-6-sol");
+    const unknown = threadViewFromProjection("thread-1", {
+      thread: { modelSelection: { model: "gpt-6-astra" } },
+      runs: [{ id: "run-1", status: "running", modelSelection: { model: "gpt-5.4" } }],
+      messages: [],
+      checkpoints: [],
+      providerTurns: [],
+      providerSessions: [{ model: "gpt-6-sol" }, { model: null }],
+    } as unknown as OrchestrationV2ThreadProjection);
+    assert.strictEqual(unknown.requestedModel, "gpt-5.4");
+    assert.strictEqual(unknown.actualModel, null);
+  }),
+);
+
+it.effect("does not record the reviewer from the implementer's thread after completion", () =>
+  Effect.gen(function* () {
+    const awaiting = yield* applySequence(happyPathEvents.slice(0, 6));
+    if (awaiting.phase !== "awaiting_qa") {
+      return yield* Effect.die("Completion must wait for QA.");
+    }
+    const planned = observationEvents({
+      taskId: "task-usba-page",
+      threadId: "thread-implementer",
+      state: awaiting,
+      view: {
+        threadId: "thread-implementer",
+        runId: "run-1",
+        status: "completed",
+        text: "done",
+        revision: null,
+        requestedModel: "gpt-5.4",
+        actualModel: "gpt-5.4",
+      },
+      allowLapse: false,
+      workerId: "codex-t3",
+    });
+    assert.strictEqual(
+      planned.some((item) => item.event.type === "record_runtime_models"),
+      false,
+    );
+  }),
+);
+
+it.effect("blocks a finished run until the implementer model is known", () =>
+  Effect.gen(function* () {
+    const executing = yield* applySequence(happyPathEvents.slice(0, 4));
+    if (executing.phase !== "executing") {
+      return yield* Effect.die("The run must be executing.");
+    }
+    const planned = observationEvents({
+      taskId: "task-usba-page",
+      threadId: "thread-1",
+      state: executing,
+      view: {
+        threadId: "thread-1",
+        runId: "run-1",
+        status: "completed",
+        text: "done",
+        revision: null,
+        requestedModel: "gpt-5.4",
+        actualModel: null,
+      },
+      allowLapse: false,
+      workerId: "codex-t3",
+    });
+    assert.strictEqual(
+      planned.some((item) => item.event.type === "submit_completion"),
+      false,
+    );
+    const runtime = planned.find((item) => item.event.type === "record_runtime_models");
+    if (runtime === undefined || runtime.event.type !== "record_runtime_models") {
+      return yield* Effect.die("The requested model is recorded without an actual.");
+    }
+    assert.strictEqual(runtime.event.requested?.model, "gpt-5.4");
+    assert.strictEqual(runtime.event.actual, null);
+    const progress = planned.find((item) => item.event.type === "report_progress");
+    if (progress === undefined || progress.event.type !== "report_progress") {
+      return yield* Effect.die("A finished run with no implementer model needs a blocker.");
+    }
+    assert.strictEqual(progress.event.report.blockers[0]?.summary, "Awaiting implementer model");
+  }),
 );

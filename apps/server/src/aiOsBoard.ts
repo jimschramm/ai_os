@@ -1,4 +1,5 @@
 import {
+  ADAPTER_ANTIGRAVITY_MODELS_PATH,
   ADAPTER_BOARD_EVENT_PATH,
   ADAPTER_BOARD_EVENTS_PATH,
   ADAPTER_BOARD_MOVE_PATH,
@@ -11,6 +12,8 @@ import {
   makeAdapterBoardHub,
 } from "@t3tools/ai-os-adapter/board-hub";
 import {
+  AWAITING_IMPLEMENTER_MODEL,
+  antigravitySupports,
   launchCommandId,
   observationEvents,
   renderPrompt,
@@ -21,14 +24,17 @@ import {
 import {
   applyBoardWorkflowEvent,
   commitInterruptedMove,
+  declaredTaskType,
   decodeSequenceEvent,
   decodeSequenceState,
   executionGeneration,
   executionLaunchKey,
   openBoardTask,
   requestKanbanMove,
+  sameModelName,
   SequenceState,
   type ContextPackageSnapshotV1,
+  type SequenceEvent,
   type KanbanColumn,
   type KanbanMoveLedger,
   type KanbanMoveResult,
@@ -47,6 +53,7 @@ import {
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
 import * as Data from "effect/Data";
+import * as Hex from "effect/encoding/Hex";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -61,6 +68,13 @@ import {
   HttpServerRespondable,
 } from "effect/http";
 
+import {
+  AntigravityReviews,
+  applyAdvisoryExecution,
+  applyAdvisoryStop,
+  type AdvisoryOpen,
+} from "./aiOsAntigravity.ts";
+import type { AdvisoryExecution } from "@t3tools/ai-os-adapter";
 import * as EnvironmentAuth from "./auth/EnvironmentAuth.ts";
 import {
   failEnvironmentAuthInvalid,
@@ -138,6 +152,14 @@ export class BoardRuns extends Context.Service<
       readonly text: string;
     }) => Effect.Effect<{ readonly runId: string | null }, BoardRunError>;
     readonly watchThread: (threadId: string) => Effect.Effect<T3ThreadView | null, BoardRunError>;
+    /**
+     * The submitting QA session. A null view is unverifiable: no actual is recorded,
+     * and the verdict cannot become rework or accept.
+     */
+    readonly readReviewerSession: (input: {
+      readonly threadId: string | null;
+      readonly runId: string | null;
+    }) => Effect.Effect<T3ThreadView | null, BoardRunError>;
     /** Production follows launched runs. Tests leave this off so a tick cannot race the assertion. */
     readonly followRuns: boolean;
   }
@@ -279,7 +301,36 @@ export const liveRuns = Layer.effect(
         Effect.map((projection) => threadViewFromProjection(threadId, projection)),
         Effect.mapError((error) => runError(errorDetail(error, "The thread could not be read."))),
       );
-    return { interrupt, confirmLaunch, launch, continueRun, watchThread, followRuns: true };
+    const readReviewerSession: BoardRuns["Service"]["readReviewerSession"] = (input) =>
+      Effect.gen(function* () {
+        const namedThread =
+          input.threadId !== null && input.threadId.length > 0 ? input.threadId : null;
+        const namedRun = input.runId !== null && input.runId.length > 0 ? input.runId : null;
+        if (namedThread === null && namedRun === null) return null;
+        let resolved = namedThread;
+        if (resolved === null && namedRun !== null) {
+          const snapshot = yield* threads.getShellSnapshot();
+          const wanted = RunId.make(namedRun);
+          const shell = [...snapshot.threads, ...snapshot.archivedThreads].find(
+            (item) => item.latestRunId === wanted || item.activeRunId === wanted,
+          );
+          resolved = shell?.id ?? null;
+        }
+        if (resolved === null) return null;
+        const view = yield* watchThread(resolved);
+        if (view === null) return null;
+        if (namedRun !== null && view.runId !== namedRun) return null;
+        return view;
+      }).pipe(Effect.catch(() => Effect.succeed(null)));
+    return {
+      interrupt,
+      confirmLaunch,
+      launch,
+      continueRun,
+      watchThread,
+      readReviewerSession,
+      followRuns: true,
+    };
   }),
 );
 
@@ -349,6 +400,10 @@ const recordConfirmedRun = (input: {
   readonly disposition: BoardLaunchDisposition;
   readonly summary: string | null;
   readonly ledger: KanbanMoveLedger;
+  /** Model the run was asked to use. Null when the thread did not report one. */
+  readonly implementerRequested?: string | null;
+  /** Provider-reported model. A finished run without one is not submitted for QA. */
+  readonly implementerActual?: string | null;
 }): Effect.Effect<KanbanMoveResult> =>
   Effect.gen(function* () {
     const queued =
@@ -373,10 +428,62 @@ const recordConfirmedRun = (input: {
     if (started._tag !== "Applied" || started.state.phase !== "executing") return started;
     if (input.disposition === "active") return started;
     const run = started.state.run;
+    const requestedText = input.implementerRequested?.trim() ?? "";
+    const actualText = input.implementerActual?.trim() ?? "";
+    const requested = requestedText.length > 0 ? { model: requestedText } : null;
+    const actual = actualText.length > 0 ? { model: actualText } : null;
+    const recorded =
+      input.disposition === "completed" && (requested !== null || actual !== null)
+        ? yield* applyBoardWorkflowEvent(
+            started.state,
+            {
+              type: "record_runtime_models",
+              taskId: input.taskId,
+              attemptId,
+              generation: run.generation,
+              leaseId: run.leaseId,
+              role: "implementer",
+              requested,
+              actual,
+            },
+            `runtime-${input.taskId}-${run.generation}-implementer`,
+            input.taskId,
+            started.ledger,
+          )
+        : started;
+    if (recorded._tag !== "Applied" || recorded.state.phase !== "executing") return recorded;
+    if (input.disposition === "completed" && actual === null) {
+      return yield* applyBoardWorkflowEvent(
+        recorded.state,
+        {
+          type: "report_progress",
+          report: {
+            version: "v1",
+            taskId: input.taskId,
+            attemptId,
+            generation: run.generation,
+            leaseId: run.leaseId,
+            status: "blocked",
+            blockers: [
+              {
+                summary: AWAITING_IMPLEMENTER_MODEL,
+                ownerId: queued.assignment.workerId,
+                nextAction:
+                  "Wait until the provider reports the model that ran. This run stays out of QA.",
+              },
+            ],
+            partialArtifacts: [],
+          },
+        },
+        `await-model-${input.taskId}-${run.generation}`,
+        input.taskId,
+        recorded.ledger,
+      );
+    }
     const terminal =
       input.disposition === "completed"
         ? yield* applyBoardWorkflowEvent(
-            started.state,
+            recorded.state,
             {
               type: "submit_completion",
               completion: {
@@ -392,7 +499,7 @@ const recordConfirmedRun = (input: {
             },
             `complete-${input.taskId}-${run.generation}`,
             input.taskId,
-            started.ledger,
+            recorded.ledger,
           )
         : yield* applyBoardWorkflowEvent(
             started.state,
@@ -414,7 +521,7 @@ const recordConfirmedRun = (input: {
             input.taskId,
             started.ledger,
           );
-    return terminal._tag === "Applied" ? terminal : started;
+    return terminal._tag === "Applied" ? terminal : recorded;
   });
 
 const publicMove = (result: KanbanMoveResult) =>
@@ -485,6 +592,7 @@ export const layer = Layer.unwrap(
     const fs = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
     const runs = yield* BoardRuns;
+    const reviews = yield* AntigravityReviews;
     const filePath = path.join(config.stateDir, BOARD_FILE);
     yield* fs.makeDirectory(path.dirname(filePath), { recursive: true }).pipe(Effect.ignore);
     const hub = makeAdapterBoardHub();
@@ -613,6 +721,46 @@ export const layer = Layer.unwrap(
         );
         return "stored" as const;
       });
+    const observeThread = (
+      state: BoardSequence,
+      taskId: string,
+      threadId: string,
+      book: KanbanMoveLedger,
+      changed: boolean,
+    ) =>
+      Effect.gen(function* () {
+        const view = yield* runs
+          .watchThread(threadId)
+          .pipe(Effect.catchTags({ BoardRunError: () => Effect.succeed(null) }));
+        if (view === null || !("assignment" in state)) {
+          return { state, book, changed, runId: null as string | null };
+        }
+        const planned = observationEvents({
+          taskId,
+          threadId,
+          state,
+          view,
+          allowLapse: view.status === "interrupted",
+          workerId: state.assignment.workerId,
+        });
+        let next: BoardSequence = state;
+        let nextBook = book;
+        let nextChanged = changed;
+        for (const item of planned) {
+          const applied: KanbanMoveResult = yield* applyBoardWorkflowEvent(
+            next,
+            item.event,
+            item.idempotencyKey,
+            taskId,
+            nextBook,
+          );
+          if (applied._tag !== "Applied") break;
+          next = applied.state;
+          nextBook = applied.ledger;
+          nextChanged = nextChanged || applied.changed;
+        }
+        return { state: next, book: nextBook, changed: nextChanged, runId: view.runId };
+      });
     const followLaunched = (
       outcome: KanbanMoveResult,
       taskId: string,
@@ -627,41 +775,217 @@ export const layer = Layer.unwrap(
         ) {
           return { outcome, runId };
         }
-        const executing = outcome.state;
-        const view = yield* runs
-          .watchThread(threadId)
-          .pipe(Effect.catchTags({ BoardRunError: () => Effect.succeed(null) }));
-        if (view === null) return { outcome, runId };
-        const planned = observationEvents({
+        const viewed = yield* observeThread(
+          outcome.state,
           taskId,
           threadId,
-          state: executing,
-          view,
-          allowLapse: view.status === "interrupted",
-          model: executing.assignment.implementerModel.model,
-          workerId: executing.assignment.workerId,
-        });
-        let state: BoardSequence = executing;
-        let book: KanbanMoveLedger = outcome.ledger;
-        let changed = outcome.changed;
-        for (const item of planned) {
-          const next: KanbanMoveResult = yield* applyBoardWorkflowEvent(
-            state,
-            item.event,
-            item.idempotencyKey,
-            taskId,
-            book,
-          );
-          if (next._tag !== "Applied") break;
-          state = next.state;
-          book = next.ledger;
-          changed = changed || next.changed;
-        }
+          outcome.ledger,
+          outcome.changed,
+        );
         return {
-          outcome: { _tag: "Applied" as const, state, ledger: book, changed },
-          runId: view.runId ?? runId,
+          outcome: {
+            _tag: "Applied" as const,
+            state: viewed.state,
+            ledger: viewed.book,
+            changed: viewed.changed,
+          },
+          runId: viewed.runId ?? runId,
         };
       });
+    const namedThread = (threadId: string | null | undefined): string | null =>
+      threadId !== undefined && threadId !== null && threadId.length > 0 ? threadId : null;
+    const reviewerThreadProblem = (
+      reviewerThread: string | null,
+      implementerThread: string | null,
+      taskId: string,
+      taskProjectId: string | null,
+      reviewerProject: string | null | undefined,
+    ): string | null => {
+      if (reviewerThread === null) return null;
+      if (implementerThread !== null && reviewerThread === implementerThread) {
+        return "The reviewer's thread is the implementer's thread.";
+      }
+      const otherTask = cardsNow().find(
+        (card) => card.taskId !== taskId && card.threadId === reviewerThread,
+      );
+      if (otherTask !== undefined) return "The reviewer's thread is not from this task.";
+      if (
+        taskProjectId !== null &&
+        reviewerProject !== undefined &&
+        reviewerProject !== null &&
+        reviewerProject.length > 0 &&
+        reviewerProject !== taskProjectId
+      ) {
+        return "The reviewer's thread is not from this task.";
+      }
+      return null;
+    };
+    const recordSubmittedReviewer = (
+      state: BoardSequence,
+      event: Extract<SequenceEvent, { type: "qa" }>,
+      taskId: string,
+      idempotencyKey: string,
+      book: KanbanMoveLedger,
+      implementerThreadId: string | null,
+    ) =>
+      Effect.gen(function* () {
+        if (event.qa.availability !== "available") {
+          return { _tag: "Ready" as const, state, book };
+        }
+        if (state.phase !== "awaiting_qa" && state.phase !== "qa_incomplete") {
+          return { _tag: "Ready" as const, state, book };
+        }
+        const named = namedThread(event.threadId);
+        const namedProblem = reviewerThreadProblem(named, implementerThreadId, taskId, null, null);
+        if (namedProblem !== null) {
+          return {
+            _tag: "Rejected" as const,
+            outcome: rejectedMove(namedProblem, state, book),
+          };
+        }
+        const view = yield* runs
+          .readReviewerSession({
+            threadId: event.threadId ?? null,
+            runId: event.runId ?? null,
+          })
+          .pipe(Effect.catchTags({ BoardRunError: () => Effect.succeed(null) }));
+        const resolvedProblem = reviewerThreadProblem(
+          view?.threadId ?? null,
+          implementerThreadId,
+          taskId,
+          projectIdOf(state),
+          view?.projectId,
+        );
+        if (resolvedProblem !== null) {
+          return {
+            _tag: "Rejected" as const,
+            outcome: rejectedMove(resolvedProblem, state, book),
+          };
+        }
+        const actual = view?.actualModel?.trim() ?? "";
+        if (view === null || actual.length === 0) {
+          return { _tag: "Ready" as const, state, book };
+        }
+        const recordedReviewer = state.run.reviewerRuntime?.actual ?? null;
+        if (recordedReviewer !== null && !sameModelName(recordedReviewer, actual)) {
+          return {
+            _tag: "Rejected" as const,
+            outcome: rejectedMove(
+              "A verified reviewer is already recorded and cannot be replaced.",
+              state,
+              book,
+            ),
+          };
+        }
+        const requested = view.requestedModel?.trim() ?? "";
+        const digest = yield* crypto
+          .digest(
+            "SHA-256",
+            new TextEncoder().encode(`${taskId}\n${state.run.generation}\n${idempotencyKey}`),
+          )
+          .pipe(Effect.orDie);
+        const applied = yield* applyBoardWorkflowEvent(
+          state,
+          {
+            type: "record_runtime_models",
+            taskId: state.acknowledgment.taskId,
+            attemptId: state.assignment.attemptId,
+            generation: state.run.generation,
+            leaseId: state.run.leaseId,
+            role: "reviewer",
+            requested: requested.length > 0 ? { model: requested } : null,
+            actual: { model: actual },
+          },
+          `reviewer-${Hex.encode(digest)}`,
+          taskId,
+          book,
+        );
+        if (applied._tag !== "Applied") return { _tag: "Rejected" as const, outcome: applied };
+        return { _tag: "Ready" as const, state: applied.state, book: applied.ledger };
+      });
+    const settleAdvisory = (
+      state: BoardSequence,
+      book: KanbanMoveLedger,
+      execution: AdvisoryExecution,
+      work: { readonly taskId: string; readonly workerId: string },
+    ) => {
+      switch (execution.status) {
+        case "completed":
+        case "model_mismatch":
+          return applyAdvisoryExecution({
+            state,
+            taskId: work.taskId,
+            ledger: book,
+            execution,
+            workerId: work.workerId,
+          });
+        default:
+          return applyAdvisoryStop({
+            state,
+            taskId: work.taskId,
+            ledger: book,
+            execution,
+            workerId: work.workerId,
+          });
+      }
+    };
+    const settleOpenAdvisory = Effect.gen(function* () {
+      for (const card of cardsNow()) {
+        if (card.state.phase !== "executing") continue;
+        if (declaredTaskType(card.state.assignment) !== "advisory") continue;
+        yield* writes.withPermits(1)(
+          Effect.gen(function* () {
+            const fresh = cardsNow().find((item) => item.taskId === card.taskId);
+            if (fresh === undefined || fresh.state.phase !== "executing") return;
+            if (declaredTaskType(fresh.state.assignment) !== "advisory") return;
+            if (!antigravitySupports("report_status")) return;
+            const watched = yield* reviews.watch(fresh.taskId);
+            const decoded = yield* decodeState(fresh.state);
+            if (decoded._tag === "Bad" || decoded.state.phase !== "executing") return;
+            // Bind before the nested generator. A closure does not keep the phase narrowing.
+            const executing = decoded.state;
+            if (
+              watched !== null &&
+              watched.generation !== undefined &&
+              watched.generation !== executing.run.generation
+            ) {
+              return;
+            }
+            if (watched === null) yield* reviews.sweep(fresh.taskId);
+            const outcome =
+              watched === null
+                ? yield* applyBoardWorkflowEvent(
+                    executing,
+                    {
+                      type: "lease_expired",
+                      lease: {
+                        taskId: fresh.taskId,
+                        attemptId: executing.assignment.attemptId,
+                        generation: executing.run.generation,
+                        leaseId: executing.run.leaseId,
+                      },
+                    },
+                    `agy-lease-${fresh.taskId}-${executing.run.generation}`,
+                    fresh.taskId,
+                    ledger,
+                  )
+                : watched.status === "running"
+                  ? null
+                  : yield* settleAdvisory(executing, ledger, watched.execution, {
+                      taskId: fresh.taskId,
+                      workerId: executing.assignment.workerId,
+                    });
+            if (outcome === null || outcome._tag !== "Applied" || !outcome.changed) return;
+            yield* persistApplied(outcome, fresh, {
+              taskId: fresh.taskId,
+              title: fresh.title,
+              threadId: fresh.threadId,
+              runId: fresh.runId ?? null,
+            });
+          }),
+        );
+      }
+    });
     const move = Effect.gen(function* () {
       yield* authorize(AuthOrchestrationOperateScope);
       const request = yield* HttpServerRequest.HttpServerRequest;
@@ -692,9 +1016,98 @@ export const layer = Layer.unwrap(
           const asked = yield* requestKanbanMove(decoded.state, requestInput);
           let launchedThread = card.threadId;
           let launchedRun = card.runId ?? null;
+          const openAdvisoryRun = (
+            queued: Extract<BoardSequence, { phase: "assigned" } | { phase: "rework" }>,
+            projectId: string,
+            book: KanbanMoveLedger,
+            rejectedState: BoardSequence,
+          ) =>
+            Effect.gen(function* () {
+              if (!antigravitySupports("start")) {
+                return rejectedMove("Antigravity does not implement start.", rejectedState, book);
+              }
+              const typed = stringField(body, "model")?.trim() ?? "";
+              const requested =
+                typed.length > 0 ? typed : (queued.assignment.advisoryModel?.model ?? undefined);
+              const generation = executionGeneration(queued);
+              const opened = yield* reviews.start({
+                projectId,
+                taskId,
+                generation,
+                intake: queued.intake,
+                context: queued.assignment.contextPackage,
+                requestedModel: requested,
+              });
+              if (opened.status === "unavailable") {
+                return rejectedMove(opened.detail, rejectedState, book);
+              }
+              const started = yield* applyBoardWorkflowEvent(
+                queued,
+                { type: "start_execution" },
+                `agy-start-${taskId}-${generation}`,
+                taskId,
+                book,
+              );
+              if (started._tag !== "Applied" || started.state.phase !== "executing") {
+                return started;
+              }
+              return {
+                _tag: "Running" as const,
+                started,
+                opened: opened as Exclude<AdvisoryOpen, { status: "unavailable" }>,
+              };
+            });
           const outcome =
             asked._tag === "NeedsInterrupt"
               ? yield* Effect.gen(function* () {
+                  if (
+                    "assignment" in decoded.state &&
+                    declaredTaskType(decoded.state.assignment) === "advisory"
+                  ) {
+                    if (!antigravitySupports("cancel")) {
+                      return {
+                        _tag: "Rejected" as const,
+                        detail: "Antigravity does not implement cancel.",
+                        state: decoded.state,
+                        ledger,
+                      };
+                    }
+                    const stopped = yield* asRun(reviews.cancel(taskId));
+                    if (stopped._tag === "No") {
+                      return {
+                        _tag: "Rejected" as const,
+                        detail: stopped.detail,
+                        state: decoded.state,
+                        ledger,
+                      };
+                    }
+                    if (decoded.state.phase !== "executing") {
+                      return {
+                        _tag: "Rejected" as const,
+                        detail: "The run is no longer active, so the card was left as it is.",
+                        state: decoded.state,
+                        ledger,
+                      };
+                    }
+                    // Cancel only asks the process to stop. The card stays blocked
+                    // until recover confirms the process is gone and the worktree is cleaned.
+                    const executing = decoded.state;
+                    return yield* applyBoardWorkflowEvent(
+                      executing,
+                      {
+                        type: "lease_expired",
+                        lease: {
+                          taskId,
+                          attemptId: executing.assignment.attemptId,
+                          generation: executing.run.generation,
+                          leaseId: executing.run.leaseId,
+                        },
+                      },
+                      `${idempotencyKey}-block`,
+                      taskId,
+                      ledger,
+                    );
+                  }
                   const threadId = card.threadId;
                   const runId = card.runId ?? null;
                   if (threadId === null || runId === null) {
@@ -753,6 +1166,35 @@ export const layer = Layer.unwrap(
                         ledger,
                       );
                     }
+                    if (declaredTaskType(queued.assignment) === "advisory") {
+                      const opened = yield* openAdvisoryRun(queued, projectId, ledger, queued);
+                      if (opened._tag !== "Running") return opened;
+                      const watched = !antigravitySupports("report_status")
+                        ? null
+                        : opened.opened.status === "settled"
+                          ? { status: "settled" as const, execution: opened.opened.execution }
+                          : yield* reviews.watch(taskId);
+                      if (watched === null || watched.status === "running") {
+                        launchedRun = opened.opened.runId;
+                        return opened.started;
+                      }
+                      return yield* settleAdvisory(
+                        opened.started.state,
+                        opened.started.ledger,
+                        watched.execution,
+                        {
+                          taskId,
+                          workerId: queued.assignment.workerId,
+                        },
+                      );
+                    }
+                    if (queued.assignment.instanceId === "antigravity") {
+                      return rejectedMove(
+                        "Antigravity does not run implementation tasks. The card stays Ready.",
+                        queued,
+                        ledger,
+                      );
+                    }
                     const launched = yield* asRun(
                       runs.launch({
                         idempotencyKey: executionLaunchKey(
@@ -798,6 +1240,9 @@ export const layer = Layer.unwrap(
                     }
                     launchedThread = launched.value.threadId;
                     launchedRun = runId;
+                    const watched = yield* runs
+                      .watchThread(launched.value.threadId)
+                      .pipe(Effect.catchTags({ BoardRunError: () => Effect.succeed(null) }));
                     return yield* recordConfirmedRun({
                       state: queued,
                       taskId,
@@ -805,6 +1250,8 @@ export const layer = Layer.unwrap(
                       disposition: launched.value.disposition,
                       summary: launched.value.summary,
                       ledger,
+                      implementerRequested: watched?.requestedModel ?? null,
+                      implementerActual: watched?.actualModel ?? null,
                     });
                   })
                 : asked._tag === "NeedsRecover"
@@ -816,6 +1263,63 @@ export const layer = Layer.unwrap(
                           waiting,
                           ledger,
                         );
+                      }
+                      if (declaredTaskType(waiting.assignment) === "advisory") {
+                        if (!antigravitySupports("start")) {
+                          return rejectedMove(
+                            "Antigravity does not implement start.",
+                            waiting,
+                            ledger,
+                          );
+                        }
+                        const recovered = yield* reviews.recover(taskId);
+                        if (recovered.status === "still_running") {
+                          return rejectedMove(
+                            "The earlier advisory review is still running. It stays blocked until that process is confirmed stopped.",
+                            waiting,
+                            ledger,
+                          );
+                        }
+                        const generation = waiting.run.generation;
+                        const nextAttemptId = `retry-${taskId}-${generation + 1}`.slice(0, 128);
+                        const resolved = yield* applyBoardWorkflowEvent(
+                          waiting,
+                          {
+                            type: "resolve_recovery",
+                            command: {
+                              command: "resolve_recovery",
+                              outcome: "continue",
+                              idempotencyKey: `agy-recover-${taskId}-${generation}`,
+                              taskId,
+                              attemptId: waiting.assignment.attemptId,
+                              nextAttemptId,
+                            },
+                          },
+                          `agy-recover-${taskId}-${generation}`,
+                          taskId,
+                          ledger,
+                        );
+                        if (resolved._tag !== "Applied" || resolved.state.phase !== "assigned") {
+                          return resolved;
+                        }
+                        const queued = resolved.state;
+                        const projectId = projectIdOf(queued);
+                        if (projectId === null) {
+                          return rejectedMove(
+                            "This card has no project, so the review cannot be started.",
+                            waiting,
+                            ledger,
+                          );
+                        }
+                        const opened = yield* openAdvisoryRun(
+                          queued,
+                          projectId,
+                          resolved.ledger,
+                          waiting,
+                        );
+                        if (opened._tag !== "Running") return opened;
+                        launchedRun = opened.opened.runId;
+                        return opened.started;
                       }
                       const threadId = card.threadId;
                       const runId = card.runId ?? null;
@@ -962,40 +1466,193 @@ export const layer = Layer.unwrap(
             stored._tag === "Ok" &&
             (decoded.event.type === "cancel" || decoded.event.type === "lease_expired")
           ) {
-            if (threadId === null || runId === null) {
+            if (
+              "assignment" in stored.state &&
+              declaredTaskType(stored.state.assignment) === "advisory"
+            ) {
+              if (!antigravitySupports("cancel")) {
+                return json(409, {
+                  _tag: "Rejected",
+                  detail: "Antigravity does not implement cancel.",
+                });
+              }
+              yield* reviews.cancel(taskId);
+              if (decoded.event.type === "cancel" && stored.state.phase === "executing") {
+                const executing = stored.state;
+                const blocked = yield* applyBoardWorkflowEvent(
+                  executing,
+                  {
+                    type: "lease_expired",
+                    lease: {
+                      taskId,
+                      attemptId: executing.assignment.attemptId,
+                      generation: executing.run.generation,
+                      leaseId: executing.run.leaseId,
+                    },
+                  },
+                  idempotencyKey,
+                  taskId,
+                  ledger,
+                );
+                if (blocked._tag !== "Applied") return json(409, publicMove(blocked));
+                const blockedSaved = yield* persistApplied(blocked, card, {
+                  taskId,
+                  title: stringField(body, "title"),
+                  threadId,
+                  runId,
+                });
+                if (blockedSaved === "needs-title") {
+                  return json(400, { detail: "A new task needs a title." });
+                }
+                if (blockedSaved !== "stored") {
+                  return json(400, { detail: "The task could not be stored." });
+                }
+                return json(200, {
+                  ...publicMove(blocked),
+                  revision: (card?.revision ?? 0) + (blocked.changed ? 1 : 0),
+                });
+              }
+            } else {
+              if (threadId === null || runId === null) {
+                return json(409, {
+                  _tag: "Rejected",
+                  detail: "This card has no T3 run to interrupt.",
+                });
+              }
+              const projectId = projectIdOf(stored.state);
+              if (projectId === null) {
+                return json(409, {
+                  _tag: "Rejected",
+                  detail: "This card has no project, so the run cannot be interrupted.",
+                });
+              }
+              const interrupted = yield* asRun(
+                runs.interrupt({
+                  projectId,
+                  threadId,
+                  runId,
+                  commandId: `board-interrupt-${idempotencyKey}`,
+                }),
+              );
+              if (interrupted._tag === "No") {
+                return json(409, { _tag: "Rejected", detail: interrupted.detail });
+              }
+            }
+          }
+          if (
+            !replay &&
+            stored._tag === "Ok" &&
+            decoded.event.type === "continue" &&
+            "assignment" in stored.state &&
+            declaredTaskType(stored.state.assignment) === "advisory" &&
+            stored.state.phase === "recovery_pending"
+          ) {
+            if (!antigravitySupports("start")) {
               return json(409, {
                 _tag: "Rejected",
-                detail: "This card has no T3 run to interrupt.",
+                detail: "Antigravity does not implement start.",
               });
             }
-            const projectId = projectIdOf(stored.state);
+            const waiting = stored.state;
+            const recovered = yield* reviews.recover(taskId);
+            if (recovered.status === "still_running") {
+              return json(409, {
+                _tag: "Rejected",
+                detail:
+                  "The earlier advisory review is still running. It stays blocked until that process is confirmed stopped.",
+              });
+            }
+            const generation = waiting.run.generation;
+            const nextAttemptId = `retry-${taskId}-${generation + 1}`.slice(0, 128);
+            const resolved = yield* applyBoardWorkflowEvent(
+              waiting,
+              {
+                type: "resolve_recovery",
+                command: {
+                  command: "resolve_recovery",
+                  outcome: "continue",
+                  idempotencyKey: `agy-recover-${taskId}-${generation}`,
+                  taskId,
+                  attemptId: waiting.assignment.attemptId,
+                  nextAttemptId,
+                },
+              },
+              `agy-recover-${taskId}-${generation}`,
+              taskId,
+              ledger,
+            );
+            if (resolved._tag !== "Applied" || resolved.state.phase !== "assigned") {
+              return json(409, publicMove(resolved));
+            }
+            const queued = resolved.state;
+            const projectId = projectIdOf(queued);
             if (projectId === null) {
               return json(409, {
                 _tag: "Rejected",
-                detail: "This card has no project, so the run cannot be interrupted.",
+                detail: "This card has no project, so the review cannot be started.",
               });
             }
-            const interrupted = yield* asRun(
-              runs.interrupt({
-                projectId,
-                threadId,
-                runId,
-                commandId: `board-interrupt-${idempotencyKey}`,
-              }),
-            );
-            if (interrupted._tag === "No") {
-              return json(409, { _tag: "Rejected", detail: interrupted.detail });
+            const typed = stringField(body, "model")?.trim() ?? "";
+            const requested =
+              typed.length > 0 ? typed : (queued.assignment.advisoryModel?.model ?? undefined);
+            const opened = yield* reviews.start({
+              projectId,
+              taskId,
+              generation: executionGeneration(queued),
+              intake: queued.intake,
+              context: queued.assignment.contextPackage,
+              requestedModel: requested,
+            });
+            if (opened.status === "unavailable") {
+              return json(409, { _tag: "Rejected", detail: opened.detail });
             }
+            const started = yield* applyBoardWorkflowEvent(
+              queued,
+              { type: "start_execution" },
+              idempotencyKey,
+              taskId,
+              resolved.ledger,
+            );
+            if (started._tag !== "Applied" || started.state.phase !== "executing") {
+              return json(409, publicMove(started));
+            }
+            const resumed = yield* persistApplied(started, card, {
+              taskId,
+              title: stringField(body, "title"),
+              threadId,
+              runId: opened.runId,
+            });
+            if (resumed === "needs-title")
+              return json(400, { detail: "A new task needs a title." });
+            if (resumed !== "stored") return json(400, { detail: "The task could not be stored." });
+            return json(200, {
+              ...publicMove(started),
+              revision: (card?.revision ?? 0) + (started.changed ? 1 : 0),
+            });
+          }
+          const prepared =
+            stored._tag === "Ok" && !replay && decoded.event.type === "qa"
+              ? yield* recordSubmittedReviewer(
+                  stored.state,
+                  decoded.event,
+                  taskId,
+                  idempotencyKey,
+                  ledger,
+                  card?.threadId ?? null,
+                )
+              : null;
+          if (prepared !== null && prepared._tag === "Rejected") {
+            return json(409, publicMove(prepared.outcome));
           }
           const outcome =
             stored._tag === "Missing"
               ? yield* openBoardTask(decoded.event, idempotencyKey, taskId, ledger)
               : yield* applyBoardWorkflowEvent(
-                  stored.state,
+                  prepared !== null && prepared._tag === "Ready" ? prepared.state : stored.state,
                   decoded.event,
                   idempotencyKey,
                   taskId,
-                  ledger,
+                  prepared !== null && prepared._tag === "Ready" ? prepared.book : ledger,
                 );
           if (outcome._tag !== "Applied") return json(409, publicMove(outcome));
           const saved = yield* persistApplied(outcome, card, {
@@ -1024,7 +1681,7 @@ export const layer = Layer.unwrap(
     );
     const followExecuting = Effect.gen(function* () {
       const open = cardsNow().filter(
-        (card) => card.state.phase === "executing" && card.threadId !== null,
+        (card) => card.threadId !== null && card.state.phase === "executing",
       );
       for (const card of open) {
         yield* writes.withPermits(1)(
@@ -1032,8 +1689,8 @@ export const layer = Layer.unwrap(
             const fresh = cardsNow().find((item) => item.taskId === card.taskId);
             if (
               fresh === undefined ||
-              fresh.state.phase !== "executing" ||
-              fresh.threadId === null
+              fresh.threadId === null ||
+              fresh.state.phase !== "executing"
             ) {
               return;
             }
@@ -1057,18 +1714,30 @@ export const layer = Layer.unwrap(
       }
     });
     const followLoop = followExecuting.pipe(
+      Effect.andThen(settleOpenAdvisory),
       Effect.catch(() => Effect.void),
       Effect.andThen(Effect.sleep(BOARD_FOLLOW_INTERVAL)),
       Effect.forever,
     );
+    const models = Effect.gen(function* () {
+      yield* authorize(AuthOrchestrationReadScope);
+      const catalog = yield* reviews.listModels();
+      return json(200, {
+        source: catalog.source,
+        models: catalog.models.map((model) => ({ slug: model.slug, label: model.label })),
+        detail: catalog.detail,
+      });
+    }).pipe(Effect.catchTags(authResponse));
     return Layer.mergeAll(
       HttpRouter.add("GET", ADAPTER_BOARD_PATH, snapshot),
       HttpRouter.add("POST", ADAPTER_BOARD_PATH, replace),
       HttpRouter.add("GET", ADAPTER_BOARD_EVENTS_PATH, events),
       HttpRouter.add("POST", ADAPTER_BOARD_MOVE_PATH, move),
       HttpRouter.add("POST", ADAPTER_BOARD_EVENT_PATH, workflowEvent),
+      HttpRouter.add("GET", ADAPTER_ANTIGRAVITY_MODELS_PATH, models),
       Layer.effectDiscard(
         Effect.gen(function* () {
+          yield* settleOpenAdvisory;
           if (!runs.followRuns) return;
           yield* Effect.forkScoped(followLoop);
         }),

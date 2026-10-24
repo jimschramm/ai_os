@@ -13,6 +13,7 @@ export {
   clearAdapterBoard,
   createGrokT3Adapter,
   memorySessionStore,
+  AWAITING_IMPLEMENTER_MODEL,
   observationEvents,
   type ObservationEvent,
   readAdapterBoard,
@@ -34,6 +35,25 @@ export {
   type T3ProjectSummary,
   type T3ThreadView,
 } from "./t3Client.ts";
+export {
+  ANTIGRAVITY_CAPABILITIES,
+  advisoryEnvironment,
+  advisoryUsage,
+  agyEnvironment,
+  antigravitySupports,
+  isAnthropicModel,
+  listAntigravityModels,
+  parseCliRun,
+  parseModelList,
+  resolveModelChoice,
+  reviewArguments,
+  runAdvisoryReview,
+  sweepAdvisoryIsolation,
+  type AdvisoryExecution,
+  type AdvisorySuccess,
+  type AntigravityCatalog,
+  type CliSpawner,
+} from "./antigravity.ts";
 export {
   WORKER_CAPABILITIES,
   hasCapability,

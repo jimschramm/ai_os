@@ -58,6 +58,8 @@ export const ResolveRecoveryCommandV1 = Schema.Union([
     command: Schema.Literal("resolve_recovery"),
     outcome: Schema.Literal("continue"),
     ...controlFields,
+    // Advisory recovery starts a new attempt. Other workers keep the open attempt.
+    nextAttemptId: Schema.optionalKey(ContractId),
   }),
   Schema.Struct({
     command: Schema.Literal("resolve_recovery"),

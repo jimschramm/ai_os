@@ -6,7 +6,7 @@ import {
   ContractText,
   ContractVersion,
   ModelRef,
-  sameModelName,
+  sameBaseModel,
   sameRevision,
   strictParse,
 } from "./common.ts";
@@ -23,8 +23,8 @@ const differentModel = Schema.makeFilter(
     readonly qaModel: ModelRef | string;
     readonly implementerModel: ModelRef | string;
   }) =>
-    sameModelName(verdict.qaModel, verdict.implementerModel)
-      ? "QA must use a different model than the implementer."
+    sameBaseModel(verdict.qaModel, verdict.implementerModel)
+      ? "QA must use a different base model than the implementer."
       : true,
 );
 

@@ -5,6 +5,7 @@ import {
   decodeIntake,
   executionLaunchKey,
   fingerprintOf,
+  sameModelName,
   taskLinkFor,
   type ContextPackageSnapshotV1,
   type Intake,
@@ -140,15 +141,89 @@ export interface ObservationEvent {
  * Progress, usage, completion, and failure for one executing run.
  * A missing or interrupted view lapses only when the caller still owns the heartbeat.
  */
+/** Visible while a finished run has no provider-reported implementer model. */
+export const AWAITING_IMPLEMENTER_MODEL = "Awaiting implementer model";
+
+const modelRef = (value: string | null | undefined) => {
+  const trimmed = value?.trim() ?? "";
+  return trimmed.length > 0 ? { model: trimmed } : null;
+};
+
+const sameReportedModel = (
+  stored: { readonly model: string } | null | undefined,
+  next: string | null,
+): boolean => stored != null && next !== null && sameModelName(stored, next);
+
+/**
+ * The first runtime report stands. A later different model is not written over it.
+ * Actual comes only from the provider session on the view. A missing actual stays missing.
+ */
+const runtimeObservation = (input: {
+  readonly taskId: string;
+  readonly attemptId: string;
+  readonly generation: number;
+  readonly leaseId: string;
+  readonly stored:
+    | {
+        readonly requested: { readonly model: string } | null;
+        readonly actual: { readonly model: string } | null;
+      }
+    | undefined;
+  readonly view: T3ThreadView;
+  readonly role: "implementer" | "reviewer";
+}): ObservationEvent | null => {
+  const requested = modelRef(input.view.requestedModel);
+  const actual = modelRef(input.view.actualModel);
+  const stored = input.stored;
+  const requestedConflict =
+    stored !== undefined &&
+    requested !== null &&
+    stored.requested !== null &&
+    !sameReportedModel(stored.requested, input.view.requestedModel ?? null);
+  const actualConflict =
+    stored !== undefined &&
+    actual !== null &&
+    stored.actual !== null &&
+    !sameReportedModel(stored.actual, input.view.actualModel ?? null);
+  const nextRequested =
+    stored === undefined
+      ? requested
+      : !requestedConflict && stored.requested === null
+        ? requested
+        : null;
+  const nextActual =
+    stored === undefined ? actual : !actualConflict && stored.actual === null ? actual : null;
+  if (nextRequested === null && nextActual === null) return null;
+  const suffix =
+    stored === undefined
+      ? input.role
+      : nextActual !== null
+        ? `${input.role}-actual`
+        : `${input.role}-requested`;
+  return {
+    idempotencyKey: `runtime-${input.taskId}-${input.generation}-${suffix}`,
+    event: {
+      type: "record_runtime_models",
+      taskId: input.taskId,
+      attemptId: input.attemptId,
+      generation: input.generation,
+      leaseId: input.leaseId,
+      role: input.role,
+      requested: nextRequested,
+      actual: nextActual,
+    },
+  };
+};
+
 export const observationEvents = (input: {
   readonly taskId: string;
   readonly threadId: string;
   readonly state: SequenceState;
   readonly view: T3ThreadView | null;
   readonly allowLapse: boolean;
-  readonly model: string;
   readonly workerId: string;
 }): readonly ObservationEvent[] => {
+  // This poll watches the implementer's thread. Its model is not the reviewer's.
   if (input.state.phase !== "executing") return [];
   const run = input.state.run;
   const attemptId = input.state.assignment.attemptId;
@@ -172,8 +247,18 @@ export const observationEvents = (input: {
     ];
   }
   const view = input.view;
+  const runtime = runtimeObservation({
+    taskId,
+    attemptId,
+    generation: run.generation,
+    leaseId: run.leaseId,
+    stored: input.state.run.implementerRuntime,
+    view,
+    role: "implementer",
+  });
   if (view.status === "running") {
     const events: ObservationEvent[] = [];
+    if (runtime !== null) events.push(runtime);
     if (run.progress?.status !== "working") {
       events.push({
         idempotencyKey: `progress-${taskId}-${run.generation}-working`,
@@ -192,8 +277,10 @@ export const observationEvents = (input: {
         },
       });
     }
+    const actual = modelRef(view.actualModel);
     if (
       run.usage.length === 0 &&
+      actual !== null &&
       view.inputTokens !== undefined &&
       view.outputTokens !== undefined
     ) {
@@ -214,7 +301,7 @@ export const observationEvents = (input: {
               agentId: input.workerId,
               platform: "t3",
               provider: "openai",
-              model: { model: input.model },
+              model: actual,
             },
           },
         },
@@ -244,7 +331,37 @@ export const observationEvents = (input: {
     ];
   }
   if (view.status !== "completed") return [];
+  const completedActual = modelRef(view.actualModel);
+  if (completedActual === null) {
+    return [
+      ...(runtime === null ? [] : [runtime]),
+      {
+        idempotencyKey: `await-model-${taskId}-${run.generation}`,
+        event: {
+          type: "report_progress",
+          report: {
+            version: "v1",
+            taskId,
+            attemptId,
+            generation: run.generation,
+            leaseId: run.leaseId,
+            status: "blocked",
+            blockers: [
+              {
+                summary: AWAITING_IMPLEMENTER_MODEL,
+                ownerId: input.state.assignment.workerId,
+                nextAction:
+                  "Wait until the provider reports the model that ran. This run stays out of QA.",
+              },
+            ],
+            partialArtifacts: [],
+          },
+        },
+      },
+    ];
+  }
   return [
+    ...(runtime === null ? [] : [runtime]),
     {
       idempotencyKey: `complete-${taskId}-${run.generation}`,
       event: {
@@ -514,7 +631,6 @@ export const createGrokT3Adapter = (input: {
         state: session.state,
         view,
         allowLapse,
-        model,
         workerId,
       });
       let current = session;

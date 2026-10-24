@@ -46,6 +46,18 @@ const eventsFor = (task: OperationsTask): readonly unknown[] => {
     return events;
   }
   events.push({ type: "start_execution" });
+  if (source.qa !== null && source.qa.availability === "available") {
+    events.push({
+      type: "record_runtime_models",
+      taskId: source.id,
+      attemptId: assignment.attemptId,
+      generation: 1,
+      leaseId: leaseIdFor(1),
+      role: "implementer",
+      requested: source.qa.implementerModel,
+      actual: source.qa.implementerModel,
+    });
+  }
   for (const measurement of source.usage) {
     events.push({
       type: "report_usage",
@@ -75,9 +87,43 @@ const eventsFor = (task: OperationsTask): readonly unknown[] => {
     return events;
   }
   if (source.completion !== null) {
+    const recordedImplementer = events.some(
+      (event) =>
+        typeof event === "object" &&
+        event !== null &&
+        "type" in event &&
+        event.type === "record_runtime_models" &&
+        "role" in event &&
+        event.role === "implementer",
+    );
+    if (!recordedImplementer) {
+      // The fixture names the model that ran. Production does not infer it.
+      events.push({
+        type: "record_runtime_models",
+        taskId: source.id,
+        attemptId: assignment.attemptId,
+        generation: 1,
+        leaseId: leaseIdFor(1),
+        role: "implementer",
+        requested: assignment.implementerModel,
+        actual: assignment.implementerModel,
+      });
+    }
     events.push({ type: "submit_completion", completion: source.completion });
   }
-  if (source.qa !== null) {
+  if (source.qa !== null && source.qa.availability === "available") {
+    events.push({
+      type: "record_runtime_models",
+      taskId: source.id,
+      attemptId: assignment.attemptId,
+      generation: 1,
+      leaseId: leaseIdFor(1),
+      role: "reviewer",
+      requested: source.qa.qaModel,
+      actual: source.qa.qaModel,
+    });
+    events.push({ type: "qa", threadId: "thread-qa", qa: source.qa });
+  } else if (source.qa !== null) {
     events.push({ type: "qa", qa: source.qa });
   }
   return events;
