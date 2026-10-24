@@ -95,7 +95,8 @@ export const reworkCapNoticeMatches = (input: {
   if (!sameFindings(input.notice.remainingIssue, latest.findings)) {
     return "The notice keeps the latest QA findings.";
   }
-  if (input.recommendation !== input.notice.recommendation) {
+  const recommendation = input.recommendation ?? "No recommendation provided";
+  if (recommendation !== input.notice.recommendation) {
     return "The notice keeps the recommendation from the latest rework.";
   }
   return true;

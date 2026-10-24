@@ -98,27 +98,14 @@ it.effect("stops the task after three rework verdicts", () =>
 
     state = yield* applySequenceEvent(state, { type: "start_execution" });
     state = yield* submit(state, attemptId, 3, "Added the final and dropped the venue.");
-    const missing = yield* failure(state, { type: "qa", qa: rework(attemptId, 3) });
-    assert.strictEqual(missing.reason, "rework_cap_needs_recommendation");
-    assert.strictEqual(state.phase, "awaiting_qa");
-    count(state, 2);
-
-    const capped = yield* verdict(
-      state,
-      attemptId,
-      3,
-      "Stop and ask Jim. The venue field is still wrong after three fixes.",
-    );
+    const capped = yield* verdict(state, attemptId, 3);
     if (capped.phase !== "rework_capped") {
       return yield* Effect.die("The third rework must block the task.");
     }
     count(capped, 3);
     assert.strictEqual(capped.notice.label, REWORK_CAP_LABEL);
     assert.strictEqual(kanbanColumn(capped.phase), "Blocked");
-    assert.strictEqual(
-      capped.notice.recommendation,
-      "Stop and ask Jim. The venue field is still wrong after three fixes.",
-    );
+    assert.strictEqual(capped.notice.recommendation, "No recommendation provided");
     assert.deepStrictEqual(capped.notice.remainingIssue, [finding(3)]);
     assert.deepStrictEqual(
       capped.notice.attemptedFixes.map((round) => ({
