@@ -1,4 +1,5 @@
 // @effect-diagnostics nodeBuiltinImport:off - The production memory file is under the home directory, and tests keep theirs in the temp state dir.
+import * as NodeChildProcess from "node:child_process";
 import * as NodeOS from "node:os";
 
 import {
@@ -11,6 +12,8 @@ import {
   ADAPTER_MEMORY_RESOLVE_PATH,
   ADAPTER_MEMORY_SUPPLY_PATH,
   ADAPTER_MEMORY_WRITE_PATH,
+  ADAPTER_REQUEST_PATH,
+  ADAPTER_ROLES_PATH,
   type AdapterBoardCard,
 } from "@t3tools/ai-os-adapter/board";
 import {
@@ -30,22 +33,38 @@ import {
 } from "@t3tools/ai-os-adapter";
 import {
   applyBoardWorkflowEvent,
+  canonicalGitSha,
   commitInterruptedMove,
+  ContractId,
+  ContractText,
   declaredTaskType,
+  decodeAssignmentV1,
+  decodeQaVerdictV1,
+  decodeRoleDefaultsFile,
   decodeSequenceEvent,
   decodeSequenceState,
+  eligibleImplementer,
   executionGeneration,
   executionLaunchKey,
+  GitSha,
+  Intake,
   ContractTransitionError,
+  needsWorkerNotice,
+  QA_INCOMPLETE_LABEL,
   openBoardTask,
   initialMemoryLedger,
   launchMemoryLines,
   promptCarriesMemory,
+  qaWorkerFor,
+  recordPendingVerdict,
   requestKanbanMove,
   reviewSteward,
+  RoleWorkerV1,
   runtimeForAssignment,
+  sameBaseModel,
   sameModelName,
   SequenceState,
+  type RoleDefaultsFileV1,
   type AttemptMemoryActivityV1,
   type ContextPackageSnapshotV1,
   type PreparedTaskMemory,
@@ -114,6 +133,20 @@ import * as ThreadLaunch from "./orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadManagement from "./orchestration-v2/ThreadManagementService.ts";
 
 const BOARD_FILE = "ai-os-board.json";
+const RolePost = Schema.Struct({
+  projectId: ContractId,
+  implementer: Schema.optionalKey(RoleWorkerV1),
+  qa: Schema.optionalKey(RoleWorkerV1),
+});
+const RequestPost = Schema.Struct({
+  taskId: ContractId,
+  title: ContractText,
+  idempotencyKey: ContractId,
+  repoCommit: GitSha,
+  intake: Intake,
+});
+const decodeRolePost = Schema.decodeUnknownEffect(RolePost, { onExcessProperty: "error" });
+const decodeRequestPost = Schema.decodeUnknownEffect(RequestPost, { onExcessProperty: "error" });
 const BOARD_FOLLOW_INTERVAL = "1 second";
 const COLUMNS = ["Backlog", "Ready", "Running", "Review", "Blocked", "Done"] as const;
 
@@ -541,6 +574,47 @@ const rejectedMove = (
   ledger: KanbanMoveLedger,
 ): KanbanMoveResult => ({ _tag: "Rejected", detail, state, ledger });
 
+const gitArtifact = (
+  revision: string | null | undefined,
+): { readonly type: "git"; readonly sha: string } | null => {
+  const sha = canonicalGitSha(revision ?? "");
+  return sha === null ? null : { type: "git", sha };
+};
+
+/** A checkpoint ref is `refs/t3/orchestration-v2/checkpoints/<scope>/ordinal/<n>`. */
+const CHECKPOINT_REF = /^refs\/t3\/orchestration-v2\/checkpoints\/[A-Za-z0-9_-]+\/ordinal\/[0-9]+$/;
+
+/**
+ * The live thread reports a checkpoint ref, not the commit it names.
+ * QA is bound to that commit, so the ref is resolved before completion is stored.
+ */
+const commitShaForRevision = (
+  revision: string | null | undefined,
+  cwd: string | null | undefined,
+): string | null => {
+  const direct = canonicalGitSha(revision ?? "");
+  if (direct !== null) return direct;
+  if (revision == null || cwd == null || cwd.length === 0 || !CHECKPOINT_REF.test(revision)) {
+    return null;
+  }
+  try {
+    const sha = NodeChildProcess.execFileSync(
+      "git",
+      ["rev-parse", "--verify", `${revision}^{commit}`],
+      { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
+    ).trim();
+    return canonicalGitSha(sha);
+  } catch {
+    return null;
+  }
+};
+
+const withResolvedRevision = (view: T3ThreadView): T3ThreadView => {
+  const sha = commitShaForRevision(view.revision, view.cwd);
+  if (sha === null || sha === view.revision) return view;
+  return { ...view, revision: sha };
+};
+
 /**
  * Record start, then a terminal outcome when the run already finished.
  * The card leaves Ready only after both events apply, in that order.
@@ -557,6 +631,8 @@ const recordConfirmedRun = (input: {
   readonly implementerRequested?: string | null;
   /** Provider-reported model. A finished run without one is not submitted for QA. */
   readonly implementerActual?: string | null;
+  /** Provider revision. A full git id is the submitted commit. Anything else stays a named page. */
+  readonly revision?: string | null;
 }): Effect.Effect<KanbanMoveResult> =>
   Effect.gen(function* () {
     const queued =
@@ -658,7 +734,11 @@ const recordConfirmedRun = (input: {
                 generation: run.generation,
                 leaseId: run.leaseId,
                 claimedOutcome: claimText(input.summary, "The run finished."),
-                artifactRevision: { type: "named", kind: "page", id: "t3-result" },
+                artifactRevision: gitArtifact(input.revision) ?? {
+                  type: "named",
+                  kind: "page",
+                  id: "t3-result",
+                },
                 evidence: [{ kind: "readback", ref: evidenceRef(input.threadId) }],
               },
             },
@@ -881,7 +961,11 @@ export const layer = Layer.unwrap(
           projectId === null
             ? []
             : memory.ledger.graph.facts.filter((fact) => fact.projectId === projectId);
-        const steward = byTask.get(card.taskId) ?? [];
+        const steward = [...(byTask.get(card.taskId) ?? [])];
+        for (const notice of card.attention ?? []) {
+          if (steward.some((item) => item.noticeId === notice.noticeId)) continue;
+          steward.push(notice);
+        }
         // Drop a previous join. An empty list has to replace the field, or a
         // resolved conflict stays on the card.
         const { steward: _previousSteward, memoryFacts: _previousFacts, ...rest } = card;
@@ -913,6 +997,8 @@ export const layer = Layer.unwrap(
         readonly title: string | null;
         readonly threadId: string | null;
         readonly runId: string | null;
+        readonly qaRun?: AdapterBoardCard["qaRun"];
+        readonly attention?: AdapterBoardCard["attention"];
       },
     ) =>
       Effect.gen(function* () {
@@ -921,6 +1007,8 @@ export const layer = Layer.unwrap(
         if (outcome.changed) {
           const title = card?.title ?? fields.title;
           if (title === null) return "needs-title" as const;
+          const qaRun = fields.qaRun === undefined ? card?.qaRun : fields.qaRun;
+          const attention = fields.attention === undefined ? card?.attention : fields.attention;
           const stored = commitCard({
             taskId: fields.taskId,
             title,
@@ -929,6 +1017,8 @@ export const layer = Layer.unwrap(
             runId: fields.runId,
             revision: (card?.revision ?? 0) + 1,
             updatedAt: yield* stamped,
+            ...(attention === undefined || attention.length === 0 ? {} : { attention }),
+            ...(qaRun === undefined || qaRun === null ? {} : { qaRun }),
           });
           if (!stored) return "rejected" as const;
         }
@@ -957,11 +1047,12 @@ export const layer = Layer.unwrap(
         if (view === null || !("assignment" in state)) {
           return { state, book, changed, runId: null as string | null };
         }
+        const reported = withResolvedRevision(view);
         const planned = observationEvents({
           taskId,
           threadId,
           state,
-          view,
+          view: reported,
           allowLapse: view.status === "interrupted",
           workerId: state.assignment.workerId,
         });
@@ -1235,6 +1326,468 @@ export const layer = Layer.unwrap(
         );
       }
     });
+    const ROLES_FILE = "ai-os-roles.json";
+    const readRoles = (): Effect.Effect<RoleDefaultsFileV1> =>
+      fs.readFileString(path.join(config.stateDir, ROLES_FILE)).pipe(
+        Effect.orElseSucceed(() => ""),
+        Effect.flatMap((text) => {
+          if (text.trim().length === 0) return Effect.succeed({ projects: {} });
+          return decodeRoleDefaultsFile(readJson(text)).pipe(
+            Effect.orElseSucceed(() => ({ projects: {} })),
+          );
+        }),
+      );
+    const writeRoles = (file: RoleDefaultsFileV1) =>
+      Effect.gen(function* () {
+        const target = path.join(config.stateDir, ROLES_FILE);
+        const temporary = `${target}.${yield* crypto.randomUUIDv4()}.tmp`;
+        yield* fs
+          .writeFileString(temporary, encodeJson(file))
+          .pipe(Effect.tapError(() => fs.remove(temporary).pipe(Effect.ignore)));
+        yield* fs
+          .rename(temporary, target)
+          .pipe(Effect.tapError(() => fs.remove(temporary).pipe(Effect.ignore)));
+      });
+    const modelSlug = (model: { readonly model: string } | string): string =>
+      typeof model === "string" ? model : model.model;
+    const fitSession = (value: string, fallback: string): string => {
+      if (/^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(value) && value.length <= 128) return value;
+      return fallback.length <= 128 ? fallback : fallback.slice(0, 128);
+    };
+    const attemptIdFor = (taskId: string): string => {
+      const joined = `${taskId}-attempt-1`;
+      return joined.length <= 128 ? joined : `attempt-${taskId}`.slice(0, 128);
+    };
+    type LaunchedRun = {
+      readonly outcome: KanbanMoveResult;
+      readonly threadId: string | null;
+      readonly runId: string | null;
+    };
+    const launchBoardRun = (input: {
+      readonly state: BoardSequence;
+      readonly title: string;
+      readonly model: string;
+      readonly instanceId: string;
+      readonly idempotencyKey: string;
+      readonly promptSuffix: string;
+    }) =>
+      Effect.gen(function* () {
+        const projectId = projectIdOf(input.state);
+        if (projectId === null) {
+          return {
+            _tag: "No" as const,
+            detail: "This card has no project, so the run cannot be launched.",
+          };
+        }
+        const supplied = yield* suppliedForLaunch(
+          taskMemoryFile(config.stateDir),
+          input.state,
+        ).pipe(
+          Effect.map((value) => ({ _tag: "Ok" as const, value })),
+          Effect.catch((error) => Effect.succeed({ _tag: "No" as const, detail: error.message })),
+        );
+        if (supplied._tag === "No") return supplied;
+        const prompt =
+          input.promptSuffix.length === 0
+            ? supplied.value.prompt
+            : `${supplied.value.prompt}\n\n${input.promptSuffix}`;
+        const launched = yield* asRun(
+          runs.launch({
+            idempotencyKey: input.idempotencyKey,
+            projectId,
+            title: input.title,
+            prompt,
+            model: input.model,
+            instanceId: input.instanceId,
+            contextPackage: supplied.value.prepared.contextPackage,
+          }),
+        );
+        if (launched._tag === "No") return launched;
+        if (launched.value.runId === null) {
+          return {
+            _tag: "No" as const,
+            detail: "Launch did not return a run, so the card stays Ready.",
+          };
+        }
+        const confirmed = yield* asRun(
+          runs.confirmLaunch({
+            projectId,
+            threadId: launched.value.threadId,
+            runId: launched.value.runId,
+          }),
+        );
+        if (confirmed._tag === "No") return confirmed;
+        if (confirmed.value === "settled" && launched.value.disposition === "active") {
+          return {
+            _tag: "No" as const,
+            detail: "That run already stopped. Resume it before marking In Progress.",
+          };
+        }
+        const recorded = yield* commitSuppliedRead(
+          taskMemoryFile(config.stateDir),
+          supplied.value.prepared,
+          supplied.value.writeToken,
+        );
+        if (recorded._tag === "No") return recorded;
+        return { _tag: "Ok" as const, launched: launched.value };
+      });
+    const launchImplementation = (input: {
+      readonly queued: Extract<BoardSequence, { phase: "assigned" } | { phase: "rework" }>;
+      readonly title: string;
+      readonly book: KanbanMoveLedger;
+    }): Effect.Effect<LaunchedRun> =>
+      Effect.gen(function* () {
+        if (input.queued.assignment.instanceId === "antigravity") {
+          return {
+            outcome: rejectedMove(
+              "Antigravity does not run implementation tasks. The card stays Ready.",
+              input.queued,
+              input.book,
+            ),
+            threadId: null,
+            runId: null,
+          };
+        }
+        const opened = yield* launchBoardRun({
+          state: input.queued,
+          title: input.title,
+          model: modelSlug(input.queued.assignment.implementerModel),
+          instanceId: input.queued.assignment.instanceId ?? T3_LAUNCH_DEFAULTS.instanceId,
+          idempotencyKey: executionLaunchKey(
+            input.queued.assignment.taskId,
+            input.queued.assignment.attemptId,
+            executionGeneration(input.queued),
+          ),
+          promptSuffix: "",
+        });
+        if (opened._tag === "No") {
+          return {
+            outcome: rejectedMove(opened.detail, input.queued, input.book),
+            threadId: null,
+            runId: null,
+          };
+        }
+        const watched = yield* runs
+          .watchThread(opened.launched.threadId)
+          .pipe(Effect.catchTags({ BoardRunError: () => Effect.succeed(null) }));
+        const reported = watched === null ? null : withResolvedRevision(watched);
+        const outcome = yield* recordConfirmedRun({
+          state: input.queued,
+          taskId: input.queued.assignment.taskId,
+          threadId: opened.launched.threadId,
+          disposition: opened.launched.disposition,
+          summary: opened.launched.summary,
+          ledger: input.book,
+          memoryFile: taskMemoryFile(config.stateDir),
+          implementerRequested: reported?.requestedModel ?? null,
+          implementerActual: reported?.actualModel ?? null,
+          revision: reported?.revision ?? null,
+        });
+        return {
+          outcome,
+          threadId: opened.launched.threadId,
+          runId: opened.launched.runId,
+        };
+      });
+    type QaFollow = {
+      readonly outcome: KanbanMoveResult;
+      readonly qaRun: AdapterBoardCard["qaRun"];
+      readonly rejection: string | null;
+      readonly touched: boolean;
+    };
+    const keepQa = (outcome: KanbanMoveResult, qaRun: AdapterBoardCard["qaRun"]): QaFollow => ({
+      outcome,
+      qaRun: qaRun ?? null,
+      rejection: null,
+      touched: false,
+    });
+    const rawFindings = (value: unknown) => {
+      if (!Array.isArray(value)) return [];
+      const findings: Array<{
+        defect: string;
+        evidence: string;
+        expectedBehavior: string;
+      }> = [];
+      for (const item of value) {
+        if (!isRecord(item)) continue;
+        const { defect, evidence, expectedBehavior } = item;
+        if (
+          typeof defect !== "string" ||
+          typeof evidence !== "string" ||
+          typeof expectedBehavior !== "string" ||
+          defect.trim() !== defect ||
+          evidence.trim() !== evidence ||
+          expectedBehavior.trim() !== expectedBehavior ||
+          defect.length === 0 ||
+          evidence.length === 0 ||
+          expectedBehavior.length === 0
+        ) {
+          continue;
+        }
+        findings.push({ defect, evidence, expectedBehavior });
+      }
+      return findings;
+    };
+    const verdictForReview = (
+      state: Extract<BoardSequence, { phase: "awaiting_qa" }>,
+      text: string | null,
+      reviewerActual: string | null,
+    ) => {
+      const empty = { verdict: null, findings: rawFindings(null) };
+      if (text === null || text.trim().length === 0) return Effect.succeed(empty);
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(text);
+      } catch {
+        return Effect.succeed(empty);
+      }
+      const body = isRecord(parsed) && isRecord(parsed.qa) ? parsed.qa : parsed;
+      if (!isRecord(body)) return Effect.succeed(empty);
+      const findings = rawFindings(body.findings);
+      const actual = reviewerActual?.trim() ?? "";
+      // The reviewer fills the judgment. Ids, the implementer, and qaModel come from the run.
+      const merged = {
+        ...body,
+        version: "v1",
+        taskId: state.acknowledgment.taskId,
+        attemptId: state.assignment.attemptId,
+        artifactRevision: state.completion.artifactRevision,
+        implementerModel: modelSlug(
+          state.run.implementerRuntime?.actual ?? state.assignment.implementerModel,
+        ),
+        ...(actual.length > 0 ? { qaModel: actual } : {}),
+        ...(body.verdict === "accept"
+          ? { acceptedRevision: state.completion.artifactRevision }
+          : {}),
+      };
+      return decodeQaVerdictV1(merged).pipe(
+        Effect.map((verdict) => ({
+          verdict,
+          findings: verdict.availability === "available" ? [...verdict.findings] : findings,
+        })),
+        Effect.orElseSucceed(() => ({ verdict: null, findings })),
+      );
+    };
+    const qaPromptSuffix = (
+      state: Extract<BoardSequence, { phase: "awaiting_qa" }>,
+      sha: string,
+    ): string => {
+      const form = {
+        version: "v1",
+        taskId: state.acknowledgment.taskId,
+        attemptId: state.assignment.attemptId,
+        availability: "available",
+        implementerModel: modelSlug(
+          state.run.implementerRuntime?.actual ?? state.assignment.implementerModel,
+        ),
+        verdict: "rework",
+        artifactRevision: { type: "git", sha },
+        findings: [
+          {
+            defect: "Describe the defect.",
+            evidence: "Where you saw it.",
+            expectedBehavior: "What should be true.",
+          },
+        ],
+      };
+      return `Review this exact submitted revision: ${sha}
+Set verdict to rework or accept. For accept, findings may be empty.
+Reply with only this JSON.
+${encodeJson(form)}`;
+    };
+    const settleQaVerdict = (
+      outcome: KanbanMoveResult & { readonly _tag: "Applied" },
+      qaRun: NonNullable<AdapterBoardCard["qaRun"]>,
+      view: T3ThreadView,
+    ): Effect.Effect<QaFollow> =>
+      Effect.gen(function* () {
+        if (outcome.state.phase !== "awaiting_qa") return keepQa(outcome, qaRun);
+        const waiting = outcome.state;
+        const reviewed = yield* verdictForReview(waiting, view.text, view.actualModel ?? null);
+        const verdict = reviewed.verdict;
+        const holdFindings = (
+          findings: ReadonlyArray<{
+            defect: string;
+            evidence: string;
+            expectedBehavior: string;
+          }>,
+          attempted: "rework" | "accept",
+        ) => {
+          const stored =
+            attempted === "rework" && findings.length === 0
+              ? [
+                  {
+                    defect: "The QA run did not return a verdict.",
+                    evidence: "The reviewer reply was not a QA verdict.",
+                    expectedBehavior: "Reply with only the QA verdict JSON.",
+                  },
+                ]
+              : findings;
+          const fields = {
+            phase: "qa_incomplete" as const,
+            intake: waiting.intake,
+            acknowledgment: waiting.acknowledgment,
+            assignment: waiting.assignment,
+            completion: waiting.completion,
+            artifactRevision: waiting.completion.artifactRevision,
+            reworkRevision: waiting.reworkRevision,
+            reworkLedger: waiting.reworkLedger,
+            run: waiting.run,
+            commands: waiting.commands,
+            qaLabel: QA_INCOMPLETE_LABEL,
+          };
+          const decoded = (nextFindings: typeof stored, nextAttempted: "rework" | "accept") =>
+            decodeSequenceState({
+              ...fields,
+              findings: nextFindings,
+              attemptedVerdict: nextAttempted,
+            });
+          return decoded(stored, attempted).pipe(
+            Effect.catch(() =>
+              decoded(
+                [
+                  {
+                    defect: "The QA run did not return a verdict.",
+                    evidence: "The reviewer reply was not a QA verdict.",
+                    expectedBehavior: "Reply with only the QA verdict JSON.",
+                  },
+                ],
+                "rework",
+              ).pipe(Effect.orDie),
+            ),
+            Effect.map((state): QaFollow => ({
+              outcome: { ...outcome, state, changed: true },
+              qaRun,
+              rejection: null,
+              touched: true,
+            })),
+          );
+        };
+        if (verdict === null || verdict.availability !== "available") {
+          return yield* holdFindings(reviewed.findings, "rework");
+        }
+        const taskId = waiting.acknowledgment.taskId;
+        const reviewerActual = view.actualModel?.trim() ?? "";
+        const qaEvent = {
+          type: "qa" as const,
+          threadId: fitSession(qaRun.threadId, "qa-thread"),
+          runId: fitSession(qaRun.runId, "qa-run"),
+          qa: verdict,
+        };
+        const implementerActual = waiting.run.implementerRuntime?.actual ?? null;
+        if (reviewerActual.length === 0) {
+          const applied = yield* applyBoardWorkflowEvent(
+            waiting,
+            qaEvent,
+            `qa-auto-${taskId}-${qaRun.commitSha}`,
+            taskId,
+            outcome.ledger,
+          );
+          if (applied._tag !== "Applied" || applied.state.phase !== "qa_incomplete") {
+            return yield* holdFindings(verdict.findings, verdict.verdict);
+          }
+          return { outcome: { ...applied, changed: true }, qaRun, rejection: null, touched: true };
+        }
+        const runtime = yield* applyBoardWorkflowEvent(
+          waiting,
+          {
+            type: "record_runtime_models",
+            taskId,
+            attemptId: waiting.assignment.attemptId,
+            generation: waiting.run.generation,
+            leaseId: waiting.run.leaseId,
+            role: "reviewer",
+            requested:
+              (view.requestedModel?.trim() ?? "").length > 0
+                ? { model: view.requestedModel?.trim() ?? "" }
+                : null,
+            actual: { model: reviewerActual },
+          },
+          `runtime-qa-${taskId}-${waiting.run.generation}`,
+          taskId,
+          outcome.ledger,
+        );
+        if (implementerActual !== null && sameBaseModel(reviewerActual, implementerActual)) {
+          return yield* holdFindings(verdict.findings, verdict.verdict);
+        }
+        if (runtime._tag !== "Applied" || runtime.state.phase !== "awaiting_qa") {
+          return yield* holdFindings(verdict.findings, verdict.verdict);
+        }
+        const pending = yield* recordPendingVerdict(runtime.state, verdict).pipe(
+          Effect.map((state) => ({ _tag: "Ok" as const, state })),
+          Effect.catchTags({
+            ContractTransitionError: () => Effect.succeed({ _tag: "No" as const }),
+          }),
+        );
+        if (pending._tag === "No") {
+          return yield* holdFindings(verdict.findings, verdict.verdict);
+        }
+        // The verdict is on the card. Rework and delivery wait for a later step.
+        return {
+          outcome: {
+            _tag: "Applied" as const,
+            state: pending.state,
+            ledger: runtime.ledger,
+            changed: true,
+          },
+          qaRun,
+          rejection: null,
+          touched: true,
+        };
+      });
+    const startAutomaticQa = (
+      outcome: KanbanMoveResult,
+      qaRun: AdapterBoardCard["qaRun"],
+      title: string,
+    ): Effect.Effect<QaFollow> =>
+      Effect.gen(function* () {
+        if (outcome._tag !== "Applied" || outcome.state.phase !== "awaiting_qa") {
+          return keepQa(outcome, qaRun);
+        }
+        const waiting = outcome.state;
+        if (declaredTaskType(waiting.assignment) === "advisory") return keepQa(outcome, qaRun);
+        if (waiting.recordedVerdict !== undefined) return keepQa(outcome, qaRun);
+        if (qaRun?.settled === "rejected") return keepQa(outcome, qaRun);
+        const revision = waiting.completion.artifactRevision;
+        if (revision.type !== "git") return keepQa(outcome, qaRun);
+        const actual = waiting.run.implementerRuntime?.actual ?? null;
+        if (actual === null) return keepQa(outcome, qaRun);
+        let nextRun = qaRun ?? null;
+        if (nextRun === null) {
+          const roles = yield* readRoles();
+          const worker = qaWorkerFor(roles.projects[waiting.intake.projectId], actual);
+          if (worker === null) return keepQa(outcome, null);
+          const opened = yield* launchBoardRun({
+            state: waiting,
+            title: `${title} QA`,
+            model: modelSlug(worker.model),
+            instanceId: worker.instanceId,
+            idempotencyKey: `qa-${waiting.acknowledgment.taskId}-${revision.sha}`,
+            promptSuffix: qaPromptSuffix(waiting, revision.sha),
+          });
+          if (opened._tag === "No") return keepQa(outcome, null);
+          const qaRunId = opened.launched.runId;
+          if (qaRunId === null) return keepQa(outcome, null);
+          nextRun = {
+            threadId: opened.launched.threadId,
+            runId: qaRunId,
+            commitSha: revision.sha,
+          };
+        }
+        const view = yield* runs
+          .watchThread(nextRun.threadId)
+          .pipe(Effect.catchTags({ BoardRunError: () => Effect.succeed(null) }));
+        if (view === null || view.status !== "completed") {
+          const started = qaRun == null;
+          return {
+            outcome: { ...outcome, changed: outcome.changed || started },
+            qaRun: nextRun,
+            rejection: null,
+            touched: started,
+          };
+        }
+        return yield* settleQaVerdict(outcome, nextRun, view);
+      });
     const move = Effect.gen(function* () {
       yield* authorize(AuthOrchestrationOperateScope);
       const request = yield* HttpServerRequest.HttpServerRequest;
@@ -1454,90 +2007,14 @@ export const layer = Layer.unwrap(
                         },
                       );
                     }
-                    if (queued.assignment.instanceId === "antigravity") {
-                      return rejectedMove(
-                        "Antigravity does not run implementation tasks. The card stays Ready.",
-                        queued,
-                        ledger,
-                      );
-                    }
-                    const supplied = yield* suppliedForLaunch(
-                      taskMemoryFile(config.stateDir),
+                    const launched = yield* launchImplementation({
                       queued,
-                    ).pipe(
-                      Effect.map((value) => ({ _tag: "Ok" as const, value })),
-                      Effect.catch((error) =>
-                        Effect.succeed({ _tag: "No" as const, detail: error.message }),
-                      ),
-                    );
-                    if (supplied._tag === "No")
-                      return rejectedMove(supplied.detail, queued, ledger);
-                    const launched = yield* asRun(
-                      runs.launch({
-                        idempotencyKey: executionLaunchKey(
-                          taskId,
-                          queued.assignment.attemptId,
-                          executionGeneration(queued),
-                        ),
-                        projectId,
-                        title: card.title,
-                        prompt: supplied.value.prompt,
-                        model: queued.assignment.implementerModel.model,
-                        instanceId: queued.assignment.instanceId ?? T3_LAUNCH_DEFAULTS.instanceId,
-                        contextPackage: supplied.value.prepared.contextPackage,
-                      }),
-                    );
-                    if (launched._tag === "No") {
-                      return rejectedMove(launched.detail, queued, ledger);
-                    }
-                    const runId = launched.value.runId;
-                    if (runId === null) {
-                      return rejectedMove(
-                        "Launch did not return a run, so the card stays Ready.",
-                        queued,
-                        ledger,
-                      );
-                    }
-                    const confirmed = yield* asRun(
-                      runs.confirmLaunch({
-                        projectId,
-                        threadId: launched.value.threadId,
-                        runId,
-                      }),
-                    );
-                    if (confirmed._tag === "No") {
-                      return rejectedMove(confirmed.detail, queued, ledger);
-                    }
-                    if (confirmed.value === "settled" && launched.value.disposition === "active") {
-                      return rejectedMove(
-                        "That run already stopped. Resume it before marking In Progress.",
-                        queued,
-                        ledger,
-                      );
-                    }
-                    const recorded = yield* commitSuppliedRead(
-                      taskMemoryFile(config.stateDir),
-                      supplied.value.prepared,
-                      supplied.value.writeToken,
-                    );
-                    if (recorded._tag === "No")
-                      return rejectedMove(recorded.detail, queued, ledger);
-                    launchedThread = launched.value.threadId;
-                    launchedRun = runId;
-                    const watched = yield* runs
-                      .watchThread(launched.value.threadId)
-                      .pipe(Effect.catchTags({ BoardRunError: () => Effect.succeed(null) }));
-                    return yield* recordConfirmedRun({
-                      state: queued,
-                      taskId,
-                      threadId: launched.value.threadId,
-                      disposition: launched.value.disposition,
-                      summary: launched.value.summary,
-                      ledger,
-                      memoryFile: taskMemoryFile(config.stateDir),
-                      implementerRequested: watched?.requestedModel ?? null,
-                      implementerActual: watched?.actualModel ?? null,
+                      title: card.title,
+                      book: ledger,
                     });
+                    if (launched.threadId !== null) launchedThread = launched.threadId;
+                    if (launched.runId !== null) launchedRun = launched.runId;
+                    return launched.outcome;
                   })
                 : asked._tag === "NeedsRecover"
                   ? yield* Effect.gen(function* () {
@@ -1669,18 +2146,22 @@ export const layer = Layer.unwrap(
                   : asked;
           const followed = yield* followLaunched(outcome, taskId, launchedThread, launchedRun);
           if (followed.outcome._tag !== "Applied") return json(409, publicMove(followed.outcome));
-          const saved = yield* persistApplied(followed.outcome, card, {
+          const qa = yield* startAutomaticQa(followed.outcome, card.qaRun ?? null, card.title);
+          if (qa.outcome._tag !== "Applied") return json(409, publicMove(qa.outcome));
+          const saved = yield* persistApplied(qa.outcome, card, {
             taskId,
             title: card.title,
             threadId: launchedThread,
             runId: followed.runId,
+            ...(qa.touched ? { qaRun: qa.qaRun } : {}),
           });
           if (saved !== "stored") {
             return json(500, { detail: "The workflow state could not be stored." });
           }
+          if (qa.rejection !== null) return json(409, { _tag: "Rejected", detail: qa.rejection });
           return json(200, {
-            ...publicMove(followed.outcome),
-            revision: (card.revision ?? 0) + (followed.outcome.changed ? 1 : 0),
+            ...publicMove(qa.outcome),
+            revision: (card.revision ?? 0) + (qa.outcome.changed ? 1 : 0),
           });
         }),
       );
@@ -1974,17 +2455,25 @@ export const layer = Layer.unwrap(
                   prepared !== null && prepared._tag === "Ready" ? prepared.book : ledger,
                 );
           if (outcome._tag !== "Applied") return json(409, publicMove(outcome));
-          const saved = yield* persistApplied(outcome, card, {
+          const qa = yield* startAutomaticQa(
+            outcome,
+            card?.qaRun ?? null,
+            card?.title ?? stringField(body, "title") ?? taskId,
+          );
+          if (qa.outcome._tag !== "Applied") return json(409, publicMove(qa.outcome));
+          const saved = yield* persistApplied(qa.outcome, card, {
             taskId,
             title: stringField(body, "title"),
             threadId,
             runId,
+            ...(qa.touched ? { qaRun: qa.qaRun } : {}),
           });
           if (saved === "needs-title") return json(400, { detail: "A new task needs a title." });
           if (saved !== "stored") return json(400, { detail: "The task could not be stored." });
+          if (qa.rejection !== null) return json(409, { _tag: "Rejected", detail: qa.rejection });
           return json(200, {
-            ...publicMove(outcome),
-            revision: (card?.revision ?? 0) + (outcome.changed ? 1 : 0),
+            ...publicMove(qa.outcome),
+            revision: (card?.revision ?? 0) + (qa.outcome.changed ? 1 : 0),
           });
         }),
       );
@@ -2021,18 +2510,55 @@ export const layer = Layer.unwrap(
               fresh.threadId,
               fresh.runId ?? null,
             );
-            if (followed.outcome._tag !== "Applied" || !followed.outcome.changed) return;
-            yield* persistApplied(followed.outcome, fresh, {
+            if (followed.outcome._tag !== "Applied") return;
+            const qa = yield* startAutomaticQa(followed.outcome, fresh.qaRun ?? null, fresh.title);
+            if (qa.outcome._tag !== "Applied") return;
+            if (!followed.outcome.changed && !qa.touched) return;
+            yield* persistApplied(qa.outcome, fresh, {
               taskId: fresh.taskId,
               title: fresh.title,
               threadId: fresh.threadId,
               runId: followed.runId,
+              ...(qa.touched ? { qaRun: qa.qaRun } : {}),
+            });
+          }),
+        );
+      }
+    });
+    const followQa = Effect.gen(function* () {
+      const open = cardsNow().filter(
+        (card) =>
+          card.state.phase === "awaiting_qa" &&
+          card.state.recordedVerdict === undefined &&
+          card.qaRun?.settled !== "rejected",
+      );
+      for (const card of open) {
+        yield* writes.withPermits(1)(
+          Effect.gen(function* () {
+            const fresh = cardsNow().find((item) => item.taskId === card.taskId);
+            if (fresh === undefined || fresh.state.phase !== "awaiting_qa") return;
+            if (fresh.state.recordedVerdict !== undefined || fresh.qaRun?.settled === "rejected") {
+              return;
+            }
+            const qa = yield* startAutomaticQa(
+              { _tag: "Applied", state: fresh.state, changed: false, ledger },
+              fresh.qaRun ?? null,
+              fresh.title,
+            );
+            if (!qa.touched || qa.outcome._tag !== "Applied") return;
+            yield* persistApplied(qa.outcome, fresh, {
+              taskId: fresh.taskId,
+              title: fresh.title,
+              threadId: fresh.threadId,
+              runId: fresh.runId ?? null,
+              qaRun: qa.qaRun,
             });
           }),
         );
       }
     });
     const followLoop = followExecuting.pipe(
+      Effect.andThen(followQa),
       Effect.andThen(settleOpenAdvisory),
       Effect.catch(() => Effect.void),
       Effect.andThen(Effect.sleep(BOARD_FOLLOW_INTERVAL)),
@@ -2217,6 +2743,230 @@ export const layer = Layer.unwrap(
         ),
       ),
     );
+    const saveRoles = Effect.gen(function* () {
+      yield* authorize(AuthOrchestrationOperateScope);
+      const request = yield* HttpServerRequest.HttpServerRequest;
+      const text = yield* request.text.pipe(Effect.orElseSucceed(() => ""));
+      const decoded = yield* decodeRolePost(readJson(text)).pipe(
+        Effect.map((value) => ({ _tag: "Ok" as const, value })),
+        Effect.catch(() => Effect.succeed({ _tag: "Bad" as const })),
+      );
+      if (decoded._tag === "Bad")
+        return json(400, { detail: "Expected a project and its role workers." });
+      return yield* writes.withPermits(1)(
+        Effect.gen(function* () {
+          const current = yield* readRoles();
+          const previous = current.projects[decoded.value.projectId];
+          const next = {
+            ...previous,
+            ...(decoded.value.implementer === undefined
+              ? {}
+              : { implementer: decoded.value.implementer }),
+            ...(decoded.value.qa === undefined ? {} : { qa: decoded.value.qa }),
+          };
+          yield* writeRoles({
+            projects: { ...current.projects, [decoded.value.projectId]: next },
+          });
+          return json(200, { projectId: decoded.value.projectId });
+        }),
+      );
+    }).pipe(
+      Effect.catchTags(authResponse),
+      Effect.catch((cause) =>
+        failEnvironmentInternal("internal_error", cause).pipe(
+          Effect.catchTags({
+            EnvironmentInternalError: (error) => HttpServerRespondable.toResponse(error),
+          }),
+        ),
+      ),
+    );
+    const requestTask = Effect.gen(function* () {
+      yield* authorize(AuthOrchestrationOperateScope);
+      const request = yield* HttpServerRequest.HttpServerRequest;
+      const text = yield* request.text.pipe(Effect.orElseSucceed(() => ""));
+      const decoded = yield* decodeRequestPost(readJson(text)).pipe(
+        Effect.map((value) => ({ _tag: "Ok" as const, value })),
+        Effect.catch(() => Effect.succeed({ _tag: "Bad" as const })),
+      );
+      if (decoded._tag === "Bad") {
+        return json(400, {
+          detail: "Expected taskId, title, idempotencyKey, repoCommit, and intake.",
+        });
+      }
+      const body = decoded.value;
+      return yield* writes.withPermits(1)(
+        Effect.gen(function* () {
+          const existing = cardsNow().find((card) => card.taskId === body.taskId);
+          let book = ledger;
+          let card = existing;
+          let state: BoardSequence;
+          if (existing === undefined) {
+            const opened = yield* openBoardTask(
+              { type: "intake", intake: body.intake },
+              body.idempotencyKey,
+              body.taskId,
+              book,
+            );
+            if (opened._tag !== "Applied") return json(409, publicMove(opened));
+            const ready = yield* requestKanbanMove(opened.state, {
+              taskId: body.taskId,
+              column: "Ready",
+              idempotencyKey: `${body.idempotencyKey}-ready`,
+              confirmed: true,
+              at: yield* stamped,
+              ledger: opened.ledger,
+            });
+            if (ready._tag !== "Applied") return json(409, publicMove(ready));
+            state = ready.state;
+            book = ready.ledger;
+          } else {
+            const stored = yield* decodeState(existing.state);
+            if (stored._tag === "Bad")
+              return json(500, { detail: "The stored task state is invalid." });
+            state = stored.state;
+          }
+          let attention = card?.attention;
+          if (state.phase === "acknowledged") {
+            const roles = yield* readRoles();
+            const worker = eligibleImplementer(roles.projects[state.intake.projectId]);
+            if (worker === null) {
+              attention = [needsWorkerNotice(state.intake.projectId, body.taskId)];
+              const saved = yield* persistApplied(
+                { _tag: "Applied", state, ledger: book, changed: true },
+                card,
+                {
+                  taskId: body.taskId,
+                  title: card?.title ?? body.title,
+                  threadId: card?.threadId ?? null,
+                  runId: card?.runId ?? null,
+                  attention,
+                },
+              );
+              if (saved !== "stored") return json(400, { detail: "The task could not be stored." });
+              return json(200, { _tag: "NeedsYou", detail: attention[0]?.summary ?? "" });
+            }
+            const createdAt = yield* stamped;
+            const assignment = yield* decodeAssignmentV1({
+              version: "v1",
+              taskId: body.taskId,
+              attemptId: attemptIdFor(body.taskId),
+              assignmentId: attemptIdFor(body.taskId).replace("-attempt-1", "-assignment-1"),
+              workerId: worker.workerId,
+              implementerModel: worker.model,
+              instanceId: worker.instanceId,
+              role: "implementer",
+              taskType: "implementation",
+              scope: state.intake.request,
+              contextPackage: {
+                requirements: state.intake.request,
+                memoryVersions: [],
+                repoCommit: body.repoCommit,
+                authorizationScope: state.intake.authorization.scope,
+                createdAt,
+              },
+            }).pipe(
+              Effect.map((value) => ({ _tag: "Ok" as const, value })),
+              Effect.catch(() => Effect.succeed({ _tag: "Bad" as const })),
+            );
+            if (assignment._tag === "Bad") {
+              return json(400, { detail: "The configured implementer is not a valid assignment." });
+            }
+            const assigned = yield* applyBoardWorkflowEvent(
+              state,
+              { type: "assign", assignment: assignment.value },
+              `${body.idempotencyKey}-assign`,
+              body.taskId,
+              book,
+            );
+            if (assigned._tag !== "Applied" || assigned.state.phase !== "assigned") {
+              return json(409, publicMove(assigned));
+            }
+            state = assigned.state;
+            book = assigned.ledger;
+            attention = [];
+          }
+          let threadId = card?.threadId ?? null;
+          let runId = card?.runId ?? null;
+          let outcome: KanbanMoveResult = {
+            _tag: "Applied",
+            state,
+            ledger: book,
+            changed: existing === undefined || state.phase === "assigned",
+          };
+          if (state.phase === "assigned" || state.phase === "rework") {
+            const launched = yield* launchImplementation({
+              queued: state,
+              title: card?.title ?? body.title,
+              book,
+            });
+            if (launched.threadId !== null) threadId = launched.threadId;
+            if (launched.runId !== null) runId = launched.runId;
+            if (launched.outcome._tag !== "Applied") {
+              yield* persistApplied(
+                {
+                  _tag: "Applied",
+                  state: launched.outcome.state,
+                  ledger: launched.outcome.ledger,
+                  changed: true,
+                },
+                card,
+                {
+                  taskId: body.taskId,
+                  title: card?.title ?? body.title,
+                  threadId,
+                  runId,
+                  attention,
+                },
+              );
+              return json(409, publicMove(launched.outcome));
+            }
+            const followed = yield* followLaunched(launched.outcome, body.taskId, threadId, runId);
+            outcome = followed.outcome;
+            runId = followed.runId ?? runId;
+          } else {
+            outcome = { ...outcome, changed: existing === undefined };
+          }
+          if (outcome._tag !== "Applied") return json(409, publicMove(outcome));
+          const qa = yield* startAutomaticQa(
+            outcome,
+            card?.qaRun ?? null,
+            card?.title ?? body.title,
+          );
+          if (qa.outcome._tag !== "Applied") return json(409, publicMove(qa.outcome));
+          if (existing !== undefined && !qa.outcome.changed && !qa.touched) {
+            return json(200, {
+              _tag: "Applied",
+              changed: false,
+              revision: existing.revision ?? 0,
+            });
+          }
+          const saved = yield* persistApplied(qa.outcome, card, {
+            taskId: body.taskId,
+            title: card?.title ?? body.title,
+            threadId,
+            runId,
+            attention,
+            ...(qa.touched ? { qaRun: qa.qaRun } : {}),
+          });
+          if (saved === "needs-title") return json(400, { detail: "A new task needs a title." });
+          if (saved !== "stored") return json(400, { detail: "The task could not be stored." });
+          if (qa.rejection !== null) return json(409, { _tag: "Rejected", detail: qa.rejection });
+          return json(200, {
+            ...publicMove(qa.outcome),
+            revision: (card?.revision ?? 0) + (qa.outcome.changed ? 1 : 0),
+          });
+        }),
+      );
+    }).pipe(
+      Effect.catchTags(authResponse),
+      Effect.catch((cause) =>
+        failEnvironmentInternal("internal_error", cause).pipe(
+          Effect.catchTags({
+            EnvironmentInternalError: (error) => HttpServerRespondable.toResponse(error),
+          }),
+        ),
+      ),
+    );
     return Layer.mergeAll(
       HttpRouter.add("GET", ADAPTER_BOARD_PATH, snapshot),
       HttpRouter.add("POST", ADAPTER_BOARD_PATH, replace),
@@ -2227,6 +2977,8 @@ export const layer = Layer.unwrap(
       HttpRouter.add("POST", ADAPTER_MEMORY_SUPPLY_PATH, supplyMemory),
       HttpRouter.add("POST", ADAPTER_MEMORY_COMMIT_PATH, commitMemory),
       HttpRouter.add("POST", ADAPTER_MEMORY_WRITE_PATH, writeMemory),
+      HttpRouter.add("POST", ADAPTER_ROLES_PATH, saveRoles),
+      HttpRouter.add("POST", ADAPTER_REQUEST_PATH, requestTask),
       HttpRouter.add("GET", ADAPTER_ANTIGRAVITY_MODELS_PATH, models),
       Layer.effectDiscard(
         Effect.gen(function* () {

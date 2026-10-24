@@ -396,6 +396,8 @@ export const AwaitingQaState = Schema.Struct({
   reworkLedger: ReworkLedgerV1,
   run: RunV1,
   commands: Schema.Array(AppliedCommandV1),
+  // A verdict that passed the independence check. The phase stays here until routing.
+  recordedVerdict: Schema.optionalKey(Schema.Union([QaReworkV1, QaAcceptV1])),
 }).check(
   Schema.makeFilter((state) => {
     const match = payloadMatches(state.acknowledgment, state.assignment, state.completion);
@@ -413,6 +415,15 @@ export const AwaitingQaState = Schema.Struct({
       sameRevision(state.completion.artifactRevision, state.reworkRevision)
     ) {
       return "The submitted revision was already sent back for rework.";
+    }
+    if (state.recordedVerdict !== undefined) {
+      if (
+        !sameRevision(state.recordedVerdict.artifactRevision, state.completion.artifactRevision)
+      ) {
+        return "QA is bound to the exact revision in the completion submission.";
+      }
+      const checked = independentQa(state.run, state.recordedVerdict);
+      if (checked !== true) return checked.detail;
     }
     return workerRecordMatchesRun(state.run, state.completion);
   }),
@@ -2110,6 +2121,61 @@ const invalidPayload = (state: unknown, event: unknown, detail: string) =>
 
 export const decodeSequenceEvent = Schema.decodeUnknownEffect(SequenceEvent, strictParse);
 export const decodeSequenceState = Schema.decodeUnknownEffect(SequenceState, strictParse);
+
+/**
+ * Store a verdict that already passed the independence check.
+ * The phase stays `awaiting_qa`. Rework, escalation, and delivery are not applied here.
+ */
+export const recordPendingVerdict = (
+  state: SequenceState,
+  verdict: QaVerdictV1,
+): Effect.Effect<SequenceState, ContractTransitionError> => {
+  const fail = (reason: ContractErrorReason, detail: string) =>
+    Effect.fail(
+      new ContractTransitionError({
+        contract: "qa",
+        reason,
+        from: state.phase,
+        event: "qa",
+        detail,
+      }),
+    );
+  if (state.phase !== "awaiting_qa") {
+    return fail("illegal_transition", `Cannot record a QA verdict from ${state.phase}.`);
+  }
+  if (verdict.availability !== "available") {
+    return fail("illegal_transition", "An unavailable review is not a QA verdict.");
+  }
+  if (
+    state.acknowledgment.taskId !== verdict.taskId ||
+    state.assignment.attemptId !== verdict.attemptId
+  ) {
+    return fail("task_mismatch", "The verdict does not match this task.");
+  }
+  if (!sameRevision(verdict.artifactRevision, state.completion.artifactRevision)) {
+    return fail(
+      "acceptance_revision_mismatch",
+      "QA is bound to the exact revision in the completion submission.",
+    );
+  }
+  const checked = independentQa(state.run, verdict);
+  if (checked !== true) {
+    return fail(checked.reason, checked.detail);
+  }
+  if (state.recordedVerdict !== undefined) return Effect.succeed(state);
+  return decodeSequenceState({ ...state, recordedVerdict: verdict }).pipe(
+    Effect.mapError(
+      () =>
+        new ContractTransitionError({
+          contract: "qa",
+          reason: "invalid_payload",
+          from: state.phase,
+          event: "qa",
+          detail: "The QA verdict does not match the run.",
+        }),
+    ),
+  );
+};
 
 export const applySequenceEvent = (
   state: unknown,

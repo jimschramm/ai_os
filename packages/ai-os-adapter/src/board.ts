@@ -19,6 +19,8 @@ export const ADAPTER_MEMORY_RESOLVE_PATH = "/api/ai-os/memory/resolve";
 export const ADAPTER_MEMORY_SUPPLY_PATH = "/api/ai-os/memory/supply";
 export const ADAPTER_MEMORY_COMMIT_PATH = "/api/ai-os/memory/commit";
 export const ADAPTER_MEMORY_WRITE_PATH = "/api/ai-os/memory/write";
+export const ADAPTER_ROLES_PATH = "/api/ai-os/roles";
+export const ADAPTER_REQUEST_PATH = "/api/ai-os/request";
 
 export interface AdapterBoardCard {
   readonly taskId: string;
@@ -34,6 +36,18 @@ export interface AdapterBoardCard {
   readonly steward?: readonly StewardNoticeV1[];
   /** Accepted and proposed facts for this card's project. The drawer reads these. */
   readonly memoryFacts?: readonly MemoryFactV1[];
+  /**
+   * Notices that stay on this card across steward joins.
+   * The Needs you list reads them from `steward` after the join.
+   */
+  readonly attention?: readonly StewardNoticeV1[];
+  /** The QA run for the submitted revision. Absent until QA starts. */
+  readonly qaRun?: {
+    readonly threadId: string;
+    readonly runId: string;
+    readonly commitSha: string;
+    readonly settled?: "rejected";
+  } | null;
 }
 
 // State stays unknown here on purpose. Decoding the sequence schema would pull
@@ -50,6 +64,17 @@ const BoardCards = Schema.Array(
     attempts: Schema.optional(Schema.Array(Schema.Unknown)),
     steward: Schema.optional(Schema.Array(Schema.Unknown)),
     memoryFacts: Schema.optional(Schema.Array(Schema.Unknown)),
+    attention: Schema.optional(Schema.Array(Schema.Unknown)),
+    qaRun: Schema.optional(
+      Schema.NullOr(
+        Schema.Struct({
+          threadId: Schema.String,
+          runId: Schema.String,
+          commitSha: Schema.String,
+          settled: Schema.optional(Schema.Literal("rejected")),
+        }),
+      ),
+    ),
   }),
 );
 

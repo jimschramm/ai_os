@@ -139,6 +139,8 @@ export interface T3ThreadView {
   readonly actualModel?: string | null;
   /** Project that owns the thread. Absent when the lookup did not read one. */
   readonly projectId?: string | null;
+  /** Workspace whose git refs include this thread's checkpoint. Absent when the scope was not read. */
+  readonly cwd?: string | null;
 }
 
 export interface T3ContinueRequest {
@@ -282,7 +284,9 @@ export const threadViewFromProjection = (
   const assistant = projection.messages.findLast(
     (message) => message.role === "assistant" && message.text.length > 0,
   );
-  const revision = projection.checkpoints.at(-1)?.ref ?? null;
+  const checkpoint = projection.checkpoints.at(-1);
+  const scope = projection.checkpointScopes?.find((item) => item.id === checkpoint?.scopeId);
+  const revision = checkpoint?.ref ?? null;
   const usage = projection.providerTurns.at(-1)?.tokenUsage;
   const requested = run?.modelSelection.model.trim() ?? "";
   const reported = projection.providerSessions.at(-1)?.model?.trim() ?? "";
@@ -295,6 +299,7 @@ export const threadViewFromProjection = (
     requestedModel: requested.length > 0 ? requested : null,
     actualModel: reported.length > 0 ? reported : null,
     projectId: projection.thread.projectId,
+    ...(scope?.cwd === undefined ? {} : { cwd: scope.cwd }),
     ...(usage?.inputTokens === undefined ? {} : { inputTokens: usage.inputTokens }),
     ...(usage?.outputTokens === undefined ? {} : { outputTokens: usage.outputTokens }),
   };
@@ -731,10 +736,7 @@ export const wsT3LocalClient = (options: T3ClientOptions): T3LocalClient => {
       Effect.gen(function* () {
         const response = yield* responseFor(() =>
           HttpClientRequest.post(`${origin}${path}`).pipe(
-            HttpClientRequest.bodyText(
-              encodeUnknownJson(body),
-              "application/json",
-            ),
+            HttpClientRequest.bodyText(encodeUnknownJson(body), "application/json"),
           ),
         );
         const text = yield* response.text;
