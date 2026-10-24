@@ -278,4 +278,21 @@ it.layer(NodeServices.layer)("migrate-dev-db", (it) => {
       assert.equal(error._tag, "MigrateDevDbSharedHomeError");
     }),
   );
+
+  it.effect("refuses to rebuild T3 Code's home when it is not the ai_os home", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const sourceDir = yield* fs.makeTempDirectoryScoped({ prefix: "migrate-dev-db-t3-src-" });
+      const t3CodeHome = yield* fs.makeTempDirectoryScoped({ prefix: "migrate-dev-db-t3-home-" });
+      const source = yield* createFixtureSource(sourceDir);
+
+      const error = yield* runMigrateDevDb(
+        { baseDir: t3CodeHome, source, projects: 5, threadsPerProject: 10 },
+        { sharedHome: sourceDir, t3CodeHome },
+      ).pipe(Effect.flip);
+      assert.equal(error._tag, "MigrateDevDbSharedHomeError");
+      assert.equal(yield* fs.exists(path.join(t3CodeHome, "userdata", "statev2.sqlite")), false);
+    }),
+  );
 });

@@ -214,4 +214,131 @@ describe("operations kanban moves", () => {
     ).not.toContain("Live hero");
     expect(document.querySelector('[role="alert"]')?.textContent).toMatch(/different model/);
   });
+
+  it("shows advisory findings apart from QA and sends the chosen model", async () => {
+    const bodies: Array<{ readonly model?: string }> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init?: RequestInit) => {
+        if (String(url).includes("/antigravity/models")) {
+          return new Response(
+            JSON.stringify({
+              source: "unverified",
+              models: [{ slug: "gemini-4-argon-high", label: "gemini-4-argon-high" }],
+              detail: "The CLI did not list models.",
+            }),
+            { status: 200 },
+          );
+        }
+        bodies.push(JSON.parse(String(init?.body)) as { readonly model?: string });
+        return new Response(JSON.stringify({ _tag: "Applied" }), { status: 200 });
+      }),
+    );
+    const sample = hero();
+    applyAdapterBoardPayload(
+      encodeAdapterBoard([
+        {
+          taskId: "task-agy",
+          title: "Advisory page",
+          state: {
+            phase: "review_delivered",
+            intake: sample.intake,
+            assignment: {
+              ...sample.assignment,
+              instanceId: "antigravity",
+              role: "advisory",
+              taskType: "advisory",
+            },
+            run: {
+              usage: [],
+              progress: null,
+              advisory: {
+                commit: "c".repeat(40),
+                model: {
+                  requested: { model: "gemini-4-argon-high" },
+                  actual: null,
+                  unverified: true,
+                },
+                findings: [
+                  {
+                    files: ["src/page.tsx"],
+                    evidence: "The page lists Saturday only.",
+                    suggestedAction: "Add Sunday to the schedule.",
+                  },
+                ],
+                artifacts: [],
+              },
+            },
+            completion: sample.completion ?? null,
+            qa: null,
+          } as unknown as AdapterBoardCard["state"],
+          threadId: null,
+          runId: null,
+          revision: 3,
+          updatedAt: "2026-10-21T18:00:00Z",
+        },
+        {
+          taskId: "task-agy-ready",
+          title: "Choose a model",
+          state: {
+            phase: "assigned",
+            intake: sample.intake,
+            assignment: {
+              ...sample.assignment,
+              instanceId: "antigravity",
+              role: "advisory",
+              taskType: "advisory",
+            },
+            heldRun: null,
+          } as unknown as AdapterBoardCard["state"],
+          threadId: null,
+          runId: null,
+          revision: 2,
+          updatedAt: "2026-10-21T18:00:00Z",
+        },
+      ]),
+    );
+    await act(() =>
+      root.render(
+        <StrictMode>
+          <OperationsDashboard />
+        </StrictMode>,
+      ),
+    );
+    const open = (title: string) => {
+      const button = [...document.querySelectorAll("button")].find((item) =>
+        item.textContent?.includes(title),
+      );
+      if (!(button instanceof HTMLButtonElement)) throw new Error(`Missing card ${title}`);
+      return button;
+    };
+    await act(async () => {
+      open("Advisory page").click();
+    });
+    const advisory = document.querySelector("#advisory-heading")?.closest("section");
+    expect(advisory?.textContent).toContain("Review delivered");
+    expect(advisory?.textContent).toContain("do not replace independent QA");
+    expect(advisory?.textContent).toContain("The page lists Saturday only.");
+    expect(advisory?.textContent).toContain("CLI did not report");
+    expect(advisory?.textContent).toContain("unverified");
+    const qa = document.querySelector("#qa-heading")?.closest("section");
+    expect(qa?.textContent).toContain("0 findings");
+    await act(async () => {
+      open("Choose a model").click();
+    });
+    const field = () => document.querySelector("#antigravity-model-task-agy-ready");
+    await expect
+      .poll(() => {
+        const input = field();
+        return input instanceof HTMLInputElement ? input.value : "";
+      })
+      .toBe("gemini-4-argon-high");
+    expect(field()?.closest("div")?.textContent).toContain("unverified");
+    await act(async () => {
+      [...document.querySelectorAll("button")]
+        .find((item) => item.textContent === "Run advisory review")
+        ?.click();
+    });
+    expect(bodies.at(-1)?.model).toBe("gemini-4-argon-high");
+  });
 });

@@ -139,4 +139,33 @@ it.layer(NodeServices.layer)("t3-sqlite-state", (it) => {
         assert.equal(aliasError._tag, "SqliteStateSharedHomeMutationError");
       }),
   );
+
+  it.effect("refuses to mutate T3 Code's home when it is not the ai_os home", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const t3CodeHome = yield* fs.makeTempDirectoryScoped({ prefix: "t3-sqlite-state-t3-" });
+      const aiOsHome = yield* fs.makeTempDirectoryScoped({ prefix: "t3-sqlite-state-aios-" });
+      yield* createFixtureDatabase(t3CodeHome);
+
+      const error = yield* runSqliteState(
+        {
+          operation: "exec",
+          baseDir: t3CodeHome,
+          sql: "DELETE FROM fixtures",
+        },
+        { sharedHome: aiOsHome, t3CodeHome },
+      ).pipe(Effect.flip);
+      assert.equal(error._tag, "SqliteStateSharedHomeMutationError");
+
+      const stillThere = yield* runSqliteState({
+        operation: "query",
+        baseDir: t3CodeHome,
+        sql: "SELECT label FROM fixtures",
+      });
+      assert.equal(stillThere.operation, "query");
+      if (stillThere.operation === "query") {
+        assert.deepStrictEqual(stillThere.rows, [{ label: "existing" }]);
+      }
+    }),
+  );
 });

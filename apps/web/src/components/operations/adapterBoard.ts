@@ -1,5 +1,6 @@
 import type { AdapterBoardCard } from "@t3tools/ai-os-adapter/board";
 import {
+  QA_INCOMPLETE_LABEL,
   RECOVERY_PENDING_LABEL,
   REWORK_CAP_LABEL,
   type SequenceState,
@@ -11,6 +12,7 @@ import { tasksForProject } from "./model";
 const completionOf = (state: SequenceState) => {
   switch (state.phase) {
     case "awaiting_qa":
+    case "qa_incomplete":
     case "rework":
     case "rework_capped":
     case "accepted":
@@ -36,10 +38,12 @@ const runOf = (state: SequenceState) => {
   switch (state.phase) {
     case "executing":
     case "awaiting_qa":
+    case "qa_incomplete":
     case "rework":
     case "rework_capped":
     case "accepted":
     case "recovery_pending":
+    case "review_delivered":
     case "failed":
       return state.run;
     case "assigned":
@@ -77,23 +81,31 @@ const taskFromAdapterCard = (card: AdapterBoardCard): OperationsTask | null => {
             nextAction: "Read the T3 thread, then resume or take over.",
             actionLabel: "Resume",
           }
-        : state.phase === "failed"
+        : state.phase === "qa_incomplete"
           ? {
-              id: `${card.taskId}-failed`,
+              id: `${card.taskId}-qa-incomplete`,
               kind: "blocker" as const,
-              summary: state.blocker.summary,
-              nextAction: state.blocker.nextAction,
-              actionLabel: "I'll take it",
+              summary: QA_INCOMPLETE_LABEL,
+              nextAction: "Send the review to a verified reviewer on a different model.",
+              actionLabel: "Route review",
             }
-          : progressBlocker === undefined
-            ? null
-            : {
-                id: `${card.taskId}-progress-block`,
+          : state.phase === "failed"
+            ? {
+                id: `${card.taskId}-failed`,
                 kind: "blocker" as const,
-                summary: progressBlocker.summary,
-                nextAction: progressBlocker.nextAction,
+                summary: state.blocker.summary,
+                nextAction: state.blocker.nextAction,
                 actionLabel: "I'll take it",
-              };
+              }
+            : progressBlocker === undefined
+              ? null
+              : {
+                  id: `${card.taskId}-progress-block`,
+                  kind: "blocker" as const,
+                  summary: progressBlocker.summary,
+                  nextAction: progressBlocker.nextAction,
+                  actionLabel: "I'll take it",
+                };
   return {
     id: card.taskId,
     projectId: state.intake.projectId,
@@ -107,7 +119,10 @@ const taskFromAdapterCard = (card: AdapterBoardCard): OperationsTask | null => {
     progress: report === null ? [] : [report],
     completion,
     qa: qaOf(state),
-    revision: completion?.artifactRevision ?? null,
+    advisory: run?.advisory ?? null,
+    revision:
+      completion?.artifactRevision ??
+      (run?.advisory === undefined ? null : { type: "git", sha: run.advisory.commit }),
     facts: [],
     candidates: [],
     usage: run?.usage ?? [],

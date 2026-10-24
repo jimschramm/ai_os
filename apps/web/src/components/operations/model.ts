@@ -1,6 +1,8 @@
 import {
   kanbanColumn,
+  QA_INCOMPLETE_LABEL,
   RECOVERY_PENDING_LABEL,
+  REVIEW_DELIVERED_LABEL,
   REWORK_CAP_LABEL,
   usageTotals,
   type KanbanColumn,
@@ -115,6 +117,8 @@ export function tasksInColumn(
 export function qaStatusLabel(task: OperationsTask): string {
   if (task.phase === "rework_capped") return REWORK_CAP_LABEL;
   if (task.phase === "recovery_pending") return RECOVERY_PENDING_LABEL;
+  if (task.phase === "qa_incomplete") return QA_INCOMPLETE_LABEL;
+  if (task.phase === "review_delivered") return REVIEW_DELIVERED_LABEL;
   if (task.qa === null) return "Not in review";
   if (task.qa.availability === "unavailable") return "QA unavailable";
   if (task.qa.verdict === "rework") return "Rework";
@@ -122,7 +126,12 @@ export function qaStatusLabel(task: OperationsTask): string {
 }
 
 export function qaBadgeTone(task: OperationsTask): QaBadgeTone {
-  if (task.phase === "rework_capped" || task.phase === "recovery_pending") return "warning";
+  if (
+    task.phase === "rework_capped" ||
+    task.phase === "recovery_pending" ||
+    task.phase === "qa_incomplete"
+  )
+    return "warning";
   if (task.qa === null) return "secondary";
   if (task.qa.availability === "unavailable") return "warning";
   if (task.qa.verdict === "rework") return "warning";

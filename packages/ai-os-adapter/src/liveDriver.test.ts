@@ -369,6 +369,7 @@ it.effect("lists project ids and publishes the launched task to the server board
             status: reads < 4 ? "running" : "completed",
             text: reads < 4 ? "draft" : "done",
             revision: null,
+            actualModel: reads < 4 ? null : "gpt-5.6-sol",
           });
         },
       };
@@ -490,6 +491,7 @@ it.effect("lists projects and launches in one run", () =>
           status: "completed",
           text: "done",
           revision: null,
+          actualModel: "gpt-5.6-sol",
         }),
     };
     yield* runLiveDriver(
@@ -558,6 +560,7 @@ it.effect("launches the offered default when the configured model is gpt-5.4", (
           status: "completed",
           text: "done",
           revision: null,
+          actualModel: "gpt-6-sol",
         }),
     };
     yield* runLiveDriver(
@@ -747,6 +750,7 @@ it.effect("stays with a task the board interrupts, then follows the resume", () 
             status: finish ? "completed" : "running",
             text: finish ? "done" : "draft",
             revision: finish ? SHA : null,
+            actualModel: finish ? "gpt-5.6-sol" : null,
           }),
       };
       const progress: string[] = [];

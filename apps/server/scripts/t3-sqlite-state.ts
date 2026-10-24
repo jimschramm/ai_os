@@ -3,6 +3,7 @@
 import * as NodeRuntime from "@effect/platform-node/NodeRuntime";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as NodeOS from "node:os";
+import { AI_OS_HOME_DIRECTORY_NAME, T3_CODE_HOME_DIRECTORY_NAME } from "@t3tools/shared/aiOsHome";
 import { fromJsonStringPretty } from "@t3tools/shared/schemaJson";
 import * as Console from "effect/Console";
 import * as DateTime from "effect/DateTime";
@@ -62,7 +63,7 @@ export class SqliteStateSharedHomeMutationError extends Schema.TaggedError<Sqlit
   {},
 ) {
   override get message(): string {
-    return "Refusing to mutate the shared ~/.t3 database. Use an isolated --base-dir.";
+    return "Refusing to mutate the shared ~/.ai_os-home or ~/.t3 database. Use an isolated --base-dir.";
   }
 }
 
@@ -124,7 +125,10 @@ export interface RunSqliteStateInput {
 }
 
 export interface RunSqliteStateOptions {
+  /** ai_os home. Writes there are refused. Tests point this at a temp directory. */
   readonly sharedHome?: string | undefined;
+  /** T3 Code home. Writes there are refused even when it is not the ai_os home. */
+  readonly t3CodeHome?: string | undefined;
 }
 
 const resolveSqlSource = Effect.fn("resolveSqliteStateSqlSource")(function* (
@@ -181,7 +185,10 @@ export const runSqliteState = Effect.fn("runSqliteState")(function* (
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const baseDir = path.resolve(input.baseDir);
-  const sharedHome = path.resolve(options.sharedHome ?? path.join(NodeOS.homedir(), ".t3"));
+  const protectedHomes = [
+    path.resolve(options.sharedHome ?? path.join(NodeOS.homedir(), AI_OS_HOME_DIRECTORY_NAME)),
+    path.resolve(options.t3CodeHome ?? path.join(NodeOS.homedir(), T3_CODE_HOME_DIRECTORY_NAME)),
+  ];
   const databasePath = path.join(baseDir, "userdata", "statev2.sqlite");
   const source = yield* resolveSqlSource(input.sql, input.file);
 
@@ -189,12 +196,12 @@ export const runSqliteState = Effect.fn("runSqliteState")(function* (
     return yield* new SqliteStateDatabaseMissingError({ databasePath });
   }
   if (input.operation === "exec") {
-    const [canonicalBaseDir, canonicalSharedHome] = yield* Effect.all([
-      fs.realPath(baseDir),
-      fs.realPath(sharedHome).pipe(Effect.orElseSucceed(() => sharedHome)),
-    ]);
-    if (canonicalBaseDir === canonicalSharedHome) {
-      return yield* new SqliteStateSharedHomeMutationError();
+    const canonicalBaseDir = yield* fs.realPath(baseDir);
+    for (const home of protectedHomes) {
+      const canonicalHome = yield* fs.realPath(home).pipe(Effect.orElseSucceed(() => home));
+      if (canonicalBaseDir === canonicalHome) {
+        return yield* new SqliteStateSharedHomeMutationError();
+      }
     }
   }
 

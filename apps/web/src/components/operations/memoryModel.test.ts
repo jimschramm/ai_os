@@ -3,9 +3,11 @@ import * as Effect from "effect/Effect";
 import { decodeMemoryGraphV1, packageFacts } from "@t3tools/ai-os-contracts";
 
 import { OPERATIONS_TASKS } from "./fixtures";
-import { MEMORY_GRAPH } from "./memoryFixtures";
+import { ATTEMPT_ACTIVITY, MEMORY_GRAPH } from "./memoryFixtures";
 import {
   INITIAL_MEMORY_REVIEW,
+  attemptActivityFor,
+  boardAttemptActivity,
   conflictingIds,
   contextPackageView,
   cortexRing,
@@ -49,6 +51,29 @@ describe("operations memory", () => {
     const friday = MEMORY_GRAPH.facts.find((fact) => fact.factId === "fact-friday-7");
     expect(friday).toBeDefined();
     expect(displayStatus(friday!, INITIAL_MEMORY_REVIEW, ids)).toBe("conflicting");
+  });
+
+  it("shows a persisted attempt in the drawer data for the agent that wrote it", () => {
+    const attempt = ATTEMPT_ACTIVITY[0];
+    if (attempt === undefined) throw new Error("expected a sample attempt");
+    const activity = boardAttemptActivity([{ attempts: [attempt] }, { attempts: [attempt] }]);
+    const rows = attemptActivityFor(activity, "usba", "saturday-copy");
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.authorId).toBe("codex-t3");
+    expect(rows[0]?.runtime).toBe("codex");
+    expect(rows[0]?.read.receiptId).toBe(attempt.read.receiptId);
+    expect(rows[0]?.write?.outcome).toBe("pending");
+    expect(boardAttemptActivity([{ attempts: [{ not: "an attempt" }] }])).toEqual([]);
+  });
+
+  it("attributes an attempt's read and write to the agent that made them", () => {
+    const rows = attemptActivityFor(ATTEMPT_ACTIVITY, "usba", "saturday-copy");
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.authorId).toBe("codex-t3");
+    expect(rows[0]?.read.memoryVersions).toEqual(["fact-governing-copy", "fact-saturday-start"]);
+    expect(rows[0]?.write?.outcome).toBe("pending");
+    expect(attemptActivityFor(ATTEMPT_ACTIVITY, "personal", null)).toEqual([]);
+    expect(attemptActivityFor(ATTEMPT_ACTIVITY, "usba", "other-task")).toEqual([]);
   });
 
   it("filters scope, type, and the seeded rejection", () => {

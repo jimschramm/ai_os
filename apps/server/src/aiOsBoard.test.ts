@@ -7,6 +7,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it as effectIt } from "@effect/vitest";
 import { afterEach, describe, expect, it } from "vite-plus/test";
 import {
+  ADAPTER_ANTIGRAVITY_MODELS_PATH,
   ADAPTER_BOARD_EVENT_PATH,
   ADAPTER_BOARD_EVENTS_PATH,
   ADAPTER_BOARD_MOVE_PATH,
@@ -19,6 +20,7 @@ import { encodeAdapterBoardWire } from "@t3tools/ai-os-adapter/board-hub";
 import {
   applySequence,
   assignmentExample,
+  exampleRepoCommit,
   executionLaunchKey,
   happyPathEvents,
   intakeV2Example,
@@ -30,7 +32,10 @@ import * as Layer from "effect/Layer";
 import { HttpRouter, HttpServerRequest } from "effect/http";
 
 import * as EnvironmentAuth from "./auth/EnvironmentAuth.ts";
+import * as AiOsAntigravity from "./aiOsAntigravity.ts";
 import * as AiOsBoard from "./aiOsBoard.ts";
+import { openMemoryDatabase, submitMemorySync } from "./aiOsMemory.ts";
+import { readAttemptActivitySync } from "./aiOsTaskMemory.ts";
 import * as ServerConfig from "./config.ts";
 
 const activeLaunch = (): AiOsBoard.BoardLaunchResult => ({
@@ -40,12 +45,22 @@ const activeLaunch = (): AiOsBoard.BoardLaunchResult => ({
   summary: null,
 });
 
+const idleReviews: AiOsAntigravity.AntigravityReviews["Service"] = {
+  listModels: () => Effect.succeed({ source: "unverified", models: [], detail: null }),
+  start: () => Effect.die("Antigravity review was not expected."),
+  watch: () => Effect.succeed(null),
+  cancel: () => Effect.succeed("already_stopped"),
+  recover: () => Effect.succeed({ status: "stopped" as const }),
+  sweep: () => Effect.void,
+};
+
 const allowRuns: AiOsBoard.BoardRuns["Service"] = {
   interrupt: () => Effect.succeed("requested"),
   confirmLaunch: () => Effect.succeed("active"),
   launch: () => Effect.succeed(activeLaunch()),
   continueRun: () => Effect.succeed({ runId: "run-continued" }),
   watchThread: () => Effect.succeed(null),
+  readReviewerSession: () => Effect.succeed(null),
   followRuns: false,
 };
 
@@ -56,12 +71,17 @@ afterEach(async () => {
   for (const dir of dirs.splice(0)) NodeFS.rmSync(dir, { recursive: true, force: true });
 });
 
-const handlerFor = (stateDir?: string, runs: AiOsBoard.BoardRuns["Service"] = allowRuns) => {
+const handlerFor = (
+  stateDir?: string,
+  runs: AiOsBoard.BoardRuns["Service"] = allowRuns,
+  reviews: AiOsAntigravity.AntigravityReviews["Service"] = idleReviews,
+) => {
   const dir = stateDir ?? NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "aios-board-"));
   if (!dirs.includes(dir)) dirs.push(dir);
   const { handler, dispose } = HttpRouter.toWebHandler(
     AiOsBoard.layer.pipe(
       Layer.provide(Layer.succeed(AiOsBoard.BoardRuns, runs)),
+      Layer.provide(Layer.succeed(AiOsAntigravity.AntigravityReviews, reviews)),
       Layer.provideMerge(
         Layer.succeed(EnvironmentAuth.EnvironmentAuth, {
           authenticateHttpRequest: (request: HttpServerRequest.HttpServerRequest) => {
@@ -326,7 +346,7 @@ describe("ai-os board route", () => {
   effectIt.effect("keeps in-flight cards from a board saved before rework ledgers", () =>
     Effect.gen(function* () {
       const executing = yield* applySequence(happyPathEvents.slice(0, 4));
-      const awaiting = yield* applySequence(happyPathEvents.slice(0, 5));
+      const awaiting = yield* applySequence(happyPathEvents.slice(0, 6));
       const withoutLedger = (state: object) => {
         const copy = JSON.parse(JSON.stringify(state)) as Record<string, unknown>;
         delete copy.reworkLedger;
@@ -713,6 +733,16 @@ describe("ai-os board route", () => {
           summary: "Done already.",
         });
       },
+      watchThread: () =>
+        Effect.succeed({
+          threadId: "thread-fast",
+          runId: "run-fast",
+          status: "completed",
+          text: "Done already.",
+          revision: null,
+          requestedModel: "gpt-5.4",
+          actualModel: "gpt-6-sol",
+        }),
     });
     await reachAssigned(handler);
     const moved = await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
@@ -723,6 +753,13 @@ describe("ai-os board route", () => {
     expect(moved.status).toBe(200);
     expect(launches).toBe(1);
     expect(await phaseOfHandler(handler)).toBe("awaiting_qa");
+    const reviewed = (await readCards(handler)).find((item) => item.taskId === "task-demo");
+    expect(
+      reviewed?.state.phase === "awaiting_qa" ? reviewed.state.run.implementerRuntime : null,
+    ).toEqual({
+      requested: "gpt-5.4",
+      actual: "gpt-6-sol",
+    });
     const again = await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
       taskId: "task-demo",
       column: "Running",
@@ -731,6 +768,48 @@ describe("ai-os board route", () => {
     expect(again.status).toBe(409);
     expect(launches).toBe(1);
     expect(await phaseOfHandler(handler)).toBe("awaiting_qa");
+  });
+
+  it("shows a blocker when a finished launch has no implementer model", async () => {
+    const { handler } = handlerFor(undefined, {
+      ...allowRuns,
+      confirmLaunch: () => Effect.succeed("settled"),
+      launch: () =>
+        Effect.succeed({
+          threadId: "thread-unknown",
+          runId: "run-unknown",
+          disposition: "completed",
+          summary: "Done already.",
+        }),
+      watchThread: () =>
+        Effect.succeed({
+          threadId: "thread-unknown",
+          runId: "run-unknown",
+          status: "completed",
+          text: "Done already.",
+          revision: null,
+          requestedModel: null,
+          actualModel: null,
+        }),
+    });
+    await reachAssigned(handler);
+    const moved = await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
+      taskId: "task-demo",
+      column: "Running",
+      idempotencyKey: "unknown-model",
+    });
+    expect(moved.status).toBe(200);
+    const card = (await readCards(handler)).find((item) => item.taskId === "task-demo");
+    expect(card?.state.phase).toBe("executing");
+    expect(card?.state.phase === "executing" ? card.state.run.implementerRuntime : "recorded").toBe(
+      undefined,
+    );
+    expect(card?.state.phase === "executing" ? card.state.run.progress?.status : null).toBe(
+      "blocked",
+    );
+    expect(
+      card?.state.phase === "executing" ? card.state.run.progress?.blockers[0]?.summary : null,
+    ).toBe("Awaiting implementer model");
   });
 
   it("records a failed launch as blocked instead of leaving it Ready", async () => {
@@ -771,6 +850,22 @@ describe("ai-os board route", () => {
     });
     expect(started.status).toBe(200);
     expect(await phaseOfHandler(handler)).toBe("executing");
+    const recorded = await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
+      taskId: "task-demo",
+      title: "Demo task",
+      idempotencyKey: "runtime-settled",
+      event: {
+        type: "record_runtime_models",
+        taskId: "task-demo",
+        attemptId: "attempt-1",
+        generation: 1,
+        leaseId: leaseIdFor(1),
+        role: "implementer",
+        requested: { model: "gpt-5.4" },
+        actual: { model: "gpt-5.4" },
+      },
+    });
+    expect(recorded.status).toBe(200);
     const done = await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
       taskId: "task-demo",
       title: "Demo task",
@@ -917,6 +1012,275 @@ describe("ai-os board route", () => {
     expect(launched).toEqual([{ instanceId: "grok", model: "gpt-5.4" }]);
   });
 
+  it("reviews with Antigravity and leaves Codex unlaunched", async () => {
+    const launched: string[] = [];
+    let reviewed = 0;
+    const { handler } = handlerFor(
+      undefined,
+      {
+        ...allowRuns,
+        launch: () => {
+          launched.push("codex");
+          return Effect.succeed(activeLaunch());
+        },
+      },
+      {
+        ...idleReviews,
+        start: () => {
+          reviewed += 1;
+          return Effect.succeed({
+            status: "settled" as const,
+            runId: "agy-run-1",
+            execution: {
+              status: "completed",
+              requestedModel: "gemini-4-argon-high",
+              actualModel: "gemini-4-argon-high",
+              unverified: false,
+              commit: exampleRepoCommit,
+              summary: "The schedule page is missing Sunday.",
+              findings: [
+                {
+                  commit: exampleRepoCommit,
+                  files: ["src/page.tsx"],
+                  evidence: "The page lists Saturday only.",
+                  suggestedAction: "Add Sunday to the schedule.",
+                },
+              ],
+              progressNote: "Read src/page.tsx.",
+              conversationId: "conv1",
+              inputTokens: 12,
+              outputTokens: 4,
+              sourcePath: "/tmp/source",
+              scratchPath: "/tmp/scratch",
+              detail: null,
+            },
+          });
+        },
+      },
+    );
+    expect(
+      (
+        await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
+          taskId: "task-agy",
+          title: "Advisory review",
+          idempotencyKey: "intake-agy",
+          event: {
+            type: "intake",
+            intake: { ...intakeV2Example, projectId: "usba", workspaceId: "usba" },
+          },
+        })
+      ).status,
+    ).toBe(200);
+    expect(
+      (
+        await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
+          taskId: "task-agy",
+          column: "Ready",
+          idempotencyKey: "ready-agy",
+        })
+      ).status,
+    ).toBe(200);
+    expect(
+      (
+        await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
+          taskId: "task-agy",
+          title: "Advisory review",
+          idempotencyKey: "assign-agy",
+          event: {
+            type: "assign",
+            assignment: {
+              ...assignmentExample,
+              taskId: "task-agy",
+              attemptId: "attempt-agy",
+              assignmentId: "assignment-agy",
+              instanceId: "antigravity",
+              role: "advisory",
+              taskType: "advisory",
+            },
+          },
+        })
+      ).status,
+    ).toBe(200);
+    const moved = await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
+      taskId: "task-agy",
+      column: "Running",
+      idempotencyKey: "run-agy",
+      model: "gemini-4-argon-high",
+    });
+    expect(moved.status).toBe(200);
+    const card = (await readCards(handler)).find((item) => item.taskId === "task-agy");
+    expect(card?.state.phase).toBe("review_delivered");
+    expect(card?.threadId).toBeNull();
+    if (card?.state.phase !== "review_delivered") return;
+    expect(card.state.reviewLabel).toBe("Review delivered");
+    expect("qa" in card.state).toBe(false);
+    expect(card.state.run.advisory?.findings).toHaveLength(1);
+    expect(card.state.run.advisory?.model.unverified).toBe(false);
+    const requested = card.state.run.advisory?.model.requested;
+    const actual = card.state.run.advisory?.model.actual;
+    expect(typeof requested === "string" ? requested : requested?.model).toBe(
+      "gemini-4-argon-high",
+    );
+    expect(typeof actual === "string" ? actual : actual?.model).toBe("gemini-4-argon-high");
+    expect(launched).toEqual([]);
+    expect(reviewed).toBe(1);
+  });
+
+  it("keeps the card Ready when the Antigravity model is unavailable", async () => {
+    const { handler } = handlerFor(undefined, allowRuns, {
+      ...idleReviews,
+      start: () =>
+        Effect.succeed({
+          status: "unavailable" as const,
+          detail:
+            "gemini-missing is not available from the CLI. Choose one of: gemini-4-argon-high",
+          models: ["gemini-4-argon-high"],
+        }),
+    });
+    expect(
+      (
+        await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
+          taskId: "task-agy",
+          title: "Advisory review",
+          idempotencyKey: "intake-agy",
+          event: {
+            type: "intake",
+            intake: { ...intakeV2Example, projectId: "usba", workspaceId: "usba" },
+          },
+        })
+      ).status,
+    ).toBe(200);
+    expect(
+      (
+        await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
+          taskId: "task-agy",
+          column: "Ready",
+          idempotencyKey: "ready-agy",
+        })
+      ).status,
+    ).toBe(200);
+    expect(
+      (
+        await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
+          taskId: "task-agy",
+          title: "Advisory review",
+          idempotencyKey: "assign-agy",
+          event: {
+            type: "assign",
+            assignment: {
+              ...assignmentExample,
+              taskId: "task-agy",
+              attemptId: "attempt-agy",
+              assignmentId: "assignment-agy",
+              instanceId: "antigravity",
+              role: "advisory",
+              taskType: "advisory",
+            },
+          },
+        })
+      ).status,
+    ).toBe(200);
+    const moved = await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
+      taskId: "task-agy",
+      column: "Running",
+      idempotencyKey: "run-agy",
+      model: "gemini-missing",
+    });
+    expect(moved.status).toBe(409);
+    expect(await moved.json()).toMatchObject({
+      _tag: "Rejected",
+      detail: expect.stringContaining("gemini-missing"),
+    });
+    const card = (await readCards(handler)).find((item) => item.taskId === "task-agy");
+    expect(card?.state.phase).toBe("assigned");
+  });
+
+  it("does not launch Codex for a non-advisory Antigravity assignment", async () => {
+    const launched: string[] = [];
+    let reviewed = 0;
+    const { handler } = handlerFor(
+      undefined,
+      {
+        ...allowRuns,
+        launch: () => {
+          launched.push("codex");
+          return Effect.succeed(activeLaunch());
+        },
+      },
+      {
+        ...idleReviews,
+        start: () => {
+          reviewed += 1;
+          return Effect.die("review");
+        },
+      },
+    );
+    expect(
+      (
+        await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
+          taskId: "task-agy",
+          title: "Implement",
+          idempotencyKey: "intake-agy",
+          event: {
+            type: "intake",
+            intake: { ...intakeV2Example, projectId: "usba", workspaceId: "usba" },
+          },
+        })
+      ).status,
+    ).toBe(200);
+    expect(
+      (
+        await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
+          taskId: "task-agy",
+          column: "Ready",
+          idempotencyKey: "ready-agy",
+        })
+      ).status,
+    ).toBe(200);
+    expect(
+      (
+        await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
+          taskId: "task-agy",
+          title: "Implement",
+          idempotencyKey: "assign-agy",
+          event: {
+            type: "assign",
+            assignment: {
+              ...assignmentExample,
+              taskId: "task-agy",
+              attemptId: "attempt-agy",
+              assignmentId: "assignment-agy",
+              instanceId: "antigravity",
+              role: "implementer",
+              taskType: "implementation",
+            },
+          },
+        })
+      ).status,
+    ).toBe(200);
+    const moved = await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
+      taskId: "task-agy",
+      column: "Running",
+      idempotencyKey: "run-agy",
+    });
+    expect(moved.status).toBe(409);
+    expect(launched).toEqual([]);
+    expect(reviewed).toBe(0);
+    const card = (await readCards(handler)).find((item) => item.taskId === "task-agy");
+    expect(card?.state.phase).toBe("assigned");
+  });
+
+  it("returns the Antigravity model catalog", async () => {
+    const { handler } = handlerFor();
+    const response = await handler(
+      new Request(boardUrl(ADAPTER_ANTIGRAVITY_MODELS_PATH), {
+        headers: { authorization: `Bearer ${AuthOrchestrationReadScope}` },
+      }),
+    );
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ source: "unverified", models: [], detail: null });
+  });
+
   it("launches rework as the next generation and does not launch that generation twice", async () => {
     const launches: string[] = [];
     const { handler } = handlerFor(undefined, {
@@ -931,7 +1295,7 @@ describe("ai-os board route", () => {
         });
       },
     });
-    for (const [index, event] of happyPathEvents.slice(0, 7).entries()) {
+    for (const [index, event] of happyPathEvents.slice(0, 9).entries()) {
       const posted = await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
         taskId: "task-usba-page",
         title: "Tournament page",
@@ -1013,6 +1377,425 @@ describe("ai-os board route", () => {
     );
   });
 
+  const modelName = (value: unknown): string | null => {
+    if (typeof value === "string") return value;
+    if (
+      value !== null &&
+      typeof value === "object" &&
+      "model" in value &&
+      typeof value.model === "string"
+    ) {
+      return value.model;
+    }
+    return null;
+  };
+
+  const REVIEWER = "claude-sonnet-5";
+
+  const sessionRuns = (
+    reviewer: { readonly requested: string | null; readonly actual: string | null } | null,
+  ): { readonly runs: AiOsBoard.BoardRuns["Service"]; readonly models: string[] } => {
+    const models: string[] = [];
+    let impl = 0;
+    const runs: AiOsBoard.BoardRuns["Service"] = {
+      ...allowRuns,
+      launch: (input) => {
+        models.push(input.model);
+        impl += 1;
+        return Effect.succeed({
+          threadId: `thread-impl-${impl}`,
+          runId: `run-impl-${impl}`,
+          disposition: "active",
+          summary: null,
+        });
+      },
+      watchThread: (threadId) => {
+        const revision = threadId.endsWith("-2") ? "b".repeat(40) : "a".repeat(40);
+        return Effect.succeed({
+          threadId,
+          runId: threadId.replace("thread", "run"),
+          status: "completed" as const,
+          text: "Shipped the page.",
+          revision,
+          requestedModel: "gpt-5.4",
+          actualModel: "gpt-5.4",
+        });
+      },
+      readReviewerSession: () =>
+        Effect.succeed(
+          reviewer === null
+            ? null
+            : {
+                threadId: "thread-qa",
+                runId: "run-qa",
+                status: "completed" as const,
+                text: null,
+                revision: null,
+                requestedModel: reviewer.requested,
+                actualModel: reviewer.actual,
+              },
+        ),
+    };
+    return { runs, models };
+  };
+
+  const finding = {
+    defect: "The schedule omits the final round.",
+    evidence: "The preview still lists Saturday only.",
+    expectedBehavior: "The page lists Saturday and Sunday.",
+  };
+
+  const verdictFor = (
+    revision:
+      | { readonly type: "git"; readonly sha: string }
+      | { readonly type: "named"; readonly kind: "page"; readonly id: string },
+    verdict: "rework" | "accept",
+    qaModel: string,
+  ) => ({
+    version: "v1" as const,
+    taskId: "task-demo",
+    attemptId: "attempt-1",
+    availability: "available" as const,
+    qaModel,
+    implementerModel: "gpt-5.4",
+    verdict,
+    artifactRevision: revision,
+    ...(verdict === "accept" ? { acceptedRevision: revision } : {}),
+    findings: [finding],
+  });
+
+  const qaEvent = (
+    revision:
+      | { readonly type: "git"; readonly sha: string }
+      | { readonly type: "named"; readonly kind: "page"; readonly id: string },
+    verdict: "rework" | "accept",
+    qaModel: string,
+  ) => ({
+    type: "qa" as const,
+    threadId: "thread-qa",
+    runId: "run-qa",
+    qa: verdictFor(revision, verdict, qaModel),
+  });
+
+  it("records the submitting session, then reworks and accepts on a different model", async () => {
+    const { runs, models } = sessionRuns({ requested: REVIEWER, actual: REVIEWER });
+    const { handler } = handlerFor(undefined, runs);
+    await reachAssigned(handler);
+    const moved = await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
+      taskId: "task-demo",
+      column: "Running",
+      idempotencyKey: "impl-run",
+    });
+    expect(moved.status).toBe(200);
+    const waiting = (await readCards(handler)).find((card) => card.taskId === "task-demo");
+    expect(waiting?.state.phase).toBe("awaiting_qa");
+    if (waiting?.state.phase !== "awaiting_qa") throw new Error("expected review");
+    expect(waiting.state.run.reviewerRuntime).toBeUndefined();
+    expect(modelName(waiting.state.run.implementerRuntime?.actual)).toBe("gpt-5.4");
+    const first = waiting.state.completion.artifactRevision;
+    if (first.type !== "git") throw new Error("expected the provider revision");
+    const reworked = await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
+      taskId: "task-demo",
+      title: "Demo task",
+      idempotencyKey: "qa-rework",
+      event: qaEvent(first, "rework", REVIEWER),
+    });
+    expect(reworked.status).toBe(200);
+    expect(await phaseOfHandler(handler)).toBe("rework");
+    const again = await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
+      taskId: "task-demo",
+      column: "Running",
+      idempotencyKey: "impl-run-2",
+    });
+    expect(again.status).toBe(200);
+    const second = (await readCards(handler)).find((card) => card.taskId === "task-demo");
+    expect(second?.state.phase).toBe("awaiting_qa");
+    if (second?.state.phase !== "awaiting_qa") throw new Error("expected the second review");
+    const revision = second.state.completion.artifactRevision;
+    if (revision.type !== "git") throw new Error("expected the corrected revision");
+    expect(revision.sha).not.toBe(first.sha);
+    const accepted = await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
+      taskId: "task-demo",
+      title: "Demo task",
+      idempotencyKey: "qa-accept-2",
+      event: qaEvent(revision, "accept", REVIEWER),
+    });
+    expect(accepted.status).toBe(200);
+    const done = (await readCards(handler)).find((card) => card.taskId === "task-demo");
+    expect(done?.state.phase).toBe("accepted");
+    if (done?.state.phase !== "accepted") throw new Error("expected acceptance");
+    expect(modelName(done.state.run.reviewerRuntime?.actual)).toBe(REVIEWER);
+    expect(modelName(done.state.run.implementerRuntime?.actual)).toBe("gpt-5.4");
+    expect(models).toEqual(["gpt-5.4", "gpt-5.4"]);
+  });
+
+  it("keeps findings and waits when the submitting session has no actual model", async () => {
+    const { runs, models } = sessionRuns({ requested: REVIEWER, actual: null });
+    const { handler } = handlerFor(undefined, runs);
+    await reachAssigned(handler);
+    await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
+      taskId: "task-demo",
+      column: "Running",
+      idempotencyKey: "impl-unknown",
+    });
+    const waiting = (await readCards(handler)).find((card) => card.taskId === "task-demo");
+    if (waiting?.state.phase !== "awaiting_qa") throw new Error("expected review");
+    const revision = waiting.state.completion.artifactRevision;
+    if (revision.type !== "git") throw new Error("expected the provider revision");
+    const reworked = await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
+      taskId: "task-demo",
+      title: "Demo task",
+      idempotencyKey: "qa-unknown-rework",
+      event: qaEvent(revision, "rework", REVIEWER),
+    });
+    expect(reworked.status).toBe(200);
+    const held = (await readCards(handler)).find((card) => card.taskId === "task-demo");
+    expect(held?.state.phase).toBe("qa_incomplete");
+    if (held?.state.phase !== "qa_incomplete") throw new Error("expected incomplete QA");
+    expect(held.state.qaLabel).toBe("Awaiting a verified reviewer");
+    expect(held.state.attemptedVerdict).toBe("rework");
+    expect(held.state.findings).toEqual([finding]);
+    expect(held.state.run.reviewerRuntime).toBeUndefined();
+    const accepted = await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
+      taskId: "task-demo",
+      title: "Demo task",
+      idempotencyKey: "qa-unknown-accept",
+      event: qaEvent(revision, "accept", REVIEWER),
+    });
+    expect(accepted.status).toBe(200);
+    const still = (await readCards(handler)).find((card) => card.taskId === "task-demo");
+    expect(still?.state.phase).toBe("qa_incomplete");
+    if (still?.state.phase !== "qa_incomplete") throw new Error("expected incomplete QA");
+    expect(still.state.attemptedVerdict).toBe("accept");
+    expect(still.state.findings).toEqual([finding]);
+    expect(models).toEqual(["gpt-5.4"]);
+  });
+
+  it("blocks completion when the implementer's actual model is unknown", async () => {
+    const { handler } = handlerFor();
+    await reachExecuting(handler);
+    const blocked = await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
+      taskId: "task-demo",
+      title: "Demo task",
+      idempotencyKey: "complete-unknown-implementer",
+      event: {
+        type: "submit_completion",
+        completion: {
+          version: "v1",
+          taskId: "task-demo",
+          attemptId: "attempt-1",
+          generation: 1,
+          leaseId: leaseIdFor(1),
+          claimedOutcome: "Finished without a reported model.",
+          artifactRevision: { type: "named", kind: "page", id: "t3-result" },
+          evidence: [{ kind: "readback", ref: "thread:thread-1" }],
+        },
+      },
+    });
+    expect(blocked.status).toBe(409);
+    expect(await blocked.json()).toMatchObject({
+      detail: expect.stringMatching(/actual model is unknown/),
+    });
+    expect(await phaseOfHandler(handler)).toBe("executing");
+  });
+
+  it("rejects a reviewer thread that is the implementer's thread", async () => {
+    const { runs } = sessionRuns({ requested: REVIEWER, actual: REVIEWER });
+    const { handler } = handlerFor(undefined, runs);
+    await reachAssigned(handler);
+    await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
+      taskId: "task-demo",
+      column: "Running",
+      idempotencyKey: "impl-own-thread",
+    });
+    const waiting = (await readCards(handler)).find((card) => card.taskId === "task-demo");
+    if (waiting?.state.phase !== "awaiting_qa" || waiting.threadId === null) {
+      throw new Error("expected the implementer's thread");
+    }
+    const revision = waiting.state.completion.artifactRevision;
+    if (revision.type !== "git") throw new Error("expected the provider revision");
+    const rejected = await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
+      taskId: "task-demo",
+      title: "Demo task",
+      idempotencyKey: "qa-own-thread",
+      event: { ...qaEvent(revision, "accept", REVIEWER), threadId: waiting.threadId },
+    });
+    expect(rejected.status).toBe(409);
+    expect(await rejected.json()).toMatchObject({
+      detail: expect.stringMatching(/implementer's thread/),
+    });
+    expect(await phaseOfHandler(handler)).toBe("awaiting_qa");
+  });
+
+  it("rejects a reviewer thread that belongs to another task", async () => {
+    const { runs } = sessionRuns({ requested: REVIEWER, actual: REVIEWER });
+    const { handler } = handlerFor(undefined, runs);
+    await reachAssigned(handler);
+    await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
+      taskId: "task-demo",
+      column: "Running",
+      idempotencyKey: "impl-this-task",
+    });
+    expect(
+      (
+        await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
+          taskId: "task-other",
+          title: "Other task",
+          idempotencyKey: "intake-other",
+          event: {
+            type: "intake",
+            intake: { ...intakeV2Example, projectId: "usba", workspaceId: "usba" },
+          },
+        })
+      ).status,
+    ).toBe(200);
+    expect(
+      (
+        await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
+          taskId: "task-other",
+          column: "Ready",
+          idempotencyKey: "ready-other",
+        })
+      ).status,
+    ).toBe(200);
+    expect(
+      (
+        await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
+          taskId: "task-other",
+          title: "Other task",
+          idempotencyKey: "assign-other",
+          event: {
+            type: "assign",
+            assignment: {
+              ...assignmentExample,
+              taskId: "task-other",
+              attemptId: "attempt-other",
+              assignmentId: "assignment-other",
+            },
+          },
+        })
+      ).status,
+    ).toBe(200);
+    expect(
+      (
+        await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
+          taskId: "task-other",
+          column: "Running",
+          idempotencyKey: "run-other",
+        })
+      ).status,
+    ).toBe(200);
+    const cards = await readCards(handler);
+    const demo = cards.find((card) => card.taskId === "task-demo");
+    const other = cards.find((card) => card.taskId === "task-other");
+    if (demo?.state.phase !== "awaiting_qa" || other === undefined || other.threadId === null) {
+      throw new Error("expected the other task's thread");
+    }
+    const revision = demo.state.completion.artifactRevision;
+    if (revision.type !== "git") throw new Error("expected the provider revision");
+    const rejected = await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
+      taskId: "task-demo",
+      title: "Demo task",
+      idempotencyKey: "qa-other-task",
+      event: { ...qaEvent(revision, "accept", REVIEWER), threadId: other.threadId },
+    });
+    expect(rejected.status).toBe(409);
+    expect(await rejected.json()).toMatchObject({
+      detail: expect.stringMatching(/not from this task/),
+    });
+    expect(await phaseOfHandler(handler)).toBe("awaiting_qa");
+  });
+
+  it("lets a verified reviewer replace an unknown one and accept", async () => {
+    const reviewer = { requested: REVIEWER, actual: null as string | null };
+    const { runs } = sessionRuns(reviewer);
+    const { handler } = handlerFor(undefined, runs);
+    await reachAssigned(handler);
+    await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
+      taskId: "task-demo",
+      column: "Running",
+      idempotencyKey: "impl-replace",
+    });
+    const waiting = (await readCards(handler)).find((card) => card.taskId === "task-demo");
+    if (waiting?.state.phase !== "awaiting_qa") throw new Error("expected review");
+    const revision = waiting.state.completion.artifactRevision;
+    if (revision.type !== "git") throw new Error("expected the provider revision");
+    const held = await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
+      taskId: "task-demo",
+      title: "Demo task",
+      idempotencyKey: "qa-held",
+      event: qaEvent(revision, "accept", REVIEWER),
+    });
+    expect(held.status).toBe(200);
+    expect(await phaseOfHandler(handler)).toBe("qa_incomplete");
+    reviewer.actual = REVIEWER;
+    const accepted = await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
+      taskId: "task-demo",
+      title: "Demo task",
+      idempotencyKey: "qa-verified",
+      event: qaEvent(revision, "accept", REVIEWER),
+    });
+    expect(accepted.status).toBe(200);
+    const done = (await readCards(handler)).find((card) => card.taskId === "task-demo");
+    expect(done?.state.phase).toBe("accepted");
+    if (done?.state.phase !== "accepted") throw new Error("expected acceptance");
+    expect(modelName(done.state.run.reviewerRuntime?.actual)).toBe(REVIEWER);
+    expect(done.state.run.priorReviews?.[0]?.attemptedVerdict).toBe("accept");
+    expect(done.state.run.priorReviews?.[0]?.findings).toEqual([finding]);
+  });
+
+  it("rejects a verdict whose models differ from the submitting session", async () => {
+    const { runs } = sessionRuns({ requested: REVIEWER, actual: REVIEWER });
+    const { handler } = handlerFor(undefined, runs);
+    await reachAssigned(handler);
+    await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
+      taskId: "task-demo",
+      column: "Running",
+      idempotencyKey: "impl-mismatch",
+    });
+    const waiting = (await readCards(handler)).find((card) => card.taskId === "task-demo");
+    if (waiting?.state.phase !== "awaiting_qa") throw new Error("expected review");
+    const revision = waiting.state.completion.artifactRevision;
+    if (revision.type !== "git") throw new Error("expected the provider revision");
+    const rejected = await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
+      taskId: "task-demo",
+      title: "Demo task",
+      idempotencyKey: "qa-payload-mismatch",
+      event: qaEvent(revision, "rework", "gpt-6-sol"),
+    });
+    expect(rejected.status).toBe(409);
+    expect(await rejected.json()).toMatchObject({
+      detail: expect.stringMatching(/reviewer/),
+    });
+    expect(await phaseOfHandler(handler)).toBe("awaiting_qa");
+  });
+
+  it("rejects rework when the submitting session ran the implementer's model", async () => {
+    const { runs } = sessionRuns({ requested: "gpt-5.4", actual: "gpt-5.4" });
+    const { handler } = handlerFor(undefined, runs);
+    await reachAssigned(handler);
+    await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
+      taskId: "task-demo",
+      column: "Running",
+      idempotencyKey: "impl-same",
+    });
+    const waiting = (await readCards(handler)).find((card) => card.taskId === "task-demo");
+    if (waiting?.state.phase !== "awaiting_qa") throw new Error("expected review");
+    const revision = waiting.state.completion.artifactRevision;
+    if (revision.type !== "git") throw new Error("expected the provider revision");
+    const rejected = await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
+      taskId: "task-demo",
+      title: "Demo task",
+      idempotencyKey: "qa-same-base",
+      event: qaEvent(revision, "rework", REVIEWER),
+    });
+    expect(rejected.status).toBe(409);
+    expect(await rejected.json()).toMatchObject({
+      detail: expect.stringMatching(/different base model/),
+    });
+    expect(await phaseOfHandler(handler)).toBe("awaiting_qa");
+  });
+
   it("resumes a blocked card on the same thread and does not continue twice", async () => {
     const continued: string[] = [];
     const { handler } = handlerFor(undefined, {
@@ -1050,5 +1833,602 @@ describe("ai-os board route", () => {
     expect(again.status).toBe(200);
     expect(await again.json()).toMatchObject({ changed: false });
     expect(continued).toEqual(["continue-task-demo-2"]);
+  });
+
+  it("cancels a running advisory review through the board", async () => {
+    let canceled = 0;
+    let starts = 0;
+    let processRunning = true;
+    let worktree = true;
+    const { handler } = handlerFor(undefined, allowRuns, {
+      ...idleReviews,
+      start: () => {
+        starts += 1;
+        return Effect.succeed({ status: "running" as const, runId: `agy-run-${starts}` });
+      },
+      cancel: () => {
+        canceled += 1;
+        return Effect.succeed("requested" as const);
+      },
+      recover: () => {
+        if (processRunning) return Effect.succeed({ status: "still_running" as const });
+        worktree = false;
+        return Effect.succeed({ status: "stopped" as const });
+      },
+    });
+    expect(
+      (
+        await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
+          taskId: "task-agy",
+          title: "Advisory review",
+          idempotencyKey: "intake-agy",
+          event: {
+            type: "intake",
+            intake: { ...intakeV2Example, projectId: "usba", workspaceId: "usba" },
+          },
+        })
+      ).status,
+    ).toBe(200);
+    expect(
+      (
+        await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
+          taskId: "task-agy",
+          column: "Ready",
+          idempotencyKey: "ready-agy",
+        })
+      ).status,
+    ).toBe(200);
+    expect(
+      (
+        await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
+          taskId: "task-agy",
+          title: "Advisory review",
+          idempotencyKey: "assign-agy",
+          event: {
+            type: "assign",
+            assignment: {
+              ...assignmentExample,
+              taskId: "task-agy",
+              attemptId: "attempt-agy",
+              assignmentId: "assignment-agy",
+              instanceId: "antigravity",
+              taskType: "advisory",
+            },
+          },
+        })
+      ).status,
+    ).toBe(200);
+    const running = await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
+      taskId: "task-agy",
+      column: "Running",
+      idempotencyKey: "run-agy",
+      model: "gemini-4-argon-high",
+    });
+    expect(running.status).toBe(200);
+    const card = (await readCards(handler)).find((item) => item.taskId === "task-agy");
+    expect(card?.state.phase).toBe("executing");
+    const stopped = await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
+      taskId: "task-agy",
+      column: "Ready",
+      idempotencyKey: "cancel-agy",
+      confirmed: true,
+    });
+    expect(stopped.status).toBe(200);
+    expect(canceled).toBe(1);
+    const after = (await readCards(handler)).find((item) => item.taskId === "task-agy");
+    expect(after?.state.phase).toBe("recovery_pending");
+    const early = await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
+      taskId: "task-agy",
+      column: "Running",
+      idempotencyKey: "run-agy-early",
+      model: "gemini-4-argon-high",
+    });
+    expect(early.status).toBe(409);
+    expect(starts).toBe(1);
+    expect(worktree).toBe(true);
+    const held = (await readCards(handler)).find((item) => item.taskId === "task-agy");
+    expect(held?.state.phase).toBe("recovery_pending");
+    processRunning = false;
+    const again = await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
+      taskId: "task-agy",
+      column: "Running",
+      idempotencyKey: "run-agy-again",
+      model: "gemini-4-argon-high",
+    });
+    expect(again.status).toBe(200);
+    expect(starts).toBe(2);
+    expect(worktree).toBe(false);
+    const restarted = (await readCards(handler)).find((item) => item.taskId === "task-agy");
+    expect(restarted?.state.phase).toBe("executing");
+    expect(restarted?.state.phase === "executing" ? restarted.state.assignment.attemptId : "").toBe(
+      "retry-task-agy-2",
+    );
+  });
+
+  it("keeps an advisory cancel event blocked until the process stops", async () => {
+    let canceled = 0;
+    let starts = 0;
+    let processRunning = true;
+    let worktree = true;
+    const { handler } = handlerFor(undefined, allowRuns, {
+      ...idleReviews,
+      start: () => {
+        starts += 1;
+        return Effect.succeed({ status: "running" as const, runId: `agy-run-${starts}` });
+      },
+      cancel: () => {
+        canceled += 1;
+        return Effect.succeed("requested" as const);
+      },
+      recover: () => {
+        if (processRunning) return Effect.succeed({ status: "still_running" as const });
+        worktree = false;
+        return Effect.succeed({ status: "stopped" as const });
+      },
+    });
+    expect(
+      (
+        await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
+          taskId: "task-agy",
+          title: "Advisory review",
+          idempotencyKey: "intake-agy",
+          event: {
+            type: "intake",
+            intake: { ...intakeV2Example, projectId: "usba", workspaceId: "usba" },
+          },
+        })
+      ).status,
+    ).toBe(200);
+    expect(
+      (
+        await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
+          taskId: "task-agy",
+          column: "Ready",
+          idempotencyKey: "ready-agy",
+        })
+      ).status,
+    ).toBe(200);
+    expect(
+      (
+        await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
+          taskId: "task-agy",
+          title: "Advisory review",
+          idempotencyKey: "assign-agy",
+          event: {
+            type: "assign",
+            assignment: {
+              ...assignmentExample,
+              taskId: "task-agy",
+              attemptId: "attempt-agy",
+              assignmentId: "assignment-agy",
+              instanceId: "antigravity",
+              taskType: "advisory",
+            },
+          },
+        })
+      ).status,
+    ).toBe(200);
+    expect(
+      (
+        await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
+          taskId: "task-agy",
+          column: "Running",
+          idempotencyKey: "run-agy",
+          model: "gemini-4-argon-high",
+        })
+      ).status,
+    ).toBe(200);
+    const canceledEvent = await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
+      taskId: "task-agy",
+      title: "Advisory review",
+      idempotencyKey: "cancel-event-agy",
+      event: {
+        type: "cancel",
+        command: {
+          command: "cancel",
+          idempotencyKey: "cancel-event-agy-c",
+          taskId: "task-agy",
+          attemptId: "attempt-agy",
+        },
+      },
+    });
+    expect(canceledEvent.status).toBe(200);
+    expect(canceled).toBe(1);
+    const after = (await readCards(handler)).find((item) => item.taskId === "task-agy");
+    expect(after?.state.phase).toBe("recovery_pending");
+    const early = await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
+      taskId: "task-agy",
+      title: "Advisory review",
+      idempotencyKey: "continue-agy-early",
+      event: {
+        type: "continue",
+        command: {
+          command: "continue",
+          idempotencyKey: "continue-agy-early-c",
+          taskId: "task-agy",
+          attemptId: "attempt-agy",
+        },
+      },
+    });
+    expect(early.status).toBe(409);
+    expect(starts).toBe(1);
+    expect(worktree).toBe(true);
+    const held = (await readCards(handler)).find((item) => item.taskId === "task-agy");
+    expect(held?.state.phase).toBe("recovery_pending");
+    expect(held?.state.phase === "recovery_pending" ? held.state.assignment.attemptId : "").toBe(
+      "attempt-agy",
+    );
+    processRunning = false;
+    const again = await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
+      taskId: "task-agy",
+      title: "Advisory review",
+      idempotencyKey: "continue-agy",
+      model: "gemini-4-argon-high",
+      event: {
+        type: "continue",
+        command: {
+          command: "continue",
+          idempotencyKey: "continue-agy-c",
+          taskId: "task-agy",
+          attemptId: "attempt-agy",
+        },
+      },
+    });
+    expect(again.status).toBe(200);
+    expect(starts).toBe(2);
+    expect(worktree).toBe(false);
+    const restarted = (await readCards(handler)).find((item) => item.taskId === "task-agy");
+    expect(restarted?.state.phase).toBe("executing");
+    expect(restarted?.state.phase === "executing" ? restarted.state.assignment.attemptId : "").toBe(
+      "retry-task-agy-2",
+    );
+  });
+
+  it("keeps an interrupted advisory review blocked until the old process stops", async () => {
+    let starts = 0;
+    let processRunning = true;
+    let worktree = true;
+    let stopSignals = 0;
+    let swept = 0;
+    const reviews = {
+      ...idleReviews,
+      sweep: () => {
+        swept += 1;
+        return Effect.void;
+      },
+      start: () => {
+        starts += 1;
+        return Effect.succeed({ status: "running" as const, runId: `agy-run-${starts}` });
+      },
+      watch: () => Effect.succeed(null),
+      recover: () => {
+        if (processRunning) {
+          stopSignals += 1;
+          return Effect.succeed({ status: "still_running" as const });
+        }
+        worktree = false;
+        return Effect.succeed({ status: "stopped" as const });
+      },
+    };
+    const first = handlerFor(undefined, allowRuns, reviews);
+    expect(
+      (
+        await postJson(first.handler, ADAPTER_BOARD_EVENT_PATH, {
+          taskId: "task-agy",
+          title: "Advisory review",
+          idempotencyKey: "intake-agy",
+          event: {
+            type: "intake",
+            intake: { ...intakeV2Example, projectId: "usba", workspaceId: "usba" },
+          },
+        })
+      ).status,
+    ).toBe(200);
+    expect(
+      (
+        await postJson(first.handler, ADAPTER_BOARD_MOVE_PATH, {
+          taskId: "task-agy",
+          column: "Ready",
+          idempotencyKey: "ready-agy",
+        })
+      ).status,
+    ).toBe(200);
+    expect(
+      (
+        await postJson(first.handler, ADAPTER_BOARD_EVENT_PATH, {
+          taskId: "task-agy",
+          title: "Advisory review",
+          idempotencyKey: "assign-agy",
+          event: {
+            type: "assign",
+            assignment: {
+              ...assignmentExample,
+              taskId: "task-agy",
+              attemptId: "attempt-agy",
+              assignmentId: "assignment-agy",
+              taskType: "advisory",
+            },
+          },
+        })
+      ).status,
+    ).toBe(200);
+    expect(
+      (
+        await postJson(first.handler, ADAPTER_BOARD_MOVE_PATH, {
+          taskId: "task-agy",
+          column: "Running",
+          idempotencyKey: "run-agy",
+          model: "gemini-4-argon-high",
+        })
+      ).status,
+    ).toBe(200);
+    const running = (await readCards(first.handler)).find((item) => item.taskId === "task-agy");
+    expect(running?.state.phase).toBe("executing");
+    expect(starts).toBe(1);
+    const second = handlerFor(first.stateDir, allowRuns, reviews);
+    const recovered = (await readCards(second.handler)).find((item) => item.taskId === "task-agy");
+    expect(recovered?.state.phase).toBe("recovery_pending");
+    expect(recovered?.threadId).toBeNull();
+    expect(swept).toBe(1);
+    expect(stopSignals).toBe(0);
+    expect(worktree).toBe(true);
+    const blocked = await postJson(second.handler, ADAPTER_BOARD_MOVE_PATH, {
+      taskId: "task-agy",
+      column: "Running",
+      idempotencyKey: "run-agy-blocked",
+      model: "gemini-4-argon-high",
+    });
+    expect(blocked.status).toBe(409);
+    expect(stopSignals).toBe(1);
+    expect(worktree).toBe(true);
+    expect(starts).toBe(1);
+    const stillBlocked = (await readCards(second.handler)).find(
+      (item) => item.taskId === "task-agy",
+    );
+    expect(stillBlocked?.state.phase).toBe("recovery_pending");
+    processRunning = false;
+    const again = await postJson(second.handler, ADAPTER_BOARD_MOVE_PATH, {
+      taskId: "task-agy",
+      column: "Running",
+      idempotencyKey: "run-agy-again",
+      model: "gemini-4-argon-high",
+    });
+    expect(again.status).toBe(200);
+    expect(starts).toBe(2);
+    expect(worktree).toBe(false);
+    const restarted = (await readCards(second.handler)).find((item) => item.taskId === "task-agy");
+    expect(restarted?.state.phase).toBe("executing");
+    expect(restarted?.state.phase === "executing" ? restarted.state.assignment.attemptId : "").toBe(
+      "retry-task-agy-2",
+    );
+    const late = await postJson(second.handler, ADAPTER_BOARD_EVENT_PATH, {
+      taskId: "task-agy",
+      idempotencyKey: "late-agy",
+      event: {
+        type: "report_progress",
+        report: {
+          version: "v1",
+          taskId: "task-agy",
+          attemptId: "attempt-agy",
+          generation: restarted?.state.phase === "executing" ? restarted.state.run.generation : 1,
+          leaseId: restarted?.state.phase === "executing" ? restarted.state.run.leaseId : "lease-1",
+          status: "working",
+          blockers: [],
+          partialArtifacts: [],
+        },
+      },
+    });
+    expect(late.status).toBe(409);
+    const after = (await readCards(second.handler)).find((item) => item.taskId === "task-agy");
+    expect(after?.state.phase).toBe("executing");
+    expect(after?.state.phase === "executing" ? after.state.assignment.attemptId : "").toBe(
+      "retry-task-agy-2",
+    );
+    expect(after?.state.phase === "executing" ? after.state.run.progress : "touched").toBeNull();
+  });
+
+  it("sends the memory package in the launch and skips a receipt the launch left out", async () => {
+    const decision = "Saturday games start at 7:00.";
+    const prompts: string[] = [];
+    const orientations: string[][] = [];
+    const { handler, stateDir } = handlerFor(
+      undefined,
+      {
+        ...allowRuns,
+        launch: (input) => {
+          prompts.push(input.prompt);
+          const id = prompts.length;
+          return Effect.succeed({
+            threadId: `thread-${id}`,
+            runId: `run-${id}`,
+            disposition: "active" as const,
+            summary: null,
+          });
+        },
+      },
+      {
+        ...idleReviews,
+        start: (input) => {
+          orientations.push([...(input.orientation ?? [])]);
+          return Effect.succeed({ status: "running" as const, runId: "agy-run-memory" });
+        },
+      },
+    );
+    const database = openMemoryDatabase(NodePath.join(stateDir, "memory.db"));
+    submitMemorySync(
+      database,
+      {
+        version: "v1",
+        submissionId: "submission-start",
+        idempotencyKey: "key-start",
+        projectId: "usba",
+        authorId: "jim",
+        taskId: "task-seed",
+        attemptId: "attempt-seed",
+        evidence: [{ evidenceId: "evidence-start", note: "The schedule file says so." }],
+        expectedVersions: [],
+        intent: "accept",
+        facts: [
+          {
+            identity: "tournament-start",
+            fact: {
+              acceptance: "proposed",
+              factId: "fact-start",
+              projectId: "usba",
+              kind: "Decision",
+              body: decision,
+              provenance: { actorId: "jim", at: "2026-10-24T06:00:00Z" },
+              validity: { from: "2026-10-24T06:00:00Z", until: null },
+            },
+          },
+        ],
+        relationships: [],
+      },
+      "jim",
+    );
+    database.close();
+
+    await reachAssigned(handler);
+    const bare = await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
+      taskId: "task-demo",
+      title: "Demo task",
+      idempotencyKey: "start-without-package",
+      threadId: "thread-bare",
+      runId: "run-bare",
+      event: { type: "start_execution" },
+    });
+    expect(bare.status).toBe(200);
+    expect(prompts).toEqual([]);
+    const skipped = openMemoryDatabase(NodePath.join(stateDir, "memory.db"));
+    expect(readAttemptActivitySync(skipped).some((item) => item.attemptId === "attempt-1")).toBe(
+      false,
+    );
+    skipped.close();
+
+    const assign = async (
+      taskId: string,
+      attemptId: string,
+      instanceId: string,
+      extra: Record<string, string> = {},
+    ) => {
+      expect(
+        (
+          await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
+            taskId,
+            title: taskId,
+            idempotencyKey: `intake-${taskId}`,
+            event: {
+              type: "intake",
+              intake: { ...intakeV2Example, projectId: "usba", workspaceId: "usba" },
+            },
+          })
+        ).status,
+      ).toBe(200);
+      expect(
+        (
+          await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
+            taskId,
+            column: "Ready",
+            idempotencyKey: `ready-${taskId}`,
+          })
+        ).status,
+      ).toBe(200);
+      expect(
+        (
+          await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
+            taskId,
+            title: taskId,
+            idempotencyKey: `assign-${taskId}`,
+            event: {
+              type: "assign",
+              assignment: {
+                ...assignmentExample,
+                taskId,
+                attemptId,
+                assignmentId: `assignment-${taskId}`,
+                instanceId,
+                ...extra,
+              },
+            },
+          })
+        ).status,
+      ).toBe(200);
+      expect(
+        (
+          await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
+            taskId,
+            column: "Running",
+            idempotencyKey: `run-${taskId}`,
+          })
+        ).status,
+      ).toBe(200);
+    };
+
+    await assign("task-codex", "attempt-codex", "codex");
+    await assign("task-cursor", "attempt-cursor", "cursor");
+    await assign("task-agy-memory", "attempt-agy-memory", "antigravity", {
+      role: "advisory",
+      taskType: "advisory",
+    });
+
+    expect(prompts).toHaveLength(2);
+    expect(
+      prompts.every((prompt) => prompt.includes(decision) && prompt.includes("Orientation")),
+    ).toBe(true);
+    expect(orientations).toEqual([[decision]]);
+
+    const saved = openMemoryDatabase(NodePath.join(stateDir, "memory.db"));
+    const activity = readAttemptActivitySync(saved);
+    saved.close();
+    expect(activity.map((item) => item.attemptId).sort()).toEqual([
+      "attempt-agy-memory",
+      "attempt-codex",
+      "attempt-cursor",
+    ]);
+    expect(activity.find((item) => item.attemptId === "attempt-cursor")).toMatchObject({
+      authorId: "t3-codex",
+      runtime: "cursor",
+    });
+    expect(activity.find((item) => item.attemptId === "attempt-codex")?.runtime).toBe("codex");
+    expect(activity.find((item) => item.attemptId === "attempt-agy-memory")?.runtime).toBe(
+      "antigravity",
+    );
+
+    const cards = await readCards(handler);
+    const cursor = cards.find((card) => card.taskId === "task-cursor");
+    expect(cursor?.attempts?.map((item) => item.attemptId)).toEqual(["attempt-cursor"]);
+    expect(cursor?.attempts?.[0]?.authorId).toBe("t3-codex");
+  });
+
+  it("does not save a read receipt when the launch is rejected before the prompt is sent", async () => {
+    const prompts: string[] = [];
+    const { handler, stateDir } = handlerFor(undefined, {
+      ...allowRuns,
+      launch: (input) => {
+        prompts.push(input.prompt);
+        return Effect.fail(
+          new AiOsBoard.BoardRunError({ detail: "HTTP 409 sentToProvider:false" }),
+        );
+      },
+    });
+    await reachAssigned(handler);
+    const moved = await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
+      taskId: "task-demo",
+      column: "Running",
+      idempotencyKey: "launch-rejected",
+    });
+    expect(moved.status).toBe(409);
+    expect(await moved.json()).toMatchObject({
+      detail: expect.stringMatching(/sentToProvider:false/),
+    });
+    expect(prompts).toHaveLength(1);
+    expect(prompts[0]).toContain(assignmentExample.contextPackage.requirements);
+    expect(prompts[0]).toContain(assignmentExample.contextPackage.repoCommit);
+    expect(await phaseOfHandler(handler)).toBe("assigned");
+    const saved = openMemoryDatabase(NodePath.join(stateDir, "memory.db"));
+    expect(readAttemptActivitySync(saved).some((item) => item.attemptId === "attempt-1")).toBe(
+      false,
+    );
+    saved.close();
   });
 });

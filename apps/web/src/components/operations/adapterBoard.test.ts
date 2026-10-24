@@ -3,6 +3,7 @@ import {
   applySequence,
   applySequenceEvent,
   assignmentExample,
+  exampleRepoCommit,
   intakeV2Example,
   leaseIdFor,
   REWORK_CAP_LABEL,
@@ -14,13 +15,13 @@ import * as Effect from "effect/Effect";
 import { encodeAdapterBoard } from "@t3tools/ai-os-adapter/board";
 
 import { tasksForBoard } from "./adapterBoard";
-import { blockerReason, columnFor, needsYou, qaStatusLabel } from "./model";
+import { findingsCount } from "./boardVisuals";
 import {
   applyAdapterBoardPayload,
   readAdapterBoardSnapshot,
   subscribeAdapterBoard,
 } from "./adapterFeed";
-import { tasksForProject } from "./model";
+import { blockerReason, columnFor, needsYou, qaStatusLabel, tasksForProject } from "./model";
 
 const at = "2026-10-21T18:00:00Z";
 
@@ -243,6 +244,17 @@ it.effect("puts a capped rework on Blocked and in Needs you", () =>
       }
       if (state.phase !== "executing") return yield* Effect.die("The round must be executing.");
       state = yield* applySequenceEvent(state, {
+        type: "record_runtime_models",
+        taskId,
+        attemptId: attempt,
+        generation: state.run.generation,
+        leaseId: state.run.leaseId,
+        role: "implementer",
+        requested: { model: "gpt-5.4" },
+        actual: { model: "gpt-5.4" },
+      });
+      if (state.phase !== "executing") return yield* Effect.die("The round must be executing.");
+      state = yield* applySequenceEvent(state, {
         type: "submit_completion",
         completion: {
           version: "v1",
@@ -255,8 +267,20 @@ it.effect("puts a capped rework on Blocked and in Needs you", () =>
           evidence: [{ kind: "commit", ref: `commit-${round}` }],
         },
       });
+      if (state.phase !== "awaiting_qa") return yield* Effect.die("The round must be in review.");
+      state = yield* applySequenceEvent(state, {
+        type: "record_runtime_models",
+        taskId,
+        attemptId: attempt,
+        generation: state.run.generation,
+        leaseId: state.run.leaseId,
+        role: "reviewer",
+        requested: { model: "claude-sonnet-5" },
+        actual: { model: "claude-sonnet-5" },
+      });
       state = yield* applySequenceEvent(state, {
         type: "qa",
+        threadId: "thread-qa",
         qa: {
           version: "v1",
           taskId,
@@ -288,5 +312,73 @@ it.effect("puts a capped rework on Blocked and in Needs you", () =>
     assert.strictEqual(needsYou(shown)[0]?.nextAction, "Ask Jim before another fix.");
     assert.strictEqual(task?.reworkCap?.attemptedFixes.length, 3);
     assert.strictEqual(task?.reworkCap?.remainingIssue[0]?.defect, "Defect 3.");
+  }),
+);
+
+it.effect("keeps advisory findings off the QA count", () =>
+  Effect.gen(function* () {
+    const review = {
+      version: "v1" as const,
+      taskId: assignmentExample.taskId,
+      attemptId: assignmentExample.attemptId,
+      generation: 1,
+      leaseId: leaseIdFor(1),
+      mode: "advisory" as const,
+      commit: exampleRepoCommit,
+      model: {
+        requested: "gemini-4-argon-high",
+        actual: null,
+        unverified: true,
+      },
+      findings: [
+        {
+          commit: exampleRepoCommit,
+          files: ["src/page.tsx"],
+          evidence: "The page lists Saturday only.",
+          suggestedAction: "Add Sunday to the schedule.",
+        },
+      ],
+      artifacts: [],
+      evidence: [{ kind: "commit" as const, ref: exampleRepoCommit }],
+      sourcePath: "/tmp/source",
+      scratchPath: "/tmp/scratch",
+    };
+    const reviewed = yield* applySequence([
+      { type: "intake", intake: intakeV2Example },
+      {
+        type: "acknowledge",
+        acknowledgment: {
+          version: "v1",
+          taskId: assignmentExample.taskId,
+          taskLink: taskLinkFor(assignmentExample.taskId),
+          durable: true,
+          receivedAt: at,
+        },
+      },
+      {
+        type: "assign",
+        assignment: { ...assignmentExample, taskType: "advisory" as const },
+      },
+      { type: "start_execution" },
+      { type: "record_advisory", review },
+      { type: "deliver_review", generation: 1, leaseId: leaseIdFor(1) },
+    ]);
+    const shown = tasksForBoard("usba", [
+      {
+        taskId: assignmentExample.taskId,
+        title: "Advisory page",
+        state: reviewed,
+        threadId: null,
+        updatedAt: at,
+      },
+    ]);
+    const task = shown[0];
+    assert.strictEqual(task?.phase, "review_delivered");
+    assert.strictEqual(task?.qa, null);
+    assert.strictEqual(task?.advisory?.findings.length, 1);
+    assert.strictEqual(task?.advisory?.model.actual, null);
+    assert.strictEqual(task?.advisory?.model.unverified, true);
+    if (task === undefined) return;
+    assert.strictEqual(findingsCount(task), 0);
   }),
 );

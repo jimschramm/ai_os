@@ -1,4 +1,4 @@
-import type { SequenceState } from "@t3tools/ai-os-contracts";
+import type { AttemptMemoryActivityV1, SequenceState } from "@t3tools/ai-os-contracts";
 import * as Schema from "effect/Schema";
 
 /**
@@ -9,6 +9,7 @@ export const ADAPTER_BOARD_PATH = "/api/ai-os/board";
 export const ADAPTER_BOARD_EVENTS_PATH = "/api/ai-os/board/events";
 export const ADAPTER_BOARD_MOVE_PATH = "/api/ai-os/board/move";
 export const ADAPTER_BOARD_EVENT_PATH = "/api/ai-os/board/event";
+export const ADAPTER_ANTIGRAVITY_MODELS_PATH = "/api/ai-os/antigravity/models";
 
 export interface AdapterBoardCard {
   readonly taskId: string;
@@ -18,6 +19,8 @@ export interface AdapterBoardCard {
   readonly runId?: string | null;
   readonly revision?: number;
   readonly updatedAt: string;
+  /** Attempt reads and writes joined from memory. Absent on snapshots saved before that join. */
+  readonly attempts?: readonly AttemptMemoryActivityV1[];
 }
 
 // State stays unknown here on purpose. Decoding the sequence schema would pull
@@ -31,6 +34,7 @@ const BoardCards = Schema.Array(
     runId: Schema.optional(Schema.NullOr(Schema.String)),
     revision: Schema.optional(Schema.Number),
     updatedAt: Schema.String,
+    attempts: Schema.optional(Schema.Array(Schema.Unknown)),
   }),
 );
 

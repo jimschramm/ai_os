@@ -16,6 +16,7 @@ import {
   revisionTwo,
 } from "./examples.ts";
 import { leaseIdFor } from "./canonical.ts";
+import { QA_INCOMPLETE_LABEL } from "./errors.ts";
 import {
   LEGAL_EVENTS,
   acceptedRevision,
@@ -29,6 +30,29 @@ import {
 } from "./sequence.ts";
 
 const failure = (state: unknown, event: unknown) => Effect.flip(applySequenceEvent(state, event));
+
+const runtimeRecord = (
+  role: "implementer" | "reviewer",
+  actual: string,
+  generation = 1,
+): SequenceEvent => ({
+  type: "record_runtime_models",
+  taskId: "task-usba-page",
+  attemptId: "attempt-1",
+  generation,
+  leaseId: leaseIdFor(generation),
+  role,
+  requested: { model: actual },
+  actual: { model: actual },
+});
+
+const acceptOn = (qaModel: string, implementerModel: string, revision = revisionOne) => ({
+  ...qaAcceptExample,
+  qaModel,
+  implementerModel,
+  artifactRevision: revision,
+  acceptedRevision: revision,
+});
 
 it.effect("runs request, assignment, execution, QA, rework, and an accepted result", () =>
   Effect.gen(function* () {
@@ -44,10 +68,14 @@ it.effect("runs request, assignment, execution, QA, rework, and an accepted resu
       "acknowledged",
       "assigned",
       "executing",
+      "executing",
+      "awaiting_qa",
       "awaiting_qa",
       "awaiting_qa",
       "rework",
       "executing",
+      "executing",
+      "awaiting_qa",
       "awaiting_qa",
       "accepted",
     ]);
@@ -97,7 +125,7 @@ it.effect("confirms only after the intake is a durable receipt", () =>
 
 it.effect("keeps a completion claim out of acceptance until independent QA", () =>
   Effect.gen(function* () {
-    const executing = yield* applySequence(happyPathEvents.slice(0, 4));
+    const executing = yield* applySequence(happyPathEvents.slice(0, 5));
     const submitted = yield* applySequenceEvent(executing, {
       type: "submit_completion",
       completion: completionExample,
@@ -106,7 +134,11 @@ it.effect("keeps a completion claim out of acceptance until independent QA", () 
     assert.strictEqual(acceptedRevision(submitted), null);
     assert.strictEqual(kanbanColumn(submitted.phase), "Review");
 
-    const waiting = yield* applySequenceEvent(submitted, { type: "qa", qa: qaWaitingExample });
+    const waiting = yield* applySequenceEvent(submitted, {
+      type: "qa",
+      threadId: "thread-qa",
+      qa: qaWaitingExample,
+    });
     assert.strictEqual(waiting.phase, "awaiting_qa");
     assert.strictEqual(acceptedRevision(waiting), null);
     const bypass = yield* failure(waiting, { type: "start_execution" });
@@ -115,38 +147,438 @@ it.effect("keeps a completion claim out of acceptance until independent QA", () 
   }),
 );
 
-it.effect("requires QA to use a different model than the assigned implementer", () =>
+it.effect("records an advisory review without creating a QA verdict", () =>
+  Effect.gen(function* () {
+    const executing = yield* applySequence(happyPathEvents.slice(0, 4));
+    assert.strictEqual(executing.phase, "executing");
+    const review = {
+      version: "v1" as const,
+      taskId: assignmentExample.taskId,
+      attemptId: assignmentExample.attemptId,
+      generation: 1,
+      leaseId: leaseIdFor(1),
+      mode: "advisory" as const,
+      commit: exampleRepoCommit,
+      model: {
+        requested: "gemini-4-argon-high",
+        actual: "gemini-4-argon-high",
+        unverified: false,
+      },
+      findings: [
+        {
+          commit: exampleRepoCommit,
+          files: ["src/page.tsx"],
+          evidence: "The page lists Saturday only.",
+          suggestedAction: "Add Sunday to the schedule.",
+        },
+      ],
+      artifacts: [],
+      evidence: [{ kind: "commit" as const, ref: exampleRepoCommit }],
+      sourcePath: "/tmp/source",
+      scratchPath: "/tmp/scratch",
+    };
+    const recorded = yield* applySequenceEvent(executing, { type: "record_advisory", review });
+    assert.strictEqual(recorded.phase, "executing");
+    if (recorded.phase !== "executing") return;
+    assert.deepStrictEqual(recorded.run.advisory?.model.requested, {
+      model: "gemini-4-argon-high",
+    });
+    assert.strictEqual(recorded.run.advisory?.findings.length, 1);
+    assert.equal("qa" in recorded, false);
+
+    const otherCommit = yield* failure(executing, {
+      type: "record_advisory",
+      review: { ...review, commit: "a".repeat(40), findings: [] },
+    });
+    assert.strictEqual(otherCommit.reason, "revision_mismatch");
+  }),
+);
+
+it.effect("delivers an advisory review without entering QA", () =>
+  Effect.gen(function* () {
+    const advisory = {
+      ...assignmentExample,
+      taskType: "advisory" as const,
+    };
+    const executing = yield* applySequence([
+      happyPathEvents[0]!,
+      happyPathEvents[1]!,
+      { type: "assign", assignment: advisory },
+      { type: "start_execution" },
+    ]);
+    const review = {
+      version: "v1" as const,
+      taskId: assignmentExample.taskId,
+      attemptId: assignmentExample.attemptId,
+      generation: 1,
+      leaseId: leaseIdFor(1),
+      mode: "advisory" as const,
+      commit: exampleRepoCommit,
+      model: {
+        requested: "gemini-4-argon-high",
+        actual: "gemini-4-argon-high",
+        unverified: false,
+      },
+      findings: [
+        {
+          commit: exampleRepoCommit,
+          files: ["src/page.tsx"],
+          evidence: "The page lists Saturday only.",
+          suggestedAction: "Add Sunday to the schedule.",
+        },
+      ],
+      artifacts: [],
+      evidence: [{ kind: "commit" as const, ref: exampleRepoCommit }],
+      sourcePath: "/tmp/source",
+      scratchPath: "/tmp/scratch",
+    };
+    const recorded = yield* applySequenceEvent(executing, { type: "record_advisory", review });
+    const refused = yield* failure(recorded, {
+      type: "submit_completion",
+      completion: completionExample,
+    });
+    assert.strictEqual(refused.reason, "illegal_transition");
+    const delivered = yield* applySequenceEvent(recorded, {
+      type: "deliver_review",
+      generation: 1,
+      leaseId: leaseIdFor(1),
+    });
+    assert.strictEqual(delivered.phase, "review_delivered");
+    if (delivered.phase !== "review_delivered") return;
+    assert.strictEqual(delivered.reviewLabel, "Review delivered");
+    assert.strictEqual(kanbanColumn(delivered.phase), "Done");
+    assert.strictEqual(acceptedRevision(delivered), null);
+    assert.strictEqual(delivered.run.advisory?.commit, exampleRepoCommit);
+    assert.strictEqual(delivered.run.advisory?.findings.length, 1);
+    const approved = yield* failure(delivered, {
+      type: "qa",
+      threadId: "thread-qa",
+      qa: qaAcceptExample,
+    });
+    assert.strictEqual(approved.reason, "illegal_transition");
+
+    const implementation = yield* applySequence([
+      happyPathEvents[0]!,
+      happyPathEvents[1]!,
+      {
+        type: "assign",
+        assignment: { ...assignmentExample, taskType: "implementation" as const },
+      },
+      { type: "start_execution" },
+      runtimeRecord("implementer", "gpt-5.4"),
+      { type: "submit_completion", completion: completionExample },
+    ]);
+    assert.strictEqual(implementation.phase, "awaiting_qa");
+  }),
+);
+
+it.effect("keeps QA on the runtime implementer when usage names another model", () =>
+  Effect.gen(function* () {
+    const executing = yield* applySequence([
+      happyPathEvents[0]!,
+      happyPathEvents[1]!,
+      {
+        type: "assign",
+        assignment: { ...assignmentExample, implementerModel: "gpt-5.4" },
+      },
+      { type: "start_execution" },
+      {
+        type: "record_runtime_models",
+        taskId: "task-usba-page",
+        attemptId: "attempt-1",
+        generation: 1,
+        leaseId: leaseIdFor(1),
+        role: "implementer",
+        requested: { model: "gpt-5.4" },
+        actual: { model: "gpt-6-sol" },
+      },
+      {
+        type: "report_usage",
+        generation: 1,
+        leaseId: leaseIdFor(1),
+        measurement: {
+          kind: "reported_tokens" as const,
+          inputTokens: 4,
+          outputTokens: 2,
+          attribution: {
+            projectId: "usba",
+            taskId: assignmentExample.taskId,
+            attemptId: assignmentExample.attemptId,
+            agentId: "codex-t3",
+            platform: "t3" as const,
+            provider: "openai",
+            model: "gpt-6-astra-high",
+          },
+        },
+      },
+      { type: "submit_completion", completion: completionExample },
+    ]);
+    if (executing.phase !== "awaiting_qa") return yield* Effect.die("Completion must wait for QA.");
+    assert.strictEqual(executing.run.usage.length, 1);
+    assert.strictEqual(executing.run.implementerRuntime?.actual?.model, "gpt-6-sol");
+    assert.strictEqual(executing.run.implementerRuntime?.requested?.model, "gpt-5.4");
+    const unknown = yield* applySequenceEvent(executing, {
+      type: "qa",
+      threadId: "thread-qa",
+      qa: acceptOn("claude-sonnet-5", "gpt-6-sol"),
+    });
+    assert.strictEqual(unknown.phase, "qa_incomplete");
+    const withSameReviewer = yield* applySequenceEvent(
+      executing,
+      runtimeRecord("reviewer", "gpt-6-sol-medium"),
+    );
+    const sameBase = yield* failure(withSameReviewer, {
+      type: "qa",
+      threadId: "thread-qa",
+      qa: acceptOn("gpt-6-sol-medium", "gpt-6-astra"),
+    });
+    assert.strictEqual(sameBase.reason, "qa_same_model");
+    const substituted = yield* failure(withSameReviewer, {
+      type: "record_runtime_models",
+      taskId: "task-usba-page",
+      attemptId: "attempt-1",
+      generation: 1,
+      leaseId: leaseIdFor(1),
+      role: "reviewer",
+      requested: { model: "gpt-6-astra" },
+      actual: { model: "gpt-6-astra" },
+    });
+    assert.strictEqual(substituted.reason, "illegal_transition");
+    const withReviewer = yield* applySequenceEvent(
+      executing,
+      runtimeRecord("reviewer", "gpt-6-astra"),
+    );
+    const declared = yield* failure(withReviewer, {
+      type: "qa",
+      threadId: "thread-qa",
+      qa: acceptOn("claude-sonnet-5", "gpt-6-sol"),
+    });
+    assert.strictEqual(declared.reason, "implementer_mismatch");
+    const reviewed = yield* applySequenceEvent(withReviewer, {
+      type: "qa",
+      threadId: "thread-qa",
+      qa: {
+        ...qaReworkExample,
+        qaModel: "gpt-6-astra",
+        implementerModel: "gpt-6-sol",
+      },
+    });
+    assert.strictEqual(reviewed.phase, "rework");
+  }),
+);
+
+it.effect("blocks completion when the implementer's actual model is unknown", () =>
+  Effect.gen(function* () {
+    const executing = yield* applySequence(happyPathEvents.slice(0, 4));
+    const blocked = yield* failure(executing, {
+      type: "submit_completion",
+      completion: completionExample,
+    });
+    assert.strictEqual(blocked.reason, "qa_model_unknown");
+    assert.strictEqual(executing.phase, "executing");
+    const submitted = yield* applySequence(happyPathEvents.slice(0, 6));
+    assert.strictEqual(submitted.phase, "awaiting_qa");
+  }),
+);
+
+it.effect("keeps findings and waits for a verified reviewer when a model is unknown", () =>
+  Effect.gen(function* () {
+    if (qaReworkExample.availability !== "available") return;
+    const awaiting = yield* applySequence(happyPathEvents.slice(0, 6));
+    const reworked = yield* applySequenceEvent(awaiting, {
+      type: "qa",
+      threadId: "thread-qa",
+      qa: qaReworkExample,
+    });
+    assert.strictEqual(reworked.phase, "qa_incomplete");
+    if (reworked.phase !== "qa_incomplete") return;
+    assert.strictEqual(reworked.qaLabel, QA_INCOMPLETE_LABEL);
+    assert.strictEqual(kanbanColumn(reworked.phase), "Review");
+    assert.deepStrictEqual(reworked.findings, qaReworkExample.findings);
+    assert.strictEqual(reworked.attemptedVerdict, "rework");
+
+    const acceptedAttempt = yield* applySequenceEvent(awaiting, {
+      type: "qa",
+      runId: "run-qa",
+      qa: {
+        ...acceptOn("claude-sonnet-5", "gpt-5.4"),
+        findings: qaReworkExample.findings,
+      },
+    });
+    assert.strictEqual(acceptedAttempt.phase, "qa_incomplete");
+    if (acceptedAttempt.phase !== "qa_incomplete") return;
+    assert.deepStrictEqual(acceptedAttempt.findings, qaReworkExample.findings);
+    assert.strictEqual(acceptedAttempt.attemptedVerdict, "accept");
+
+    const withImplementer = yield* applySequence(happyPathEvents.slice(0, 6));
+    const waiting = yield* applySequenceEvent(withImplementer, {
+      type: "qa",
+      threadId: "thread-qa",
+      qa: qaReworkExample,
+    });
+    const verified = yield* applySequenceEvent(
+      waiting,
+      runtimeRecord("reviewer", "claude-sonnet-5"),
+    );
+    const done = yield* applySequenceEvent(verified, {
+      type: "qa",
+      threadId: "thread-qa",
+      qa: qaReworkExample,
+    });
+    assert.strictEqual(done.phase, "rework");
+    if (done.phase !== "rework") return;
+    assert.strictEqual(done.run.priorReviews?.[0]?.attemptedVerdict, "rework");
+    assert.deepStrictEqual(done.run.priorReviews?.[0]?.findings, qaReworkExample.findings);
+  }),
+);
+
+it.effect("a verified reviewer replaces an unknown one and can accept", () =>
   Effect.gen(function* () {
     if (qaReworkExample.availability !== "available") {
       return yield* Effect.die("The rework example must be an available verdict.");
     }
-    const awaiting = yield* applySequence(happyPathEvents.slice(0, 5));
-    const sameModel = yield* failure(awaiting, {
+    const awaiting = yield* applySequence(happyPathEvents.slice(0, 6));
+    const held = yield* applySequenceEvent(awaiting, {
       type: "qa",
+      threadId: "thread-qa",
       qa: {
-        ...qaReworkExample,
-        qaModel: assignmentExample.implementerModel,
-        implementerModel: "claude-sonnet-5",
+        ...acceptOn("claude-sonnet-5", "gpt-5.4"),
+        findings: qaReworkExample.findings,
       },
     });
+    if (held.phase !== "qa_incomplete") {
+      return yield* Effect.die("An unknown reviewer must leave the review incomplete.");
+    }
+    const verified = yield* applySequenceEvent(held, runtimeRecord("reviewer", "claude-sonnet-5"));
+    const accepted = yield* applySequenceEvent(verified, {
+      type: "qa",
+      threadId: "thread-qa",
+      qa: {
+        ...acceptOn("claude-sonnet-5", "gpt-5.4"),
+        findings: [],
+      },
+    });
+    assert.strictEqual(accepted.phase, "accepted");
+    if (accepted.phase !== "accepted") return;
+    assert.strictEqual(accepted.run.reviewerRuntime?.actual?.model, "claude-sonnet-5");
+    assert.strictEqual(accepted.run.priorReviews?.[0]?.attemptedVerdict, "accept");
+    assert.deepStrictEqual(accepted.run.priorReviews?.[0]?.findings, qaReworkExample.findings);
+    const swapped = yield* failure(verified, {
+      ...runtimeRecord("reviewer", "gpt-6-astra"),
+      requested: { model: "gpt-6-astra" },
+      actual: { model: "gpt-6-astra" },
+    });
+    assert.strictEqual(swapped.reason, "illegal_transition");
+  }),
+);
+
+it.effect("rejects rework when the runtime models share a base", () =>
+  Effect.gen(function* () {
+    const sameBase = yield* applySequence([
+      ...happyPathEvents.slice(0, 6),
+      runtimeRecord("reviewer", "gpt-5.4"),
+    ]);
+    const rework = yield* failure(sameBase, {
+      type: "qa",
+      threadId: "thread-qa",
+      qa: { ...qaReworkExample, qaModel: "claude-sonnet-5" },
+    });
+    assert.strictEqual(rework.reason, "qa_same_model");
+    const accepted = yield* failure(sameBase, {
+      type: "qa",
+      threadId: "thread-qa",
+      qa: acceptOn("claude-sonnet-5", "gpt-5.4"),
+    });
+    assert.strictEqual(accepted.reason, "qa_same_model");
+  }),
+);
+
+it.effect("treats Argon efforts as one base and keeps Sol and Astra distinct", () =>
+  Effect.gen(function* () {
+    const argon = yield* applySequence([
+      happyPathEvents[0]!,
+      happyPathEvents[1]!,
+      {
+        type: "assign",
+        assignment: { ...assignmentExample, implementerModel: "gemini-4-argon-high" },
+      },
+      { type: "start_execution" },
+      runtimeRecord("implementer", "gemini-4-argon-high"),
+      { type: "submit_completion", completion: completionExample },
+      runtimeRecord("reviewer", "gemini-4-argon-medium"),
+    ]);
+    const sameBase = yield* failure(argon, {
+      type: "qa",
+      threadId: "thread-qa",
+      qa: acceptOn("gemini-4-argon-medium", "gpt-6-sol"),
+    });
+    assert.strictEqual(sameBase.reason, "qa_same_model");
+
+    const sol = yield* applySequence([
+      happyPathEvents[0]!,
+      happyPathEvents[1]!,
+      {
+        type: "assign",
+        assignment: { ...assignmentExample, implementerModel: "gpt-6-sol" },
+      },
+      { type: "start_execution" },
+      runtimeRecord("implementer", "gpt-6-sol"),
+      { type: "submit_completion", completion: completionExample },
+      runtimeRecord("reviewer", "gpt-6-astra"),
+    ]);
+    const reviewed = yield* applySequenceEvent(sol, {
+      type: "qa",
+      threadId: "thread-qa",
+      qa: {
+        ...qaReworkExample,
+        qaModel: "gpt-6-astra",
+        implementerModel: "gpt-6-sol",
+      },
+    });
+    assert.strictEqual(reviewed.phase, "rework");
+  }),
+);
+
+it.effect("requires QA to use a different base model than the implementer that ran", () =>
+  Effect.gen(function* () {
+    if (qaReworkExample.availability !== "available") {
+      return yield* Effect.die("The rework example must be an available verdict.");
+    }
+    const awaiting = yield* applySequence(happyPathEvents.slice(0, 6));
+    const sameModel = yield* failure(
+      yield* applySequenceEvent(awaiting, runtimeRecord("reviewer", "gpt-5.4")),
+      {
+        type: "qa",
+        threadId: "thread-qa",
+        qa: acceptOn("gpt-5.4", "claude-sonnet-5"),
+      },
+    );
     assert.strictEqual(sameModel.reason, "qa_same_model");
 
-    const otherImplementer = yield* failure(awaiting, {
-      type: "qa",
-      qa: {
-        ...qaReworkExample,
-        qaModel: "claude-sonnet-5",
-        implementerModel: "grok-4",
+    const otherImplementer = yield* failure(
+      yield* applySequenceEvent(awaiting, runtimeRecord("reviewer", "claude-sonnet-5")),
+      {
+        type: "qa",
+        threadId: "thread-qa",
+        qa: acceptOn("claude-sonnet-5", "grok-4"),
       },
-    });
+    );
     assert.strictEqual(otherImplementer.reason, "implementer_mismatch");
   }),
 );
 
 it.effect("binds acceptance to the exact final revision", () =>
   Effect.gen(function* () {
-    const awaitingRework = yield* applySequence(happyPathEvents.slice(0, 6));
-    const rework = yield* applySequenceEvent(awaitingRework, { type: "qa", qa: qaReworkExample });
+    const awaitingRework = yield* applySequence(happyPathEvents.slice(0, 7));
+    const reviewed = yield* applySequenceEvent(
+      awaitingRework,
+      runtimeRecord("reviewer", "claude-sonnet-5"),
+    );
+    const rework = yield* applySequenceEvent(reviewed, {
+      type: "qa",
+      threadId: "thread-qa",
+      qa: qaReworkExample,
+    });
     const executing = yield* applySequenceEvent(rework, { type: "start_execution" });
     if (executing.phase !== "executing") {
       return yield* Effect.die("Rework must be executing before the repeated submission.");
@@ -161,17 +593,22 @@ it.effect("binds acceptance to the exact final revision", () =>
     });
     assert.strictEqual(repeated.reason, "revision_mismatch");
 
-    const corrected = yield* applySequence(happyPathEvents.slice(0, 9));
+    const corrected = yield* applySequence(happyPathEvents.slice(0, 13));
     if (qaAcceptExample.availability !== "available" || qaAcceptExample.verdict !== "accept") {
       return yield* Effect.die("The accept example must accept a revision.");
     }
     const stale = yield* failure(corrected, {
       type: "qa",
+      threadId: "thread-qa",
       qa: { ...qaAcceptExample, artifactRevision: revisionOne, acceptedRevision: revisionOne },
     });
     assert.strictEqual(stale.reason, "acceptance_revision_mismatch");
 
-    const accepted = yield* applySequenceEvent(corrected, { type: "qa", qa: qaAcceptExample });
+    const accepted = yield* applySequenceEvent(corrected, {
+      type: "qa",
+      threadId: "thread-qa",
+      qa: qaAcceptExample,
+    });
     assert.deepStrictEqual(acceptedRevision(accepted), revisionTwo);
     const changedAgain = yield* applySequenceEvent(accepted, { type: "start_execution" });
     assert.strictEqual(changedAgain.phase, "executing");
@@ -212,7 +649,7 @@ it.effect("blocks an expired lease as recovery_pending and does not return it to
         },
       },
       { type: "submit_completion", completion: completionExample },
-      { type: "qa", qa: qaAcceptExample },
+      { type: "qa", threadId: "thread-qa", qa: qaAcceptExample },
     ];
     for (const event of events) {
       const error = yield* failure(blocked, event);
@@ -222,9 +659,103 @@ it.effect("blocks an expired lease as recovery_pending and does not return it to
   }),
 );
 
+it.effect("retries an advisory review under a new attempt and rejects the old one", () =>
+  Effect.gen(function* () {
+    const executing = yield* applySequence([
+      happyPathEvents[0]!,
+      happyPathEvents[1]!,
+      {
+        type: "assign",
+        assignment: { ...assignmentExample, taskType: "advisory" as const },
+      },
+      { type: "start_execution" },
+    ]);
+    const blocked = yield* applySequenceEvent(executing, {
+      type: "lease_expired",
+      lease: {
+        taskId: "task-usba-page",
+        attemptId: "attempt-1",
+        generation: 1,
+        leaseId: leaseIdFor(1),
+      },
+    });
+    assert.strictEqual(blocked.phase, "recovery_pending");
+    const sameAttempt = yield* failure(blocked, {
+      type: "resolve_recovery",
+      command: {
+        command: "resolve_recovery",
+        outcome: "continue",
+        idempotencyKey: "recover-same",
+        taskId: "task-usba-page",
+        attemptId: "attempt-1",
+      },
+    });
+    assert.strictEqual(sameAttempt.reason, "illegal_transition");
+
+    const implementation = yield* applySequence(happyPathEvents.slice(0, 4));
+    const implementationBlocked = yield* applySequenceEvent(implementation, {
+      type: "lease_expired",
+      lease: {
+        taskId: "task-usba-page",
+        attemptId: "attempt-1",
+        generation: 1,
+        leaseId: leaseIdFor(1),
+      },
+    });
+    const changedAttempt = yield* failure(implementationBlocked, {
+      type: "resolve_recovery",
+      command: {
+        command: "resolve_recovery",
+        outcome: "continue",
+        idempotencyKey: "recover-impl",
+        taskId: "task-usba-page",
+        attemptId: "attempt-1",
+        nextAttemptId: "attempt-2",
+      },
+    });
+    assert.strictEqual(changedAttempt.reason, "illegal_transition");
+
+    const assigned = yield* applySequenceEvent(blocked, {
+      type: "resolve_recovery",
+      command: {
+        command: "resolve_recovery",
+        outcome: "continue",
+        idempotencyKey: "recover-new",
+        taskId: "task-usba-page",
+        attemptId: "attempt-1",
+        nextAttemptId: "attempt-2",
+      },
+    });
+    if (assigned.phase !== "assigned") {
+      return yield* Effect.die("Advisory recovery must return to Ready under a new attempt.");
+    }
+    assert.strictEqual(assigned.assignment.attemptId, "attempt-2");
+    const restarted = yield* applySequenceEvent(assigned, { type: "start_execution" });
+    if (restarted.phase !== "executing") {
+      return yield* Effect.die("The replacement attempt must be executing.");
+    }
+    const late = yield* failure(restarted, {
+      type: "report_progress",
+      report: {
+        version: "v1",
+        taskId: "task-usba-page",
+        attemptId: "attempt-1",
+        generation: restarted.run.generation,
+        leaseId: restarted.run.leaseId,
+        status: "working",
+        blockers: [],
+        partialArtifacts: [],
+      },
+    });
+    assert.strictEqual(late.reason, "attempt_mismatch");
+    assert.strictEqual(restarted.phase, "executing");
+    assert.strictEqual(restarted.assignment.attemptId, "attempt-2");
+  }),
+);
+
 it.effect("rejects a completion or QA payload for a different task", () =>
   Effect.gen(function* () {
-    const executing = yield* applySequence(happyPathEvents.slice(0, 4));
+    const executing = yield* applySequence(happyPathEvents.slice(0, 5));
     const otherTask = yield* failure(executing, {
       type: "submit_completion",
       completion: { ...completionExample, taskId: "task-other" },
@@ -236,6 +767,7 @@ it.effect("rejects a completion or QA payload for a different task", () =>
     });
     const otherAttempt = yield* failure(awaiting, {
       type: "qa",
+      threadId: "thread-qa",
       qa: { ...qaWaitingExample, attemptId: "attempt-2" },
     });
     assert.strictEqual(otherAttempt.reason, "attempt_mismatch");
@@ -247,15 +779,15 @@ it.effect("does not treat a differently cased model id as a different QA model",
     if (qaReworkExample.availability !== "available") {
       return yield* Effect.die("The rework example must be an available verdict.");
     }
-    const awaiting = yield* applySequence(happyPathEvents.slice(0, 5));
-    const cased = yield* failure(awaiting, {
-      type: "qa",
-      qa: {
-        ...qaReworkExample,
-        qaModel: "GPT-5.4",
-        implementerModel: "claude-sonnet-5",
+    const awaiting = yield* applySequence(happyPathEvents.slice(0, 6));
+    const cased = yield* failure(
+      yield* applySequenceEvent(awaiting, runtimeRecord("reviewer", "GPT-5.4")),
+      {
+        type: "qa",
+        threadId: "thread-qa",
+        qa: acceptOn("GPT-5.4", "claude-sonnet-5"),
       },
-    });
+    );
     assert.strictEqual(cased.reason, "qa_same_model");
 
     const acknowledged = yield* applySequence(happyPathEvents.slice(0, 2));
@@ -264,38 +796,34 @@ it.effect("does not treat a differently cased model id as a different QA model",
       assignment: { ...assignmentExample, implementerModel: "openai/gpt-5.4" },
     });
     const executing = yield* applySequenceEvent(assigned, { type: "start_execution" });
-    const submitted = yield* applySequenceEvent(executing, {
+    const running = yield* applySequenceEvent(executing, runtimeRecord("implementer", "gpt-5.4"));
+    const submitted = yield* applySequenceEvent(running, {
       type: "submit_completion",
       completion: completionExample,
     });
-    const prefixed = yield* failure(submitted, {
+    const withReviewer = yield* applySequenceEvent(submitted, runtimeRecord("reviewer", "gpt-5.4"));
+    const prefixed = yield* failure(withReviewer, {
       type: "qa",
-      qa: {
-        ...qaReworkExample,
-        qaModel: "OpenAI:GPT-5.4",
-        implementerModel: "claude-sonnet-5",
-      },
+      threadId: "thread-qa",
+      qa: acceptOn("OpenAI:GPT-5.4", "claude-sonnet-5"),
     });
     assert.strictEqual(prefixed.reason, "qa_same_model");
 
-    const azure = yield* failure(submitted, {
+    const azure = yield* failure(withReviewer, {
       type: "qa",
-      qa: {
-        ...qaReworkExample,
-        qaModel: "azure/gpt-5.4",
-        implementerModel: "claude-sonnet-5",
-      },
+      threadId: "thread-qa",
+      qa: acceptOn("azure/gpt-5.4", "claude-sonnet-5"),
     });
     assert.strictEqual(azure.reason, "qa_same_model");
 
-    const bare = yield* failure(awaiting, {
-      type: "qa",
-      qa: {
-        ...qaReworkExample,
-        qaModel: "openai/gpt-5.4",
-        implementerModel: "claude-sonnet-5",
+    const bare = yield* failure(
+      yield* applySequenceEvent(awaiting, runtimeRecord("reviewer", "gpt-5.4")),
+      {
+        type: "qa",
+        threadId: "thread-qa",
+        qa: acceptOn("openai/gpt-5.4", "claude-sonnet-5"),
       },
-    });
+    );
     assert.strictEqual(bare.reason, "qa_same_model");
   }),
 );
@@ -317,9 +845,10 @@ it.effect("rejects a QA model id that is not in the model alphabet", () =>
     if (qaReworkExample.availability !== "available") {
       return yield* Effect.die("The rework example must be an available verdict.");
     }
-    const awaiting = yield* applySequence(happyPathEvents.slice(0, 5));
+    const awaiting = yield* applySequence(happyPathEvents.slice(0, 6));
     const hidden = yield* failure(awaiting, {
       type: "qa",
+      threadId: "thread-qa",
       qa: {
         ...qaReworkExample,
         qaModel: "gpt-\u200b5.4",
@@ -337,7 +866,7 @@ it.effect("rejects schema-invalid input on every transition", () =>
     const acknowledged = yield* applySequence(happyPathEvents.slice(0, 2));
     const assigned = yield* applySequence(happyPathEvents.slice(0, 3));
     const executing = yield* applySequence(happyPathEvents.slice(0, 4));
-    const awaiting = yield* applySequence(happyPathEvents.slice(0, 5));
+    const awaiting = yield* applySequence(happyPathEvents.slice(0, 6));
     const cases = [
       [initialSequenceState, { type: "intake", intake: { ...intakeExample, request: "   " } }],
       [
@@ -364,6 +893,7 @@ it.effect("rejects schema-invalid input on every transition", () =>
         awaiting,
         {
           type: "qa",
+          threadId: "thread-qa",
           qa: { ...qaReworkExample, qaModel: "gpt-\u200b5.4" },
         },
       ],
@@ -621,7 +1151,7 @@ it.effect("rejects an accepted phase that has no completion or independent QA ve
         qa: { ...accepted.qa, qaModel: accepted.assignment.implementerModel },
       }),
     );
-    const awaiting = yield* applySequence(happyPathEvents.slice(0, 5));
+    const awaiting = yield* applySequence(happyPathEvents.slice(0, 6));
     const acceptedTooEarly = yield* Effect.exit(
       decodeSequenceState({ ...awaiting, qa: qaAcceptExample }),
     );
@@ -631,6 +1161,69 @@ it.effect("rejects an accepted phase that has no completion or independent QA ve
     assert.strictEqual(Exit.isFailure(acceptedTooEarly), true);
     assert.strictEqual(Exit.isFailure(bareFailed), true);
     assert.strictEqual(Exit.isFailure(bareCancelled), true);
+  }),
+);
+
+it.effect("decodes a stored card from before runtime models were recorded", () =>
+  Effect.gen(function* () {
+    const accepted = yield* applySequence(happyPathEvents);
+    if (accepted.phase !== "accepted") {
+      return yield* Effect.die("The happy path must accept the final revision.");
+    }
+    const legacyAccepted = yield* decodeSequenceState({
+      ...accepted,
+      run: {
+        generation: accepted.run.generation,
+        leaseId: accepted.run.leaseId,
+        leaseExpiresAt: accepted.run.leaseExpiresAt,
+        progress: accepted.run.progress,
+        retryCount: accepted.run.retryCount,
+        retryLimit: accepted.run.retryLimit,
+        usage: accepted.run.usage,
+      },
+    });
+    assert.strictEqual(legacyAccepted.phase, "accepted");
+    if (legacyAccepted.phase !== "accepted") return;
+    assert.strictEqual(legacyAccepted.run.implementerRuntime, undefined);
+    assert.strictEqual(legacyAccepted.run.reviewerRuntime, undefined);
+
+    const rework = yield* applySequence(happyPathEvents.slice(0, 9));
+    if (rework.phase !== "rework") return yield* Effect.die("The path must be in rework.");
+    const legacyRework = yield* decodeSequenceState({
+      ...rework,
+      run: {
+        generation: rework.run.generation,
+        leaseId: rework.run.leaseId,
+        leaseExpiresAt: rework.run.leaseExpiresAt,
+        progress: rework.run.progress,
+        retryCount: rework.run.retryCount,
+        retryLimit: rework.run.retryLimit,
+        usage: rework.run.usage,
+      },
+    });
+    assert.strictEqual(legacyRework.phase, "rework");
+
+    const awaiting = yield* applySequence(happyPathEvents.slice(0, 6));
+    const incomplete = yield* applySequenceEvent(awaiting, {
+      type: "qa",
+      threadId: "thread-qa",
+      qa: qaReworkExample,
+    });
+    assert.strictEqual(incomplete.phase, "qa_incomplete");
+
+    const sameBase = yield* Effect.exit(
+      decodeSequenceState({
+        ...accepted,
+        run: {
+          ...accepted.run,
+          reviewerRuntime: {
+            requested: { model: "gpt-5.4" },
+            actual: { model: "gpt-5.4" },
+          },
+        },
+      }),
+    );
+    assert.strictEqual(Exit.isFailure(sameBase), true);
   }),
 );
 
@@ -680,7 +1273,7 @@ it.effect("stores an assignment snapshot that later caller mutation cannot chang
 
 it.effect("treats a rework revision as stale when only the git SHA case differs", () =>
   Effect.gen(function* () {
-    const rework = yield* applySequence(happyPathEvents.slice(0, 7));
+    const rework = yield* applySequence(happyPathEvents.slice(0, 9));
     if (rework.phase !== "rework" || rework.reworkRevision.type !== "git") {
       return yield* Effect.die("Rework must record the reviewed git revision.");
     }
@@ -729,7 +1322,7 @@ it.effect("rejects stored progress or completion that names a different run", ()
     assert.strictEqual(progressWrite.reason, "invalid_payload");
     assert.strictEqual(progressWrite.from, "executing");
 
-    const awaiting = yield* applySequence(happyPathEvents.slice(0, 5));
+    const awaiting = yield* applySequence(happyPathEvents.slice(0, 6));
     if (awaiting.phase !== "awaiting_qa") {
       return yield* Effect.die("The completion must be awaiting QA.");
     }
@@ -742,7 +1335,11 @@ it.effect("rejects stored progress or completion that names a different run", ()
       },
     };
     const completionState = yield* Effect.exit(decodeSequenceState(forgedCompletion));
-    const qaOverStale = yield* failure(forgedCompletion, { type: "qa", qa: qaWaitingExample });
+    const qaOverStale = yield* failure(forgedCompletion, {
+      type: "qa",
+      threadId: "thread-qa",
+      qa: qaWaitingExample,
+    });
     assert.strictEqual(Exit.isFailure(completionState), true);
     assert.strictEqual(qaOverStale.reason, "invalid_payload");
     assert.strictEqual(qaOverStale.from, "awaiting_qa");

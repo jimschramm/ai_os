@@ -59,8 +59,8 @@ it.effect("rejects every move that would skip QA on the way to Done", () =>
     const acknowledged = phase(yield* applySequence(happyPathEvents.slice(0, 2)), "acknowledged");
     const assigned = phase(yield* applySequence(happyPathEvents.slice(0, 3)), "assigned");
     const executing = phase(yield* applySequence(happyPathEvents.slice(0, 4)), "executing");
-    const awaiting = phase(yield* applySequence(happyPathEvents.slice(0, 5)), "awaiting_qa");
-    const rework = phase(yield* applySequence(happyPathEvents.slice(0, 7)), "rework");
+    const awaiting = phase(yield* applySequence(happyPathEvents.slice(0, 6)), "awaiting_qa");
+    const rework = phase(yield* applySequence(happyPathEvents.slice(0, 9)), "rework");
     const blocked = phase(
       yield* applyBoardWorkflowEvent(
         executing,
@@ -141,8 +141,8 @@ it.effect("rejects the other illegal column moves and leaves the phase alone", (
     const acknowledged = phase(yield* applySequence(happyPathEvents.slice(0, 2)), "acknowledged");
     const assigned = phase(yield* applySequence(happyPathEvents.slice(0, 3)), "assigned");
     const executing = phase(yield* applySequence(happyPathEvents.slice(0, 4)), "executing");
-    const awaiting = phase(yield* applySequence(happyPathEvents.slice(0, 5)), "awaiting_qa");
-    const rework = phase(yield* applySequence(happyPathEvents.slice(0, 7)), "rework");
+    const awaiting = phase(yield* applySequence(happyPathEvents.slice(0, 6)), "awaiting_qa");
+    const rework = phase(yield* applySequence(happyPathEvents.slice(0, 9)), "rework");
     const blocked = phase(
       yield* applyBoardWorkflowEvent(
         executing,
@@ -208,7 +208,7 @@ it.effect("does not start a second run when the same drop is repeated", () =>
     assert.deepStrictEqual(fromBoard.ledger, empty);
     if (fromBoard._tag === "NeedsLaunch") assert.match(fromBoard.detail, /confirmed active/);
 
-    const rework = phase(yield* applySequence(happyPathEvents.slice(0, 7)), "rework");
+    const rework = phase(yield* applySequence(happyPathEvents.slice(0, 9)), "rework");
     const reworkLaunch = yield* move(rework, "Running", "start-rework");
     assert.strictEqual(reworkLaunch._tag, "NeedsLaunch");
     assert.strictEqual(reworkLaunch.state.phase, "rework");
@@ -337,7 +337,7 @@ it.effect("queues a backlog card through acknowledge and pauses only through the
 
 it.effect("keeps a completion claim from counting as acceptance", () =>
   Effect.gen(function* () {
-    const executing = phase(yield* applySequence(happyPathEvents.slice(0, 4)), "executing");
+    const executing = phase(yield* applySequence(happyPathEvents.slice(0, 5)), "executing");
     const submitted = yield* applyBoardWorkflowEvent(
       executing,
       {

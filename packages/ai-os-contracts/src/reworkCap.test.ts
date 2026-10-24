@@ -59,22 +59,65 @@ const count = (state: SequenceState, expected: number) => {
 const failure = (state: SequenceState, event: unknown) =>
   Effect.flip(applySequenceEvent(state, event));
 
-const submit = (state: SequenceState, attempt: string, revision: number, summary: string) => {
-  if (state.phase !== "executing") {
-    return Effect.die("A completion needs an executing run.");
-  }
-  return applySequenceEvent(state, {
-    type: "submit_completion",
-    completion: completion(state.run.generation, attempt, revision, summary),
+const recordRuntime = (
+  state: Extract<SequenceState, { phase: "executing" | "awaiting_qa" | "qa_incomplete" }>,
+  role: "implementer" | "reviewer",
+  model: string,
+) =>
+  applySequenceEvent(state, {
+    type: "record_runtime_models",
+    taskId,
+    attemptId: state.assignment.attemptId,
+    generation: state.run.generation,
+    leaseId: state.run.leaseId,
+    role,
+    requested: { model },
+    actual: { model },
   });
+
+const ensureImplementer = (state: SequenceState) => {
+  if (state.phase !== "executing" || (state.run.implementerRuntime?.actual ?? null) !== null) {
+    return Effect.succeed(state);
+  }
+  return recordRuntime(state, "implementer", "gpt-5.4");
 };
+
+const ensureReviewer = (state: SequenceState) => {
+  if (
+    (state.phase !== "awaiting_qa" && state.phase !== "qa_incomplete") ||
+    (state.run.reviewerRuntime?.actual ?? null) !== null
+  ) {
+    return Effect.succeed(state);
+  }
+  return recordRuntime(state, "reviewer", "claude-sonnet-5");
+};
+
+const submit = (state: SequenceState, attempt: string, revision: number, summary: string) =>
+  Effect.gen(function* () {
+    const ready = yield* ensureImplementer(state);
+    if (ready.phase !== "executing") {
+      return yield* Effect.die("A completion needs an executing run.");
+    }
+    return yield* applySequenceEvent(ready, {
+      type: "submit_completion",
+      completion: completion(ready.run.generation, attempt, revision, summary),
+    });
+  });
 
 const verdict = (
   state: SequenceState,
   attempt: string,
   revision: number,
   recommendation?: string,
-) => applySequenceEvent(state, { type: "qa", qa: rework(attempt, revision, recommendation) });
+) =>
+  Effect.gen(function* () {
+    const ready = yield* ensureReviewer(state);
+    return yield* applySequenceEvent(ready, {
+      type: "qa",
+      threadId: "thread-qa",
+      qa: rework(attempt, revision, recommendation),
+    });
+  });
 
 it.effect("stops the task after three rework verdicts", () =>
   Effect.gen(function* () {
@@ -98,7 +141,11 @@ it.effect("stops the task after three rework verdicts", () =>
 
     state = yield* applySequenceEvent(state, { type: "start_execution" });
     state = yield* submit(state, attemptId, 3, "Added the final and dropped the venue.");
-    const missing = yield* failure(state, { type: "qa", qa: rework(attemptId, 3) });
+    const missing = yield* failure(yield* ensureReviewer(state), {
+      type: "qa",
+      threadId: "thread-qa",
+      qa: rework(attemptId, 3),
+    });
     assert.strictEqual(missing.reason, "rework_cap_needs_recommendation");
     assert.strictEqual(state.phase, "awaiting_qa");
     count(state, 2);
@@ -406,6 +453,7 @@ it.effect("keeps earlier rework rounds when QA later accepts", () =>
     state = yield* verdict(state, attemptId, 1);
     count(state, 1);
     state = yield* applySequenceEvent(state, { type: "start_execution" });
+    state = yield* ensureImplementer(state);
     if (state.phase !== "executing") return yield* Effect.die("Rework must start.");
     state = yield* applySequenceEvent(state, {
       type: "submit_completion",
@@ -414,7 +462,12 @@ it.effect("keeps earlier rework rounds when QA later accepts", () =>
         artifactRevision: revisionTwo,
       },
     });
-    const accepted = yield* applySequenceEvent(state, { type: "qa", qa: qaAcceptExample });
+    state = yield* ensureReviewer(state);
+    const accepted = yield* applySequenceEvent(state, {
+      type: "qa",
+      threadId: "thread-qa",
+      qa: qaAcceptExample,
+    });
     assert.strictEqual(accepted.phase, "accepted");
     count(accepted, 1);
     const again = yield* applySequenceEvent(accepted, { type: "start_execution" });
