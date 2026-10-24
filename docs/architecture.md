@@ -145,7 +145,7 @@ No vector store is an authority.
 
 Other Grok bots are external update-only workers, the same class as the VS Code Codex sidebar.
 
-An adapter declares the capabilities it implements: start, retrieve assignments, report status, cancel, resume, return artifacts, report usage, receive context, heartbeat, and idempotency. The console calls only capabilities the adapter declares.
+An adapter declares the capabilities it implements: start, retrieve assignments, report status, cancel, resume, return artifacts, report usage, receive context, heartbeat, and idempotency.
 
 Three paths have to be verified before a worker is trusted: Grok intake and automatic return, Codex interactive versus the independent T3 worker, and subscription versus API auth and billing.
 
