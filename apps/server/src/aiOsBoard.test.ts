@@ -3272,7 +3272,7 @@ describe("ai-os request route", () => {
     expect(card.qaRun?.commitSha).toBe(SUBMITTED);
   });
 
-  it("rejects QA that ran the implementer's model and does not count it", async () => {
+  it("leaves QA incomplete when the reviewer ran the implementer's model and keeps the findings", async () => {
     const { runs } = runsFor({
       actual: "gpt-5.6-sol",
       status: "completed",
@@ -3281,16 +3281,19 @@ describe("ai-os request route", () => {
     const { handler } = handlerFor(undefined, runs);
     expect((await configure(handler)).status).toBe(200);
     const started = await ask(handler);
-    expect(started.status).toBe(409);
-    expect(await started.json()).toMatchObject({
-      detail: expect.stringMatching(/different base model/),
-    });
+    expect(started.status).toBe(200);
     const card = await demo(handler);
-    expect(card?.state.phase).toBe("awaiting_qa");
-    if (card?.state.phase !== "awaiting_qa") throw new Error("expected the card to stay in review");
-    expect(card.state.recordedVerdict).toBeUndefined();
+    expect(card?.state.phase).toBe("qa_incomplete");
+    if (card?.state.phase !== "qa_incomplete") throw new Error("expected incomplete QA");
+    expect(card.state.qaLabel).toBe("Awaiting a verified reviewer");
+    expect(card.state.findings).toEqual([finding]);
+    expect("recordedVerdict" in card.state).toBe(false);
     expect(card.state.run.reviewerRuntime?.actual ?? null).toBeNull();
-    expect(card.qaRun).toMatchObject({ commitSha: SUBMITTED, settled: "rejected" });
+    expect(card.qaRun).toEqual({
+      threadId: "thread-qa",
+      runId: "run-qa",
+      commitSha: SUBMITTED,
+    });
   });
 
   const expectNoStoredVerdict = async (text: string | null) => {
@@ -3402,18 +3405,16 @@ describe("ai-os request route", () => {
         const prompt = launches.find((item) => item.model === "gpt-6-astra")?.prompt ?? "";
         const marker = "Reply with only this JSON.";
         const form = JSON.parse(prompt.slice(prompt.indexOf(marker) + marker.length).trim()) as {
-          qaModel: string;
           verdict: string;
           findings: Array<{ defect: string; evidence: string; expectedBehavior: string }>;
         };
-        form.qaModel = "gpt-6-astra";
         form.verdict = "rework";
         form.findings = [finding];
         return Effect.succeed({
           threadId,
           runId: "run-qa",
           status: "completed" as const,
-          text: JSON.stringify(form),
+          text: JSON.stringify({ ...form, qaModel: "GPT-6" }),
           revision: SUBMITTED,
           requestedModel: "gpt-6-astra",
           actualModel: "gpt-6-astra",
@@ -3428,10 +3429,32 @@ describe("ai-os request route", () => {
     expect(card?.state.phase).toBe("awaiting_qa");
     if (card?.state.phase !== "awaiting_qa") throw new Error("expected the card to stay in review");
     expect(card.state.recordedVerdict?.verdict).toBe("rework");
+    expect(card.state.recordedVerdict?.qaModel).toBe("gpt-6-astra");
     expect(card.state.recordedVerdict?.artifactRevision).toEqual({ type: "git", sha: SUBMITTED });
     expect(card.state.recordedVerdict?.findings).toEqual([finding]);
     expect(launches[1]?.prompt).toContain("Reply with only this JSON.");
     expect(launches[1]?.prompt).toContain(`"sha":"${SUBMITTED}"`);
+    expect(launches[1]?.prompt.includes("qaModel")).toBe(false);
+  });
+
+  it("records the runtime model when the reviewer names a different model", async () => {
+    const { runs, launches } = runsFor({
+      actual: "gpt-6-astra",
+      status: "completed",
+      text: verdictText("GPT-6"),
+    });
+    const { handler } = handlerFor(undefined, runs);
+    expect((await configure(handler)).status).toBe(200);
+    const started = await ask(handler);
+    expect(started.status).toBe(200);
+    const card = await demo(handler);
+    expect(card?.state.phase).toBe("awaiting_qa");
+    if (card?.state.phase !== "awaiting_qa") throw new Error("expected the card to stay in review");
+    expect(card.state.recordedVerdict?.verdict).toBe("rework");
+    expect(card.state.recordedVerdict?.qaModel).toBe("gpt-6-astra");
+    expect(card.state.recordedVerdict?.findings).toEqual([finding]);
+    expect(card.state.run.reviewerRuntime?.actual).toBe("gpt-6-astra");
+    expect(launches[1]?.prompt.includes("qaModel")).toBe(false);
   });
 
   it("records an independent QA verdict and leaves the card in review", async () => {

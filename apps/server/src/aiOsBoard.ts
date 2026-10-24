@@ -1501,20 +1501,51 @@ export const layer = Layer.unwrap(
       rejection: null,
       touched: false,
     });
+    const rawFindings = (value: unknown) => {
+      if (!Array.isArray(value)) return [];
+      const findings: Array<{
+        defect: string;
+        evidence: string;
+        expectedBehavior: string;
+      }> = [];
+      for (const item of value) {
+        if (!isRecord(item)) continue;
+        const { defect, evidence, expectedBehavior } = item;
+        if (
+          typeof defect !== "string" ||
+          typeof evidence !== "string" ||
+          typeof expectedBehavior !== "string" ||
+          defect.trim() !== defect ||
+          evidence.trim() !== evidence ||
+          expectedBehavior.trim() !== expectedBehavior ||
+          defect.length === 0 ||
+          evidence.length === 0 ||
+          expectedBehavior.length === 0
+        ) {
+          continue;
+        }
+        findings.push({ defect, evidence, expectedBehavior });
+      }
+      return findings;
+    };
     const verdictForReview = (
       state: Extract<BoardSequence, { phase: "awaiting_qa" }>,
       text: string | null,
+      reviewerActual: string | null,
     ) => {
-      if (text === null || text.trim().length === 0) return Effect.succeed(null);
+      const empty = { verdict: null, findings: rawFindings(null) };
+      if (text === null || text.trim().length === 0) return Effect.succeed(empty);
       let parsed: unknown;
       try {
         parsed = JSON.parse(text);
       } catch {
-        return Effect.succeed(null);
+        return Effect.succeed(empty);
       }
       const body = isRecord(parsed) && isRecord(parsed.qa) ? parsed.qa : parsed;
-      if (!isRecord(body)) return Effect.succeed(null);
-      // The reviewer fills the judgment. The ids and the implementer are already known.
+      if (!isRecord(body)) return Effect.succeed(empty);
+      const findings = rawFindings(body.findings);
+      const actual = reviewerActual?.trim() ?? "";
+      // The reviewer fills the judgment. Ids, the implementer, and qaModel come from the run.
       const merged = {
         ...body,
         version: "v1",
@@ -1524,11 +1555,18 @@ export const layer = Layer.unwrap(
         implementerModel: modelSlug(
           state.run.implementerRuntime?.actual ?? state.assignment.implementerModel,
         ),
+        ...(actual.length > 0 ? { qaModel: actual } : {}),
         ...(body.verdict === "accept"
           ? { acceptedRevision: state.completion.artifactRevision }
           : {}),
       };
-      return decodeQaVerdictV1(merged).pipe(Effect.catch(() => Effect.succeed(null)));
+      return decodeQaVerdictV1(merged).pipe(
+        Effect.map((verdict) => ({
+          verdict,
+          findings: verdict.availability === "available" ? [...verdict.findings] : findings,
+        })),
+        Effect.orElseSucceed(() => ({ verdict: null, findings })),
+      );
     };
     const qaPromptSuffix = (
       state: Extract<BoardSequence, { phase: "awaiting_qa" }>,
@@ -1539,7 +1577,6 @@ export const layer = Layer.unwrap(
         taskId: state.acknowledgment.taskId,
         attemptId: state.assignment.attemptId,
         availability: "available",
-        qaModel: "<qa-model>",
         implementerModel: modelSlug(
           state.run.implementerRuntime?.actual ?? state.assignment.implementerModel,
         ),
@@ -1554,7 +1591,7 @@ export const layer = Layer.unwrap(
         ],
       };
       return `Review this exact submitted revision: ${sha}
-Set qaModel to the base model that ran this review. Set verdict to rework or accept. For accept, findings may be empty.
+Set verdict to rework or accept. For accept, findings may be empty.
 Reply with only this JSON.
 ${encodeJson(form)}`;
     };
@@ -1566,46 +1603,68 @@ ${encodeJson(form)}`;
       Effect.gen(function* () {
         if (outcome.state.phase !== "awaiting_qa") return keepQa(outcome, qaRun);
         const waiting = outcome.state;
-        const verdict = yield* verdictForReview(waiting, view.text);
-        if (verdict === null || verdict.availability !== "available") {
-          const incomplete = yield* decodeSequenceState({
-            phase: "qa_incomplete",
+        const reviewed = yield* verdictForReview(waiting, view.text, view.actualModel ?? null);
+        const verdict = reviewed.verdict;
+        const holdFindings = (
+          findings: ReadonlyArray<{
+            defect: string;
+            evidence: string;
+            expectedBehavior: string;
+          }>,
+          attempted: "rework" | "accept",
+        ) => {
+          const stored =
+            attempted === "rework" && findings.length === 0
+              ? [
+                  {
+                    defect: "The QA run did not return a verdict.",
+                    evidence: "The reviewer reply was not a QA verdict.",
+                    expectedBehavior: "Reply with only the QA verdict JSON.",
+                  },
+                ]
+              : findings;
+          const fields = {
+            phase: "qa_incomplete" as const,
             intake: waiting.intake,
             acknowledgment: waiting.acknowledgment,
             assignment: waiting.assignment,
             completion: waiting.completion,
-            findings: [
-              {
-                defect: "The QA run did not return a verdict.",
-                evidence: "The reviewer reply was not a QA verdict.",
-                expectedBehavior: "Reply with only the QA verdict JSON.",
-              },
-            ],
             artifactRevision: waiting.completion.artifactRevision,
-            attemptedVerdict: "rework",
             reworkRevision: waiting.reworkRevision,
             reworkLedger: waiting.reworkLedger,
             run: waiting.run,
             commands: waiting.commands,
             qaLabel: QA_INCOMPLETE_LABEL,
-          }).pipe(
-            Effect.map((state) => ({ _tag: "Ok" as const, state })),
-            Effect.catch(() => Effect.succeed({ _tag: "No" as const })),
-          );
-          if (incomplete._tag === "No") {
-            return {
-              outcome: { ...outcome, changed: true },
-              qaRun: { ...qaRun, settled: "rejected" as const },
-              rejection: "The QA run did not return a verdict.",
-              touched: true,
-            };
-          }
-          return {
-            outcome: { ...outcome, state: incomplete.state, changed: true },
-            qaRun,
-            rejection: null,
-            touched: true,
           };
+          const decoded = (nextFindings: typeof stored, nextAttempted: "rework" | "accept") =>
+            decodeSequenceState({
+              ...fields,
+              findings: nextFindings,
+              attemptedVerdict: nextAttempted,
+            });
+          return decoded(stored, attempted).pipe(
+            Effect.catch(() =>
+              decoded(
+                [
+                  {
+                    defect: "The QA run did not return a verdict.",
+                    evidence: "The reviewer reply was not a QA verdict.",
+                    expectedBehavior: "Reply with only the QA verdict JSON.",
+                  },
+                ],
+                "rework",
+              ).pipe(Effect.orDie),
+            ),
+            Effect.map((state): QaFollow => ({
+              outcome: { ...outcome, state, changed: true },
+              qaRun,
+              rejection: null,
+              touched: true,
+            })),
+          );
+        };
+        if (verdict === null || verdict.availability !== "available") {
+          return yield* holdFindings(reviewed.findings, "rework");
         }
         const taskId = waiting.acknowledgment.taskId;
         const reviewerActual = view.actualModel?.trim() ?? "";
@@ -1624,13 +1683,8 @@ ${encodeJson(form)}`;
             taskId,
             outcome.ledger,
           );
-          if (applied._tag !== "Applied") {
-            return {
-              outcome: { ...outcome, changed: true },
-              qaRun: { ...qaRun, settled: "rejected" as const },
-              rejection: applied.detail,
-              touched: true,
-            };
+          if (applied._tag !== "Applied" || applied.state.phase !== "qa_incomplete") {
+            return yield* holdFindings(verdict.findings, verdict.verdict);
           }
           return { outcome: { ...applied, changed: true }, qaRun, rejection: null, touched: true };
         }
@@ -1654,48 +1708,19 @@ ${encodeJson(form)}`;
           outcome.ledger,
         );
         if (implementerActual !== null && sameBaseModel(reviewerActual, implementerActual)) {
-          const basis = runtime._tag === "Applied" ? runtime.state : waiting;
-          const book = runtime._tag === "Applied" ? runtime.ledger : outcome.ledger;
-          const rejected = yield* applyBoardWorkflowEvent(
-            basis,
-            qaEvent,
-            `qa-auto-${taskId}-${qaRun.commitSha}`,
-            taskId,
-            book,
-          );
-          return {
-            outcome: { ...outcome, changed: true },
-            qaRun: { ...qaRun, settled: "rejected" as const },
-            rejection:
-              rejected._tag === "Rejected"
-                ? rejected.detail
-                : "QA must use a different base model than the implementer that ran.",
-            touched: true,
-          };
+          return yield* holdFindings(verdict.findings, verdict.verdict);
         }
         if (runtime._tag !== "Applied" || runtime.state.phase !== "awaiting_qa") {
-          return {
-            outcome: { ...outcome, changed: true },
-            qaRun: { ...qaRun, settled: "rejected" as const },
-            rejection:
-              runtime._tag === "Rejected" ? runtime.detail : "QA did not record the reviewer.",
-            touched: true,
-          };
+          return yield* holdFindings(verdict.findings, verdict.verdict);
         }
         const pending = yield* recordPendingVerdict(runtime.state, verdict).pipe(
           Effect.map((state) => ({ _tag: "Ok" as const, state })),
           Effect.catchTags({
-            ContractTransitionError: (error) =>
-              Effect.succeed({ _tag: "No" as const, detail: error.detail }),
+            ContractTransitionError: () => Effect.succeed({ _tag: "No" as const }),
           }),
         );
         if (pending._tag === "No") {
-          return {
-            outcome: { ...outcome, changed: true },
-            qaRun: { ...qaRun, settled: "rejected" as const },
-            rejection: pending.detail,
-            touched: true,
-          };
+          return yield* holdFindings(verdict.findings, verdict.verdict);
         }
         // The verdict is on the card. Rework and delivery wait for a later step.
         return {
