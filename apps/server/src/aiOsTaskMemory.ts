@@ -2,6 +2,7 @@
 import * as NodeSqlite from "node:sqlite";
 
 import {
+  contentDigest,
   ContractTransitionError,
   decodeAttemptMemoryActivityV1,
   decodeContextPackageSnapshotV1,
@@ -151,6 +152,107 @@ export const recordTaskWriteSync = (
     taskWriteSubmission(readMemoryLedger(database), stored.receipt, write),
   );
   return submitMemorySync(database, submission, acceptingAuthorId);
+};
+
+const fitId = (prefix: string, key: string): string => {
+  const joined = `${prefix}-${key}`;
+  if (joined.length <= 128 && /^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(joined)) return joined;
+  return `${prefix}-${contentDigest(key)}`;
+};
+
+const isRecordedFact = (
+  write: unknown,
+): write is { readonly kind: "fact"; readonly identity: string } =>
+  typeof write === "object" &&
+  write !== null &&
+  "kind" in write &&
+  write.kind === "fact" &&
+  "identity" in write &&
+  typeof write.identity === "string";
+
+/**
+ * A later run only reads accepted facts. A new recorded fact is accepted by
+ * the authority. Findings stay proposed, and a contradiction is already a conflict.
+ */
+const acceptRecordedFactSync = (
+  database: NodeSqlite.DatabaseSync,
+  receipt: SubmissionReceiptV1,
+  write: unknown,
+  acceptingAuthorId: string,
+): void => {
+  if (receipt.outcome !== "pending" || receipt.factIds.length !== 1) return;
+  if (!isRecordedFact(write)) return;
+  const proposedId = receipt.factIds[0];
+  if (proposedId === undefined) return;
+  const ledger = readMemoryLedger(database);
+  const proposed = ledger.graph.facts.find((fact) => fact.factId === proposedId);
+  const identity = ledger.identities.find((item) => item.factId === proposedId);
+  if (proposed === undefined || identity === undefined || identity.identity !== write.identity) {
+    return;
+  }
+  const current = ledger.revisions.find(
+    (revision) =>
+      revision.current &&
+      revision.identity === identity.identity &&
+      revision.projectId === receipt.projectId,
+  );
+  if (current !== undefined) return;
+  const factId = fitId("known", proposedId);
+  const key = fitId("accept", proposedId);
+  const accepted = submitMemorySync(
+    database,
+    {
+      version: "v1",
+      submissionId: key,
+      idempotencyKey: key,
+      projectId: receipt.projectId,
+      authorId: acceptingAuthorId,
+      taskId: receipt.taskId,
+      attemptId: fitId("accept", receipt.attemptId),
+      evidence: receipt.evidence,
+      expectedVersions: [],
+      intent: "accept",
+      facts: [
+        {
+          identity: identity.identity,
+          fact: {
+            acceptance: "proposed",
+            factId,
+            projectId: receipt.projectId,
+            kind: proposed.kind,
+            body: proposed.body,
+            provenance: { actorId: acceptingAuthorId, at: proposed.provenance.at },
+            validity: { from: proposed.validity.from, until: null },
+          },
+        },
+      ],
+      relationships: [],
+    },
+    acceptingAuthorId,
+  );
+  if (accepted.outcome !== "accepted" && accepted.outcome !== "duplicate") {
+    throw invalid(accepted.detail);
+  }
+};
+
+/** The attempt's own project. A recorded fact with no current statement is then accepted. */
+export const submitAttemptMemorySync = (
+  database: NodeSqlite.DatabaseSync,
+  attemptId: string,
+  projectId: string,
+  write: unknown,
+  acceptingAuthorId: string,
+): SubmissionReceiptV1 => {
+  const activity = readAttemptActivitySync(database).find((item) => item.attemptId === attemptId);
+  if (activity === undefined) {
+    throw invalid("Context was not supplied for this attempt.");
+  }
+  if (activity.projectId !== projectId) {
+    throw invalid("A fact stays inside the attempt's project.");
+  }
+  const receipt = recordTaskWriteSync(database, attemptId, write, acceptingAuthorId);
+  acceptRecordedFactSync(database, receipt, write, acceptingAuthorId);
+  return receipt;
 };
 
 const writeFor = (

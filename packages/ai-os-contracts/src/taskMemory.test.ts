@@ -218,3 +218,31 @@ it.effect("writes findings as a proposal and does not accept a lesson", () =>
     );
   }),
 );
+
+it.effect("records a fact as the agent's proposal inside the attempt project", () =>
+  Effect.gen(function* () {
+    const accepted = yield* fact(
+      initialMemoryLedger,
+      "start",
+      "Decision",
+      "Saturday games start at 7:00.",
+      authority,
+    );
+    const prepared = yield* prepareTaskMemory(accepted.ledger, request("codex"));
+    const submission = yield* taskWriteSubmission(accepted.ledger, prepared.receipt, {
+      kind: "fact",
+      identity: "page-check",
+      nodeKind: "Procedure",
+      body: "Check the schedule file before changing the start time.",
+      evidence: [{ evidenceId: "evidence-fact", note: "The run read the schedule." }],
+    });
+    assert.strictEqual(submission.intent, "propose");
+    assert.strictEqual(submission.projectId, "usba");
+    assert.strictEqual(submission.authorId, prepared.receipt.authorId);
+    assert.strictEqual(submission.attemptId, prepared.receipt.attemptId);
+    assert.strictEqual(submission.facts[0]?.identity, "page-check");
+    assert.strictEqual(submission.facts[0]?.fact.kind, "Procedure");
+    assert.strictEqual(submission.facts[0]?.fact.projectId, "usba");
+    assert.strictEqual(submission.facts[0]?.fact.provenance.actorId, prepared.receipt.authorId);
+  }),
+);

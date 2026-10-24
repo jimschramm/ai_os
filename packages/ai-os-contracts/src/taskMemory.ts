@@ -164,6 +164,13 @@ export const TaskWriteV1 = Schema.Union([
     evidence: evidenceList,
   }),
   Schema.Struct({
+    kind: Schema.Literal("fact"),
+    identity: ContractId,
+    nodeKind: MemoryNodeKindV1,
+    body: ContractText,
+    evidence: evidenceList,
+  }),
+  Schema.Struct({
     kind: Schema.Literal("no_durable_change"),
     explanation: ContractText,
     evidence: evidenceList,
@@ -254,6 +261,20 @@ export const promptCarriesMemory = (memoryPackage: TaskMemoryPackageV1, prompt: 
   prompt.includes(memoryPackage.requirements) &&
   prompt.includes(memoryPackage.repoCommit) &&
   orientationText(memoryPackage).every((line) => prompt.includes(line));
+
+/**
+ * Lines appended to the launch prompt the same way the memory package is.
+ * A fresh agent has to see its own attempt, project, and the write shapes.
+ */
+export const taskWritePrompt = (
+  memoryPackage: TaskMemoryPackageV1,
+  writePath: string,
+): readonly string[] => [
+  `Memory write: POST ${writePath} for attempt ${memoryPackage.attemptId} in project ${memoryPackage.projectId}.`,
+  `Record a fact: {"attemptId":"${memoryPackage.attemptId}","write":{"kind":"fact","identity":"<identity>","nodeKind":"Decision","body":"<statement>","evidence":[{"evidenceId":"<id>","note":"<source>"}]}}`,
+  `Propose findings: {"attemptId":"${memoryPackage.attemptId}","write":{"kind":"findings","facts":[{"identity":"<identity>","fact":{"acceptance":"proposed","factId":"<id>","projectId":"${memoryPackage.projectId}","kind":"Decision","body":"<statement>","provenance":{"actorId":"${memoryPackage.authorId}","at":"${memoryPackage.createdAt}"},"validity":{"from":"${memoryPackage.createdAt}","until":null}}}],"relationships":[],"evidence":[{"evidenceId":"<id>","note":"<source>"}]}}`,
+  "This attempt has one write. A stale or contradictory proposal is kept as a conflict for the Memory Steward.",
+];
 
 export interface PreparedTaskMemory {
   readonly package: TaskMemoryPackageV1;
@@ -375,7 +396,7 @@ const currentExpected = (
 
 /**
  * A run writes through SubmissionV1 as a proposal. The accepting authority is
- * not this agent, and a repeated failure's lesson stays proposed.
+ * not this agent. A recorded fact is one proposed fact. Findings stay proposed.
  */
 export const taskWriteSubmission = (
   ledger: MemoryLedgerV1,
@@ -389,20 +410,35 @@ export const taskWriteSubmission = (
     const facts =
       decoded.kind === "findings"
         ? decoded.facts
-        : [
-            {
-              identity: prefixedId("unchanged", receipt.attemptId),
-              fact: {
-                acceptance: "proposed" as const,
-                factId: prefixedId("note", receipt.attemptId),
-                projectId: receipt.projectId,
-                kind: "Source" as const,
-                body: decoded.explanation,
-                provenance: { actorId: receipt.authorId, at: receipt.suppliedAt },
-                validity: { from: receipt.suppliedAt, until: null as string | null },
+        : decoded.kind === "fact"
+          ? [
+              {
+                identity: decoded.identity,
+                fact: {
+                  acceptance: "proposed" as const,
+                  factId: prefixedId("fact", `${receipt.attemptId}-${decoded.identity}`),
+                  projectId: receipt.projectId,
+                  kind: decoded.nodeKind,
+                  body: decoded.body,
+                  provenance: { actorId: receipt.authorId, at: receipt.suppliedAt },
+                  validity: { from: receipt.suppliedAt, until: null as string | null },
+                },
               },
-            },
-          ];
+            ]
+          : [
+              {
+                identity: prefixedId("unchanged", receipt.attemptId),
+                fact: {
+                  acceptance: "proposed" as const,
+                  factId: prefixedId("note", receipt.attemptId),
+                  projectId: receipt.projectId,
+                  kind: "Source" as const,
+                  body: decoded.explanation,
+                  provenance: { actorId: receipt.authorId, at: receipt.suppliedAt },
+                  validity: { from: receipt.suppliedAt, until: null as string | null },
+                },
+              },
+            ];
     for (const item of facts) {
       if (item.fact.provenance.actorId !== receipt.authorId) {
         return yield* invalid("The fact author is the agent that read the context.");
