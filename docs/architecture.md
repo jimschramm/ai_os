@@ -200,7 +200,7 @@ Reliability rules:
 - Idempotent operations.
 - Live authorization checks.
 - Bounded retries.
-- `recovery_pending`: an expired lease or a lost advisory process stays Blocked, labeled "Execution status unknown", until the earlier process is confirmed stopped. Advisory work is read-only, and that does not make a retry safe: it still uses resources and can produce duplicate or late results. Late results from the old attempt are rejected. It never returns to Ready on its own.
+- `recovery_pending`: an expired lease or a lost advisory process stays Blocked, labeled "Execution status unknown", until the earlier process is confirmed stopped. Advisory work is read-only, and that does not make a retry safe: it still uses resources and can produce duplicate or late results. Late results from the old attempt are rejected. It never returns to Ready on its own. The exception is an advisory restart: after that process is confirmed stopped, In Progress leaves Blocked and starts a new attempt. While the process might still be running, the card stays Blocked.
 
 A maintainer agent handles platform health, with independent QA and an external recovery path for when the maintainer itself is down. Operations cover backups, restore, updates, diagnostics, and docs.
 
