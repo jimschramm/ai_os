@@ -145,6 +145,10 @@ it.effect("supplies current memory to each runtime and keeps logs behind the sum
       assert.strictEqual(shown.includes("Publish only an accepted start time."), true);
       assert.strictEqual(shown.includes("x".repeat(500)), false);
       assert.deepStrictEqual(prepared.contextPackage.memoryVersions.includes("fact-start"), true);
+      assert.strictEqual(
+        prepared.package.orientation.proposals.some((line) => line.factId === "fact-late"),
+        false,
+      );
       assert.strictEqual(Object.isFrozen(prepared.package), true);
     }
     const again = yield* prepareTaskMemory(conflicted.ledger, request("codex"));
@@ -216,5 +220,83 @@ it.effect("writes findings as a proposal and does not accept a lesson", () =>
       ),
       false,
     );
+  }),
+);
+
+it.effect("records a fact as the agent's proposal inside the attempt project", () =>
+  Effect.gen(function* () {
+    const accepted = yield* fact(
+      initialMemoryLedger,
+      "start",
+      "Decision",
+      "Saturday games start at 7:00.",
+      authority,
+    );
+    const prepared = yield* prepareTaskMemory(accepted.ledger, request("codex"));
+    const submission = yield* taskWriteSubmission(accepted.ledger, prepared.receipt, {
+      kind: "fact",
+      identity: "page-check",
+      nodeKind: "Procedure",
+      body: "Check the schedule file before changing the start time.",
+      evidence: [{ evidenceId: "evidence-fact", note: "The run read the schedule." }],
+    });
+    assert.strictEqual(submission.intent, "propose");
+    assert.strictEqual(submission.projectId, "usba");
+    assert.strictEqual(submission.authorId, prepared.receipt.authorId);
+    assert.strictEqual(submission.attemptId, prepared.receipt.attemptId);
+    assert.strictEqual(submission.facts[0]?.identity, "page-check");
+    assert.strictEqual(submission.facts[0]?.fact.kind, "Procedure");
+    assert.strictEqual(submission.facts[0]?.fact.projectId, "usba");
+    assert.strictEqual(submission.facts[0]?.fact.provenance.actorId, prepared.receipt.authorId);
+  }),
+);
+
+it.effect("keeps a pending proposal out of accepted knowledge and in the read receipt", () =>
+  Effect.gen(function* () {
+    const proposed = yield* applySubmission(
+      initialMemoryLedger,
+      {
+        version: "v1",
+        submissionId: "submission-pending",
+        idempotencyKey: "key-pending",
+        projectId: "usba",
+        authorId: "codex-t3",
+        taskId: "task-seed",
+        attemptId: "attempt-seed",
+        evidence: [{ evidenceId: "evidence-pending", note: "The agent recorded it." }],
+        expectedVersions: [],
+        intent: "propose",
+        facts: [
+          {
+            identity: "tournament-start",
+            fact: {
+              acceptance: "proposed",
+              factId: "fact-pending",
+              projectId: "usba",
+              kind: "Decision",
+              body: "Saturday games start at 7:00.",
+              provenance: { actorId: "codex-t3", at },
+              validity: { from: at, until: null },
+            },
+          },
+        ],
+        relationships: [],
+      },
+      authority,
+    );
+    assert.strictEqual(proposed.receipt.outcome, "pending");
+    const prepared = yield* prepareTaskMemory(proposed.ledger, request("codex", "attempt-2"));
+    assert.deepStrictEqual(prepared.package.orientation.decisions, []);
+    assert.strictEqual(prepared.package.orientation.proposals[0]?.factId, "fact-pending");
+    assert.strictEqual(prepared.package.orientation.proposals[0]?.actorId, "codex-t3");
+    assert.strictEqual(
+      orientationText(prepared.package).includes(
+        "proposed, not accepted: Saturday games start at 7:00.",
+      ),
+      true,
+    );
+    assert.strictEqual(prepared.receipt.memoryVersions.includes("fact-pending"), true);
+    assert.strictEqual(prepared.contextPackage.memoryVersions.includes("fact-pending"), true);
+    assert.deepStrictEqual(packageFacts(proposed.ledger.graph, "usba", at), []);
   }),
 );

@@ -13,6 +13,7 @@ import {
   ADAPTER_BOARD_MOVE_PATH,
   ADAPTER_BOARD_PATH,
   ADAPTER_MEMORY_RESOLVE_PATH,
+  ADAPTER_MEMORY_WRITE_PATH,
   decodeAdapterBoard,
   encodeAdapterBoard,
   type AdapterBoardCard,
@@ -2380,7 +2381,11 @@ describe("ai-os board route", () => {
     expect(
       prompts.every((prompt) => prompt.includes(decision) && prompt.includes("Orientation")),
     ).toBe(true);
-    expect(orientations).toEqual([[decision]]);
+    expect(orientations.map((lines) => lines[0])).toEqual([decision]);
+    expect(
+      orientations.every((lines) => lines.some((line) => line.includes(ADAPTER_MEMORY_WRITE_PATH))),
+    ).toBe(true);
+    expect(prompts.every((prompt) => prompt.includes(ADAPTER_MEMORY_WRITE_PATH))).toBe(true);
 
     const saved = openMemoryDatabase(NodePath.join(stateDir, "memory.db"));
     const activity = readAttemptActivitySync(saved);
@@ -2586,5 +2591,379 @@ describe("ai-os board route", () => {
     saved.close();
     expect(launch?.read.receiptId).toBe("read-attempt-1");
     expect(launch?.read.memoryVersions).toEqual(expect.arrayContaining([...applied.factIds]));
+  });
+
+  it("keeps an attempt's fact proposed until Jim resolves the next attempt's conflict", async () => {
+    const prompts: string[] = [];
+    let launches = 0;
+    const { handler } = handlerFor(undefined, {
+      ...allowRuns,
+      launch: (input) => {
+        prompts.push(input.prompt);
+        launches += 1;
+        return Effect.succeed({
+          threadId: `thread-${launches}`,
+          runId: `run-${launches}`,
+          disposition: "active" as const,
+          summary: null,
+        });
+      },
+    });
+    const fact = "Saturday games start at 7:00.";
+    const conflict = "Saturday games start at 8:30.";
+    const resolution = "Saturday games start at 7:30.";
+    const finished = "Finished without replacing the schedule fact.";
+    const at = "2026-10-24T06:00:00Z";
+    const tokenIn = (prompt: string | undefined): string => {
+      const found = prompt?.match(/Memory write token: (wt-[0-9a-f]{32})/);
+      if (found?.[1] === undefined) throw new Error("The launch prompt has no write token.");
+      return found[1];
+    };
+    const factWrite = (attemptId: string, writeToken: string, body: string, evidenceId: string) =>
+      postJson(handler, ADAPTER_MEMORY_WRITE_PATH, {
+        attemptId,
+        writeToken,
+        write: {
+          kind: "fact",
+          identity: "tournament-start",
+          nodeKind: "Decision",
+          body,
+          evidence: [{ evidenceId, note: "The schedule file says so." }],
+        },
+      });
+    await reachAssigned(handler);
+    const moved = await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
+      taskId: "task-demo",
+      column: "Running",
+      idempotencyKey: "launch-write",
+    });
+    expect(moved.status).toBe(200);
+    expect(prompts[0]).toContain(ADAPTER_MEMORY_WRITE_PATH);
+    expect(prompts[0]).toContain("attempt-1");
+    expect(prompts[0]).toContain("project usba");
+    const tokenA = tokenIn(prompts[0]);
+
+    const other = await factWrite("attempt-other", tokenA, fact, "evidence-other");
+    expect(other.status).toBe(409);
+
+    const foreign = await postJson(handler, ADAPTER_MEMORY_WRITE_PATH, {
+      attemptId: "attempt-1",
+      writeToken: tokenA,
+      write: {
+        kind: "findings",
+        facts: [
+          {
+            identity: "other-project",
+            fact: {
+              acceptance: "proposed",
+              factId: "fact-other",
+              projectId: "other",
+              kind: "Decision",
+              body: "This belongs somewhere else.",
+              provenance: { actorId: "t3-codex", at },
+              validity: { from: at, until: null },
+            },
+          },
+        ],
+        relationships: [],
+        evidence: [{ evidenceId: "evidence-other-project", note: "Wrong project." }],
+      },
+    });
+    expect(foreign.status).toBe(409);
+
+    const written = await factWrite("attempt-1", tokenA, fact, "evidence-start");
+    expect(written.status).toBe(200);
+    expect(await written.json()).toMatchObject({ _tag: "Applied", outcome: "pending" });
+
+    const proposedFact = (await readCards(handler))
+      .find((card) => card.taskId === "task-demo")
+      ?.memoryFacts?.find((item) => item.body === fact);
+    expect(proposedFact).toMatchObject({
+      acceptance: "proposed",
+      factId: "fact-attempt-1-tournament-start",
+      provenance: { actorId: "t3-codex" },
+    });
+    expect(
+      (await readCards(handler))
+        .find((card) => card.taskId === "task-demo")
+        ?.memoryFacts?.some(
+          (item) => item.acceptance === "accepted" || item.provenance.actorId === "jim",
+        ),
+    ).toBe(false);
+
+    const again = await factWrite("attempt-1", tokenA, conflict, "evidence-again");
+    expect(again.status).toBe(200);
+    expect(await again.json()).toMatchObject({ outcome: "duplicate" });
+
+    const assign = async () => {
+      expect(
+        (
+          await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
+            taskId: "task-next",
+            title: "Next task",
+            idempotencyKey: "intake-next",
+            event: {
+              type: "intake",
+              intake: { ...intakeV2Example, projectId: "usba", workspaceId: "usba" },
+            },
+          })
+        ).status,
+      ).toBe(200);
+      expect(
+        (
+          await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
+            taskId: "task-next",
+            column: "Ready",
+            idempotencyKey: "ready-next",
+          })
+        ).status,
+      ).toBe(200);
+      expect(
+        (
+          await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
+            taskId: "task-next",
+            title: "Next task",
+            idempotencyKey: "assign-next",
+            event: {
+              type: "assign",
+              assignment: {
+                ...assignmentExample,
+                taskId: "task-next",
+                attemptId: "attempt-2",
+                assignmentId: "assignment-next",
+                workerId: "agent-b",
+              },
+            },
+          })
+        ).status,
+      ).toBe(200);
+      expect(
+        (
+          await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
+            taskId: "task-next",
+            column: "Running",
+            idempotencyKey: "run-next",
+          })
+        ).status,
+      ).toBe(200);
+    };
+    await assign();
+    expect(prompts[1]).toContain(`proposed, not accepted: ${fact}`);
+    expect(prompts[1]).toContain(ADAPTER_MEMORY_WRITE_PATH);
+    expect(prompts[1]).toContain("attempt-2");
+    expect(prompts[1]).not.toContain(conflict);
+    const tokenB = tokenIn(prompts[1]);
+
+    const next = (await readCards(handler)).find((card) => card.taskId === "task-next");
+    const read = next?.attempts?.find((item) => item.attemptId === "attempt-2");
+    expect(read?.read.memoryVersions).toContain(proposedFact?.factId);
+    expect(
+      next?.memoryFacts?.some((item) => item.body === fact && item.acceptance === "accepted"),
+    ).toBe(false);
+
+    const crossed = await factWrite("attempt-2", tokenA, conflict, "evidence-cross");
+    expect(crossed.status).toBe(409);
+    const crossedBack = await factWrite("attempt-1", tokenB, conflict, "evidence-cross-back");
+    expect(crossedBack.status).toBe(409);
+
+    const proposed = await factWrite("attempt-2", tokenB, conflict, "evidence-b");
+    expect(proposed.status).toBe(200);
+    expect(await proposed.json()).toMatchObject({ _tag: "Applied", outcome: "conflict" });
+
+    const visible = (await readCards(handler)).find((card) => card.taskId === "task-next");
+    const notice = visible?.steward?.find((item) => item.kind === "open_conflict");
+    expect(notice?.authorId).toBe("agent-b");
+    expect(notice?.acceptedFactId).toBe(proposedFact?.factId);
+    expect(notice?.proposedFactId).toBe("fact-attempt-2-tournament-start");
+    expect(
+      visible?.memoryFacts?.some(
+        (item) =>
+          item.factId === "fact-attempt-2-tournament-start" &&
+          item.acceptance === "proposed" &&
+          item.provenance.actorId === "agent-b",
+      ),
+    ).toBe(true);
+    expect(visible?.attempts?.find((item) => item.attemptId === "attempt-2")?.write?.outcome).toBe(
+      "conflict",
+    );
+
+    const recorded = await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
+      taskId: "task-demo",
+      title: "Demo task",
+      idempotencyKey: "runtime-write",
+      event: {
+        type: "record_runtime_models",
+        taskId: "task-demo",
+        attemptId: "attempt-1",
+        generation: 1,
+        leaseId: leaseIdFor(1),
+        role: "implementer",
+        requested: { model: "gpt-5.4" },
+        actual: { model: "gpt-5.4" },
+      },
+    });
+    expect(recorded.status).toBe(200);
+    const done = await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
+      taskId: "task-demo",
+      title: "Demo task",
+      idempotencyKey: "complete-write",
+      threadId: "thread-1",
+      runId: "run-1",
+      event: {
+        type: "submit_completion",
+        completion: {
+          version: "v1",
+          taskId: "task-demo",
+          attemptId: "attempt-1",
+          generation: 1,
+          leaseId: leaseIdFor(1),
+          claimedOutcome: finished,
+          artifactRevision: { type: "named", kind: "page", id: "t3-result" },
+          evidence: [{ kind: "readback", ref: "thread:thread-1" }],
+        },
+      },
+    });
+    expect(done.status).toBe(200);
+    const afterFinish = (await readCards(handler)).find((card) => card.taskId === "task-demo");
+    expect(
+      afterFinish?.attempts?.find((item) => item.attemptId === "attempt-1")?.write?.outcome,
+    ).toBe("pending");
+    expect(afterFinish?.memoryFacts?.some((item) => item.body === finished)).toBe(false);
+    expect(
+      afterFinish?.memoryFacts?.some(
+        (item) => item.factId === proposedFact?.factId && item.acceptance === "proposed",
+      ),
+    ).toBe(true);
+
+    const closed = await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
+      taskId: "task-next",
+      title: "Next task",
+      idempotencyKey: "runtime-next",
+      event: {
+        type: "record_runtime_models",
+        taskId: "task-next",
+        attemptId: "attempt-2",
+        generation: 1,
+        leaseId: leaseIdFor(1),
+        role: "implementer",
+        requested: { model: "gpt-5.4" },
+        actual: { model: "gpt-5.4" },
+      },
+    });
+    expect(closed.status).toBe(200);
+    const finishedNext = await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
+      taskId: "task-next",
+      title: "Next task",
+      idempotencyKey: "complete-next",
+      threadId: "thread-2",
+      runId: "run-2",
+      event: {
+        type: "submit_completion",
+        completion: {
+          version: "v1",
+          taskId: "task-next",
+          attemptId: "attempt-2",
+          generation: 1,
+          leaseId: leaseIdFor(1),
+          claimedOutcome: "Finished the conflicting proposal.",
+          artifactRevision: { type: "named", kind: "page", id: "t3-result" },
+          evidence: [{ kind: "readback", ref: "thread:thread-2" }],
+        },
+      },
+    });
+    expect(finishedNext.status).toBe(200);
+    const stayed = (await readCards(handler)).find((card) => card.taskId === "task-next");
+    expect(stayed?.attempts?.find((item) => item.attemptId === "attempt-2")?.write?.outcome).toBe(
+      "conflict",
+    );
+    expect(
+      stayed?.memoryFacts?.some((item) => item.body === "Finished the conflicting proposal."),
+    ).toBe(false);
+    expect(stayed?.steward?.some((item) => item.kind === "open_conflict")).toBe(true);
+    if (notice?.conflictId == null) throw new Error("expected an open steward conflict");
+
+    const resolved = await postJson(handler, ADAPTER_MEMORY_RESOLVE_PATH, {
+      conflictId: notice.conflictId,
+      action: "correct",
+      body: resolution,
+    });
+    expect(resolved.status).toBe(200);
+    const applied = (await resolved.json()) as { readonly factIds: readonly string[] };
+    expect(applied.factIds.length).toBeGreaterThan(0);
+
+    const settled = (await readCards(handler)).find((card) => card.taskId === "task-next");
+    expect(settled?.steward?.find((item) => item.kind === "open_conflict")).toBeUndefined();
+    expect(
+      settled?.memoryFacts?.some(
+        (item) =>
+          item.body === resolution &&
+          item.acceptance === "accepted" &&
+          item.provenance.actorId === "jim",
+      ),
+    ).toBe(true);
+    expect(
+      settled?.memoryFacts?.find((item) => item.factId === proposedFact?.factId),
+    ).toMatchObject({
+      acceptance: "proposed",
+      provenance: { actorId: "t3-codex" },
+    });
+
+    expect(
+      (
+        await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
+          taskId: "task-later",
+          title: "Later task",
+          idempotencyKey: "intake-later",
+          event: {
+            type: "intake",
+            intake: { ...intakeV2Example, projectId: "usba", workspaceId: "usba" },
+          },
+        })
+      ).status,
+    ).toBe(200);
+    expect(
+      (
+        await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
+          taskId: "task-later",
+          column: "Ready",
+          idempotencyKey: "ready-later",
+        })
+      ).status,
+    ).toBe(200);
+    expect(
+      (
+        await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
+          taskId: "task-later",
+          title: "Later task",
+          idempotencyKey: "assign-later",
+          event: {
+            type: "assign",
+            assignment: {
+              ...assignmentExample,
+              taskId: "task-later",
+              attemptId: "attempt-3",
+              assignmentId: "assignment-later",
+              workerId: "agent-c",
+            },
+          },
+        })
+      ).status,
+    ).toBe(200);
+    expect(
+      (
+        await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
+          taskId: "task-later",
+          column: "Running",
+          idempotencyKey: "run-later",
+        })
+      ).status,
+    ).toBe(200);
+    expect(prompts[2]).toContain(resolution);
+    expect(prompts[2]).not.toContain(`proposed, not accepted: ${fact}`);
+    expect(prompts[2]).not.toContain(conflict);
+    const later = (await readCards(handler)).find((card) => card.taskId === "task-later");
+    expect(
+      later?.attempts?.find((item) => item.attemptId === "attempt-3")?.read.memoryVersions,
+    ).toEqual(expect.arrayContaining([...applied.factIds]));
   });
 });

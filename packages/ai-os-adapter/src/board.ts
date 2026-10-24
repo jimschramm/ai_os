@@ -16,6 +16,7 @@ export const ADAPTER_BOARD_MOVE_PATH = "/api/ai-os/board/move";
 export const ADAPTER_BOARD_EVENT_PATH = "/api/ai-os/board/event";
 export const ADAPTER_ANTIGRAVITY_MODELS_PATH = "/api/ai-os/antigravity/models";
 export const ADAPTER_MEMORY_RESOLVE_PATH = "/api/ai-os/memory/resolve";
+export const ADAPTER_MEMORY_WRITE_PATH = "/api/ai-os/memory/write";
 
 export interface AdapterBoardCard {
   readonly taskId: string;

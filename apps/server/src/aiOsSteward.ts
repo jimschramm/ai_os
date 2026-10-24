@@ -60,11 +60,14 @@ export const resolveMemoryConflictSync = (
   }
   const accepted = ledger.graph.facts.find((fact) => fact.factId === conflict.acceptedFactId);
   const proposed = ledger.graph.facts.find((fact) => fact.factId === conflict.proposedFactId);
-  if (accepted === undefined || accepted.acceptance === "proposed") {
+  if (accepted === undefined || accepted.acceptance === "superseded") {
     throw invalid("The accepted fact is missing.");
   }
+  // A conflict between two proposals has no accepted revision yet. Jim's
+  // resolution is the first acceptance. An agent write is not that acceptance.
+  const proposedSide = accepted.acceptance === "proposed";
   const revision = ledger.revisions.find((item) => item.factId === accepted.factId && item.current);
-  if (revision === undefined) {
+  if (!proposedSide && revision === undefined) {
     throw invalid("The accepted fact has no current revision.");
   }
   const statement =
@@ -91,7 +94,10 @@ export const resolveMemoryConflictSync = (
     taskId: conflict.taskId,
     attemptId: conflict.attemptId,
     evidence: [{ evidenceId: fitId("evidence", conflict.conflictId), note: noteFor(input.action) }],
-    expectedVersions: [{ factId: accepted.factId, revision: revision.revision }],
+    expectedVersions:
+      proposedSide || revision === undefined
+        ? []
+        : [{ factId: accepted.factId, revision: revision.revision }],
     intent: "accept",
     facts: [
       {

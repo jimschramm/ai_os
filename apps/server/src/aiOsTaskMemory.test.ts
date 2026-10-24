@@ -4,7 +4,7 @@ import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 
 import { assert, it } from "@effect/vitest";
-import { packageFacts } from "@t3tools/ai-os-contracts";
+import { orientationText, packageFacts } from "@t3tools/ai-os-contracts";
 import * as Effect from "effect/Effect";
 
 import { openMemoryDatabase, readMemoryLedger, submitMemory } from "./aiOsMemory.ts";
@@ -74,7 +74,25 @@ it.effect("records a read and a write for each runtime, and reopens them", () =>
         prepared.receipt.authorId,
         request(runtime, `attempt-${runtime}`).authorId,
       );
-      assert.deepStrictEqual(prepared.contextPackage.memoryVersions, ["fact-start"]);
+      assert.deepStrictEqual(
+        prepared.package.orientation.decisions.map((line) => line.factId),
+        ["fact-start"],
+      );
+      const earlier = supplied.slice(0, -1);
+      assert.deepStrictEqual(
+        [...prepared.receipt.memoryVersions].sort(),
+        ["fact-start", ...earlier.map((item) => `fact-lesson-${item.receipt.runtime}`)].sort(),
+      );
+      assert.deepStrictEqual(
+        prepared.package.orientation.proposals.map((line) => line.body),
+        earlier.map((item) => `Lesson from ${item.receipt.runtime}.`),
+      );
+      assert.strictEqual(
+        prepared.package.orientation.proposals.every((line) =>
+          orientationText(prepared.package).includes(`proposed, not accepted: ${line.body}`),
+        ),
+        true,
+      );
       const receipt = yield* recordTaskWrite(
         database,
         prepared.receipt.attemptId,

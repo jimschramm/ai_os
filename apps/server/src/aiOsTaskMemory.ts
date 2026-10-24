@@ -1,4 +1,5 @@
 // @effect-diagnostics nodeBuiltinImport:off - node:sqlite is synchronous, and the read receipt is stored beside the ledger.
+import * as NodeCrypto from "node:crypto";
 import * as NodeSqlite from "node:sqlite";
 
 import {
@@ -29,7 +30,8 @@ const READ_SCHEMA = `
     runtime TEXT NOT NULL,
     digest TEXT NOT NULL,
     receipt_json TEXT NOT NULL,
-    package_json TEXT NOT NULL
+    package_json TEXT NOT NULL,
+    write_token TEXT
   );
 `;
 
@@ -54,6 +56,35 @@ const rollback = (database: NodeSqlite.DatabaseSync) => {
 
 const prepareReads = (database: NodeSqlite.DatabaseSync) => {
   database.exec(READ_SCHEMA);
+  const columns = database.prepare("PRAGMA table_info(ai_os_memory_read)").all() as ReadonlyArray<{
+    name?: string;
+  }>;
+  if (!columns.some((column) => column.name === "write_token")) {
+    database.exec("ALTER TABLE ai_os_memory_read ADD COLUMN write_token TEXT");
+  }
+};
+
+/** Token supplied in this attempt's launch prompt. A stored token wins. */
+export const attemptWriteTokenSync = (
+  database: NodeSqlite.DatabaseSync,
+  attemptId: string,
+): string => {
+  prepareReads(database);
+  const row = database
+    .prepare("SELECT write_token FROM ai_os_memory_read WHERE attempt_id = ?")
+    .get(attemptId) as { write_token?: string | null } | undefined;
+  if (typeof row?.write_token === "string" && row.write_token.length > 0) return row.write_token;
+  return `wt-${NodeCrypto.randomBytes(16).toString("hex")}`;
+};
+
+const storedWriteToken = (database: NodeSqlite.DatabaseSync, attemptId: string): string | null => {
+  prepareReads(database);
+  const row = database
+    .prepare("SELECT write_token FROM ai_os_memory_read WHERE attempt_id = ?")
+    .get(attemptId) as { write_token?: string | null } | undefined;
+  return typeof row?.write_token === "string" && row.write_token.length > 0
+    ? row.write_token
+    : null;
 };
 
 const storedRead = (
@@ -95,20 +126,30 @@ export const prepareTaskMemorySync = (
 export const commitTaskReadSync = (
   database: NodeSqlite.DatabaseSync,
   prepared: PreparedTaskMemory,
+  writeToken?: string,
 ): PreparedTaskMemory => {
   prepareReads(database);
   database.exec("BEGIN IMMEDIATE");
   try {
     const existing = storedRead(database, prepared.receipt.attemptId);
     if (existing !== null) {
-      database.exec("ROLLBACK");
+      if (writeToken !== undefined) {
+        database
+          .prepare(
+            `UPDATE ai_os_memory_read
+             SET write_token = ?
+             WHERE attempt_id = ? AND write_token IS NULL`,
+          )
+          .run(writeToken, prepared.receipt.attemptId);
+      }
+      database.exec("COMMIT");
       return existing;
     }
     database
       .prepare(
         `INSERT INTO ai_os_memory_read
-          (attempt_id, receipt_id, project_id, task_id, author_id, runtime, digest, receipt_json, package_json)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          (attempt_id, receipt_id, project_id, task_id, author_id, runtime, digest, receipt_json, package_json, write_token)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         prepared.receipt.attemptId,
@@ -120,6 +161,7 @@ export const commitTaskReadSync = (
         prepared.receipt.digest,
         JSON.stringify(prepared.receipt),
         JSON.stringify(prepared.package),
+        writeToken ?? null,
       );
     database.exec("COMMIT");
     return prepared;
@@ -151,6 +193,32 @@ export const recordTaskWriteSync = (
     taskWriteSubmission(readMemoryLedger(database), stored.receipt, write),
   );
   return submitMemorySync(database, submission, acceptingAuthorId);
+};
+
+/**
+ * The attempt's own project and launch token.
+ * The write stays a proposal. This does not accept it.
+ */
+export const submitAttemptMemorySync = (
+  database: NodeSqlite.DatabaseSync,
+  attemptId: string,
+  projectId: string,
+  write: unknown,
+  acceptingAuthorId: string,
+  writeToken: string,
+): SubmissionReceiptV1 => {
+  const activity = readAttemptActivitySync(database).find((item) => item.attemptId === attemptId);
+  if (activity === undefined) {
+    throw invalid("Context was not supplied for this attempt.");
+  }
+  if (activity.projectId !== projectId) {
+    throw invalid("A fact stays inside the attempt's project.");
+  }
+  const token = storedWriteToken(database, attemptId);
+  if (token === null || token !== writeToken) {
+    throw invalid("This write token belongs to a different attempt.");
+  }
+  return recordTaskWriteSync(database, attemptId, write, acceptingAuthorId);
 };
 
 const writeFor = (

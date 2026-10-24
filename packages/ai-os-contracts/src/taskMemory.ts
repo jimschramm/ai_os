@@ -19,6 +19,7 @@ import { ContractTransitionError } from "./errors.ts";
 import {
   MemoryNodeKindV1,
   packageFacts,
+  packageProposals,
   ProposedRelationshipV1,
   type MemoryFactV1,
 } from "./memory.ts";
@@ -93,6 +94,9 @@ export const TaskMemoryPackageV1 = Schema.Struct({
     decisions: lineList,
     knowledge: lineList,
     conflicts: Schema.Array(ConflictOrientationV1),
+    proposals: Schema.Array(OrientationLineV1).pipe(
+      Schema.withDecodingDefault(Effect.sync(() => [] as ReadonlyArray<OrientationLineV1>)),
+    ),
   }),
   detail: lineList,
   summaries: Schema.Array(ArtifactSummaryV1),
@@ -161,6 +165,13 @@ export const TaskWriteV1 = Schema.Union([
     kind: Schema.Literal("findings"),
     facts: Schema.NonEmptyArray(proposedFact),
     relationships: Schema.Array(ProposedRelationshipV1),
+    evidence: evidenceList,
+  }),
+  Schema.Struct({
+    kind: Schema.Literal("fact"),
+    identity: ContractId,
+    nodeKind: MemoryNodeKindV1,
+    body: ContractText,
     evidence: evidenceList,
   }),
   Schema.Struct({
@@ -243,6 +254,7 @@ export const orientationText = (memoryPackage: TaskMemoryPackageV1): readonly st
     (conflict) =>
       `Open conflict ${conflict.conflictId}: ${conflict.acceptedBody} / ${conflict.proposedBody} (${conflict.authorId})`,
   ),
+  ...memoryPackage.orientation.proposals.map((line) => `proposed, not accepted: ${line.body}`),
   ...memoryPackage.summaries.map((item) => item.summary),
 ];
 
@@ -254,6 +266,22 @@ export const promptCarriesMemory = (memoryPackage: TaskMemoryPackageV1, prompt: 
   prompt.includes(memoryPackage.requirements) &&
   prompt.includes(memoryPackage.repoCommit) &&
   orientationText(memoryPackage).every((line) => prompt.includes(line));
+
+/**
+ * Lines appended to the launch prompt the same way the memory package is.
+ * A fresh agent has to see its own attempt, project, and the write shapes.
+ */
+export const taskWritePrompt = (
+  memoryPackage: TaskMemoryPackageV1,
+  writePath: string,
+  writeToken: string,
+): readonly string[] => [
+  `Memory write: POST ${writePath} for attempt ${memoryPackage.attemptId} in project ${memoryPackage.projectId}.`,
+  `Memory write token: ${writeToken}`,
+  `Record a fact: {"attemptId":"${memoryPackage.attemptId}","writeToken":"${writeToken}","write":{"kind":"fact","identity":"<identity>","nodeKind":"Decision","body":"<statement>","evidence":[{"evidenceId":"<id>","note":"<source>"}]}}`,
+  `Propose findings: {"attemptId":"${memoryPackage.attemptId}","writeToken":"${writeToken}","write":{"kind":"findings","facts":[{"identity":"<identity>","fact":{"acceptance":"proposed","factId":"<id>","projectId":"${memoryPackage.projectId}","kind":"Decision","body":"<statement>","provenance":{"actorId":"${memoryPackage.authorId}","at":"${memoryPackage.createdAt}"},"validity":{"from":"${memoryPackage.createdAt}","until":null}}}],"relationships":[],"evidence":[{"evidenceId":"<id>","note":"<source>"}]}}`,
+  "This attempt has one write. A stale or contradictory proposal is kept as a conflict for the Memory Steward.",
+];
 
 export interface PreparedTaskMemory {
   readonly package: TaskMemoryPackageV1;
@@ -270,6 +298,22 @@ export const prepareTaskMemory = (
       Effect.mapError(() => invalid("The task memory request does not match the schema.")),
     );
     const current = packageFacts(ledger.graph, decoded.projectId, decoded.createdAt);
+    const pendingProposals = packageProposals(
+      ledger.graph,
+      decoded.projectId,
+      decoded.createdAt,
+    ).filter((fact) => {
+      const named = ledger.identities.find(
+        (item) => item.factId === fact.factId && item.projectId === decoded.projectId,
+      );
+      if (named === undefined) return true;
+      return !ledger.revisions.some(
+        (revision) =>
+          revision.current &&
+          revision.identity === named.identity &&
+          revision.projectId === decoded.projectId,
+      );
+    });
     const artifacts = current.filter((fact) => fact.kind === "Artifact");
     const knowledge = current.filter(
       (fact) => fact.kind !== "Instruction" && fact.kind !== "Decision" && fact.kind !== "Artifact",
@@ -299,7 +343,11 @@ export const prepareTaskMemory = (
       summary: summaryOf(fact.body),
       actorId: fact.provenance.actorId,
     }));
-    const memoryVersions = current.map((fact) => fact.factId);
+    const memoryVersions = [
+      ...current.map((fact) => fact.factId),
+      ...pendingProposals.map((fact) => fact.factId),
+    ];
+    const packaged = [...current, ...pendingProposals];
     const canonical = [
       decoded.projectId,
       decoded.taskId,
@@ -309,8 +357,11 @@ export const prepareTaskMemory = (
       decoded.repoCommit,
       decoded.requirements,
       ...[...memoryVersions].sort().map((factId) => {
-        const fact = current.find((item) => item.factId === factId);
-        return `${factId}\t${fact?.body ?? ""}`;
+        const fact = packaged.find((item) => item.factId === factId);
+        const standing = pendingProposals.some((item) => item.factId === factId)
+          ? "proposed"
+          : "accepted";
+        return `${standing}\t${factId}\t${fact?.body ?? ""}`;
       }),
       ...conflicts.map(
         (conflict) => `${conflict.conflictId}\t${conflict.acceptedBody}\t${conflict.proposedBody}`,
@@ -342,6 +393,7 @@ export const prepareTaskMemory = (
         decisions: byKind(current, "Decision"),
         knowledge: knowledge.map(lineFrom),
         conflicts,
+        proposals: pendingProposals.map(lineFrom),
       },
       detail: current.map(lineFrom),
       summaries,
@@ -375,7 +427,7 @@ const currentExpected = (
 
 /**
  * A run writes through SubmissionV1 as a proposal. The accepting authority is
- * not this agent, and a repeated failure's lesson stays proposed.
+ * not this agent. A recorded fact is one proposed fact. Findings stay proposed.
  */
 export const taskWriteSubmission = (
   ledger: MemoryLedgerV1,
@@ -389,20 +441,35 @@ export const taskWriteSubmission = (
     const facts =
       decoded.kind === "findings"
         ? decoded.facts
-        : [
-            {
-              identity: prefixedId("unchanged", receipt.attemptId),
-              fact: {
-                acceptance: "proposed" as const,
-                factId: prefixedId("note", receipt.attemptId),
-                projectId: receipt.projectId,
-                kind: "Source" as const,
-                body: decoded.explanation,
-                provenance: { actorId: receipt.authorId, at: receipt.suppliedAt },
-                validity: { from: receipt.suppliedAt, until: null as string | null },
+        : decoded.kind === "fact"
+          ? [
+              {
+                identity: decoded.identity,
+                fact: {
+                  acceptance: "proposed" as const,
+                  factId: prefixedId("fact", `${receipt.attemptId}-${decoded.identity}`),
+                  projectId: receipt.projectId,
+                  kind: decoded.nodeKind,
+                  body: decoded.body,
+                  provenance: { actorId: receipt.authorId, at: receipt.suppliedAt },
+                  validity: { from: receipt.suppliedAt, until: null as string | null },
+                },
               },
-            },
-          ];
+            ]
+          : [
+              {
+                identity: prefixedId("unchanged", receipt.attemptId),
+                fact: {
+                  acceptance: "proposed" as const,
+                  factId: prefixedId("note", receipt.attemptId),
+                  projectId: receipt.projectId,
+                  kind: "Source" as const,
+                  body: decoded.explanation,
+                  provenance: { actorId: receipt.authorId, at: receipt.suppliedAt },
+                  validity: { from: receipt.suppliedAt, until: null as string | null },
+                },
+              },
+            ];
     for (const item of facts) {
       if (item.fact.provenance.actorId !== receipt.authorId) {
         return yield* invalid("The fact author is the agent that read the context.");

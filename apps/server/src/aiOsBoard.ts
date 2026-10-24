@@ -8,6 +8,7 @@ import {
   ADAPTER_BOARD_MOVE_PATH,
   ADAPTER_BOARD_PATH,
   ADAPTER_MEMORY_RESOLVE_PATH,
+  ADAPTER_MEMORY_WRITE_PATH,
   type AdapterBoardCard,
 } from "@t3tools/ai-os-adapter/board";
 import {
@@ -38,6 +39,7 @@ import {
   orientationText,
   initialMemoryLedger,
   promptCarriesMemory,
+  taskWritePrompt,
   requestKanbanMove,
   reviewSteward,
   runtimeForAssignment,
@@ -89,10 +91,12 @@ import {
 import { memoryDatabasePath, openMemoryDatabase, readMemoryLedger } from "./aiOsMemory.ts";
 import { resolveMemoryConflictSync } from "./aiOsSteward.ts";
 import {
+  attemptWriteTokenSync,
   commitTaskReadSync,
   prepareTaskMemorySync,
   readAttemptActivitySync,
   recordTaskWriteSync,
+  submitAttemptMemorySync,
   withTaskMemory,
 } from "./aiOsTaskMemory.ts";
 import type { AdvisoryExecution, AdvisorySuccess } from "@t3tools/ai-os-adapter";
@@ -469,12 +473,23 @@ const suppliedForLaunch = (file: string, state: BoardSequence) =>
         detail: "This run has no project.",
       });
     }
-    const prepared = yield* withTaskMemory(file, (database) =>
-      prepareTaskMemorySync(database, request),
-    );
-    const lines = orientationText(prepared.package);
-    const prompt = renderSuppliedPrompt(state.intake, prepared.contextPackage, lines);
-    if (!promptCarriesMemory(prepared.package, prompt)) {
+    const supplied = yield* withTaskMemory(file, (database) => {
+      const prepared = prepareTaskMemorySync(database, request);
+      return {
+        prepared,
+        writeToken: attemptWriteTokenSync(database, prepared.receipt.attemptId),
+      };
+    });
+    const lines = [
+      ...orientationText(supplied.prepared.package),
+      ...taskWritePrompt(supplied.prepared.package, ADAPTER_MEMORY_WRITE_PATH, supplied.writeToken),
+    ];
+    const prompt = renderSuppliedPrompt(state.intake, supplied.prepared.contextPackage, lines);
+    if (
+      !promptCarriesMemory(supplied.prepared.package, prompt) ||
+      !prompt.includes(ADAPTER_MEMORY_WRITE_PATH) ||
+      !prompt.includes(supplied.writeToken)
+    ) {
       return yield* new ContractTransitionError({
         contract: "memory",
         reason: "invalid_payload",
@@ -483,12 +498,12 @@ const suppliedForLaunch = (file: string, state: BoardSequence) =>
         detail: "The launch prompt does not include the memory package.",
       });
     }
-    return { prepared, prompt, lines };
+    return { prepared: supplied.prepared, prompt, lines, writeToken: supplied.writeToken };
   });
 
 /** Store the read after the adapter has accepted the prompt that carries this package. */
-const commitSuppliedRead = (file: string, prepared: PreparedTaskMemory) =>
-  withTaskMemory(file, (database) => commitTaskReadSync(database, prepared)).pipe(
+const commitSuppliedRead = (file: string, prepared: PreparedTaskMemory, writeToken: string) =>
+  withTaskMemory(file, (database) => commitTaskReadSync(database, prepared, writeToken)).pipe(
     Effect.map(() => ({ _tag: "Ok" as const })),
     Effect.catch((error) => Effect.succeed({ _tag: "No" as const, detail: error.message })),
   );
@@ -1264,6 +1279,7 @@ export const layer = Layer.unwrap(
               const recorded = yield* commitSuppliedRead(
                 taskMemoryFile(config.stateDir),
                 supplied.value.prepared,
+                supplied.value.writeToken,
               );
               if (recorded._tag === "No") return rejectedMove(recorded.detail, rejectedState, book);
               const started = yield* applyBoardWorkflowEvent(
@@ -1477,6 +1493,7 @@ export const layer = Layer.unwrap(
                     const recorded = yield* commitSuppliedRead(
                       taskMemoryFile(config.stateDir),
                       supplied.value.prepared,
+                      supplied.value.writeToken,
                     );
                     if (recorded._tag === "No")
                       return rejectedMove(recorded.detail, queued, ledger);
@@ -1878,6 +1895,7 @@ export const layer = Layer.unwrap(
             const recorded = yield* commitSuppliedRead(
               taskMemoryFile(config.stateDir),
               supplied.value.prepared,
+              supplied.value.writeToken,
             );
             if (recorded._tag === "No") {
               return json(409, { _tag: "Rejected", detail: recorded.detail });
@@ -2057,6 +2075,61 @@ export const layer = Layer.unwrap(
         ),
       ),
     );
+    const writeMemory = Effect.gen(function* () {
+      yield* authorize(AuthOrchestrationOperateScope);
+      const request = yield* HttpServerRequest.HttpServerRequest;
+      const text = yield* request.text.pipe(Effect.orElseSucceed(() => ""));
+      return yield* writes.withPermits(1)(
+        Effect.gen(function* () {
+          const body = readJson(text);
+          if (!isRecord(body)) return json(400, { detail: "Expected a JSON object." });
+          const attemptId = stringField(body, "attemptId");
+          const writeToken = stringField(body, "writeToken");
+          if (attemptId === null || writeToken === null || !("write" in body)) {
+            return json(400, { detail: "Expected attemptId, writeToken, and write." });
+          }
+          const running = cardsNow().find(
+            (card) =>
+              card.state.phase === "executing" && card.state.assignment.attemptId === attemptId,
+          );
+          if (running === undefined || running.state.phase !== "executing") {
+            return json(409, { _tag: "Rejected", detail: "This attempt is not running." });
+          }
+          const projectId = projectIdOf(running.state);
+          if (projectId === null) {
+            return json(409, { _tag: "Rejected", detail: "This run has no project." });
+          }
+          const wrote = yield* withTaskMemory(taskMemoryFile(config.stateDir), (database) =>
+            submitAttemptMemorySync(database, attemptId, projectId, body.write, "jim", writeToken),
+          ).pipe(
+            Effect.map((receipt) => ({ _tag: "Ok" as const, receipt })),
+            Effect.catch((error) => Effect.succeed({ _tag: "No" as const, detail: error.message })),
+          );
+          if (wrote._tag === "No") return json(409, { _tag: "Rejected", detail: wrote.detail });
+          if (wrote.receipt.outcome === "rejected") {
+            return json(409, { _tag: "Rejected", detail: wrote.receipt.detail });
+          }
+          publishAttempts();
+          return json(200, {
+            _tag: "Applied",
+            outcome: wrote.receipt.outcome,
+            detail: wrote.receipt.detail,
+            submissionId: wrote.receipt.submissionId,
+            factIds: wrote.receipt.factIds,
+            conflictIds: wrote.receipt.conflictIds,
+          });
+        }),
+      );
+    }).pipe(
+      Effect.catchTags(authResponse),
+      Effect.catch((cause) =>
+        failEnvironmentInternal("internal_error", cause).pipe(
+          Effect.catchTags({
+            EnvironmentInternalError: (error) => HttpServerRespondable.toResponse(error),
+          }),
+        ),
+      ),
+    );
     return Layer.mergeAll(
       HttpRouter.add("GET", ADAPTER_BOARD_PATH, snapshot),
       HttpRouter.add("POST", ADAPTER_BOARD_PATH, replace),
@@ -2064,6 +2137,7 @@ export const layer = Layer.unwrap(
       HttpRouter.add("POST", ADAPTER_BOARD_MOVE_PATH, move),
       HttpRouter.add("POST", ADAPTER_BOARD_EVENT_PATH, workflowEvent),
       HttpRouter.add("POST", ADAPTER_MEMORY_RESOLVE_PATH, resolveConflict),
+      HttpRouter.add("POST", ADAPTER_MEMORY_WRITE_PATH, writeMemory),
       HttpRouter.add("GET", ADAPTER_ANTIGRAVITY_MODELS_PATH, models),
       Layer.effectDiscard(
         Effect.gen(function* () {

@@ -177,6 +177,40 @@ const currentRevision = (
 const factById = (graph: MemoryGraphV1, factId: string): MemoryFactV1 | undefined =>
   graph.facts.find((fact) => fact.factId === factId);
 
+/**
+ * A pending fact for this identity, from another attempt, whose text disagrees.
+ * It is not accepted knowledge. The same attempt can still record its own proposal.
+ */
+const pendingDisagreement = (
+  ledger: MemoryLedgerV1,
+  identity: string,
+  projectId: string,
+  body: string,
+  attemptId: string,
+): MemoryFactV1 | undefined => {
+  for (const named of ledger.identities) {
+    if (named.identity !== identity || named.projectId !== projectId) continue;
+    const fact = factById(ledger.graph, named.factId);
+    if (
+      fact === undefined ||
+      fact.acceptance !== "proposed" ||
+      fact.projectId !== projectId ||
+      fact.body === body
+    ) {
+      continue;
+    }
+    const authorAttempt = ledger.receipts.find(
+      (receipt) =>
+        receipt.factIds.includes(fact.factId) &&
+        receipt.outcome !== "duplicate" &&
+        receipt.outcome !== "rejected",
+    )?.attemptId;
+    if (authorAttempt === undefined || authorAttempt === attemptId) continue;
+    return fact;
+  }
+  return undefined;
+};
+
 const authorOf = (fact: MemoryFactV1 | undefined): string => fact?.provenance.actorId ?? "unknown";
 
 interface PublishPlan {
@@ -188,7 +222,7 @@ interface PublishPlan {
   }>;
   readonly kept: ReadonlyArray<{ readonly identity: string; readonly factId: string }>;
   readonly conflicts: ReadonlyArray<{
-    readonly accepted: FactRevisionV1;
+    readonly acceptedFactId: string;
     readonly proposed: SubmissionFactV1;
   }>;
   readonly relationships: ReadonlyArray<ProposedRelationshipV1>;
@@ -321,13 +355,25 @@ const planSubmission = (ledger: MemoryLedgerV1, submission: SubmissionV1): Publi
     return revision === undefined || !revision.current || revision.revision !== expected.revision;
   });
   const replacements: Array<{ next: SubmissionFactV1; previous: FactRevisionV1 }> = [];
-  const conflicts: Array<{ accepted: FactRevisionV1; proposed: SubmissionFactV1 }> = [];
+  const conflicts: Array<{ acceptedFactId: string; proposed: SubmissionFactV1 }> = [];
   const kept: Array<{ identity: string; factId: string }> = [];
   const facts: SubmissionFactV1[] = [];
   for (const item of submission.facts) {
     const current = currentRevision(ledger, item.identity, submission.projectId);
     const currentFact = current === undefined ? undefined : factById(ledger.graph, current.factId);
     if (current === undefined || currentFact === undefined) {
+      if (submission.intent === "propose") {
+        const prior = pendingDisagreement(
+          ledger,
+          item.identity,
+          submission.projectId,
+          item.fact.body,
+          submission.attemptId,
+        );
+        if (prior !== undefined) {
+          conflicts.push({ acceptedFactId: prior.factId, proposed: item });
+        }
+      }
       facts.push(item);
       continue;
     }
@@ -356,7 +402,7 @@ const planSubmission = (ledger: MemoryLedgerV1, submission: SubmissionV1): Publi
         }
         continue;
       }
-      conflicts.push({ accepted: current, proposed: item });
+      conflicts.push({ acceptedFactId: current.factId, proposed: item });
       facts.push(item);
       continue;
     }
@@ -372,7 +418,7 @@ const planSubmission = (ledger: MemoryLedgerV1, submission: SubmissionV1): Publi
     if (submission.intent === "accept" && expected === undefined && stale.length === 0) {
       return "Name the accepted version this statement replaces.";
     }
-    conflicts.push({ accepted: current, proposed: item });
+    conflicts.push({ acceptedFactId: current.factId, proposed: item });
     facts.push(item);
   }
   if (facts.length === 0 && submission.relationships.length === 0 && kept.length === 0) {
@@ -400,11 +446,11 @@ const planSubmission = (ledger: MemoryLedgerV1, submission: SubmissionV1): Publi
         proposed !== undefined &&
         !conflicts.some(
           (item) =>
-            item.accepted.factId === current.factId &&
+            item.acceptedFactId === current.factId &&
             item.proposed.fact.factId === proposed.fact.factId,
         )
       ) {
-        conflicts.push({ accepted: current, proposed });
+        conflicts.push({ acceptedFactId: current.factId, proposed });
       }
     }
   }
@@ -421,7 +467,11 @@ const planSubmission = (ledger: MemoryLedgerV1, submission: SubmissionV1): Publi
     relationships: submission.relationships,
     detail:
       mode === "conflict"
-        ? "The accepted statement was kept. The submission is an open conflict."
+        ? conflicts.some((conflict) =>
+            ledger.revisions.some((revision) => revision.factId === conflict.acceptedFactId),
+          )
+          ? "The accepted statement was kept. The submission is an open conflict."
+          : "Recorded as a proposal. It conflicts with a pending fact. Accepted knowledge was not changed."
         : mode === "accepted" && replacements.length === 0 && keptFacts.length > 0
           ? "Kept the accepted statement."
           : mode === "accepted"
@@ -557,7 +607,7 @@ const publish = (
       if (conflictId === null) {
         return yield* invalid("The conflict id does not fit the id rules.");
       }
-      const accepted = factById(ledger.graph, conflict.accepted.factId);
+      const accepted = factById(ledger.graph, conflict.acceptedFactId);
       conflictRecords.push({
         conflictId,
         projectId: submission.projectId,
@@ -567,7 +617,7 @@ const publish = (
         taskId: submission.taskId,
         attemptId: submission.attemptId,
         identity: conflict.proposed.identity,
-        acceptedFactId: conflict.accepted.factId,
+        acceptedFactId: conflict.acceptedFactId,
         proposedFactId: conflict.proposed.fact.factId,
         resolvedBySubmissionId: null,
       });
@@ -578,6 +628,7 @@ const publish = (
             conflict.resolvedBySubmissionId === null &&
             conflict.projectId === submission.projectId &&
             (plan.kept.some((item) => item.identity === conflict.identity) ||
+              plan.facts.some((item) => item.identity === conflict.identity) ||
               plan.replacements.some(
                 (replacement) =>
                   replacement.previous.projectId === conflict.projectId &&
