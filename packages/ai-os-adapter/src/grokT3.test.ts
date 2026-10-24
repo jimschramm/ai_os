@@ -3,7 +3,6 @@ import { assert, it } from "@effect/vitest";
 import {
   assignmentExample,
   applySequence,
-  applySequenceEvent,
   decodeAssignmentV1,
   decodeCompletionSubmissionV1,
   decodeIntake,
@@ -712,9 +711,8 @@ it.effect("launches one T3 thread and reads the completion back", () =>
       if (working.state.phase !== "executing") return;
       assert.strictEqual(working.state.run.progress?.status, "working");
       assert.strictEqual(working.state.run.usage.length, 0);
-      assert.strictEqual(working.state.run.actualModel?.requested?.model, TEST_MODEL);
-      assert.strictEqual(working.state.run.actualModel?.model, null);
-      assert.strictEqual(working.state.run.actualModel?.unverified, false);
+      assert.strictEqual(working.state.run.implementerRuntime?.requested?.model, TEST_MODEL);
+      assert.strictEqual(working.state.run.implementerRuntime?.actual, null);
       const again = yield* adapter.observe(recorded.taskId);
       if (again.state.phase !== "executing") return;
       assert.strictEqual(again.state.run.usage.length, 0);
@@ -1245,15 +1243,6 @@ it.effect("attributes tokens to the provider session model and not the request",
       return yield* Effect.die("The measurement must be reported tokens.");
     }
     assert.strictEqual(usage.event.measurement.attribution.model.model, "gpt-6-sol");
-    const runtime = planned.find((item) => item.event.type === "record_runtime_models");
-    if (runtime === undefined) {
-      return yield* Effect.die("Codex must record the model it reported.");
-    }
-    const recorded = yield* applySequenceEvent(executing, runtime.event);
-    if (recorded.phase !== "executing") return;
-    assert.strictEqual(recorded.assignment.implementerModel.model, "gpt-5.4");
-    assert.strictEqual(recorded.run.actualModel?.model?.model, "gpt-6-sol");
-    assert.strictEqual(recorded.run.actualModel?.unverified, false);
     const unreported = observationEvents({
       taskId: "task-usba-page",
       threadId: "thread-1",

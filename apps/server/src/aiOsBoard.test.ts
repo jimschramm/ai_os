@@ -1173,7 +1173,7 @@ describe("ai-os board route", () => {
         });
       },
     });
-    for (const [index, event] of happyPathEvents.slice(0, 8).entries()) {
+    for (const [index, event] of happyPathEvents.slice(0, 9).entries()) {
       const posted = await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
         taskId: "task-usba-page",
         title: "Tournament page",

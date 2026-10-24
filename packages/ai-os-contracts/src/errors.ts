@@ -37,6 +37,7 @@ export const ContractErrorReason = Schema.Literals([
   "attempt_mismatch",
   "implementer_mismatch",
   "qa_same_model",
+  "qa_model_unknown",
   "acceptance_revision_mismatch",
   "revision_mismatch",
   "recovery_pending_not_ready",
