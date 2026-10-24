@@ -1477,6 +1477,41 @@ export const layer = Layer.unwrap(
                 });
               }
               yield* reviews.cancel(taskId);
+              if (decoded.event.type === "cancel" && stored.state.phase === "executing") {
+                const executing = stored.state;
+                const blocked = yield* applyBoardWorkflowEvent(
+                  executing,
+                  {
+                    type: "lease_expired",
+                    lease: {
+                      taskId,
+                      attemptId: executing.assignment.attemptId,
+                      generation: executing.run.generation,
+                      leaseId: executing.run.leaseId,
+                    },
+                  },
+                  idempotencyKey,
+                  taskId,
+                  ledger,
+                );
+                if (blocked._tag !== "Applied") return json(409, publicMove(blocked));
+                const blockedSaved = yield* persistApplied(blocked, card, {
+                  taskId,
+                  title: stringField(body, "title"),
+                  threadId,
+                  runId,
+                });
+                if (blockedSaved === "needs-title") {
+                  return json(400, { detail: "A new task needs a title." });
+                }
+                if (blockedSaved !== "stored") {
+                  return json(400, { detail: "The task could not be stored." });
+                }
+                return json(200, {
+                  ...publicMove(blocked),
+                  revision: (card?.revision ?? 0) + (blocked.changed ? 1 : 0),
+                });
+              }
             } else {
               if (threadId === null || runId === null) {
                 return json(409, {
@@ -1503,6 +1538,97 @@ export const layer = Layer.unwrap(
                 return json(409, { _tag: "Rejected", detail: interrupted.detail });
               }
             }
+          }
+          if (
+            !replay &&
+            stored._tag === "Ok" &&
+            decoded.event.type === "continue" &&
+            "assignment" in stored.state &&
+            declaredTaskType(stored.state.assignment) === "advisory" &&
+            stored.state.phase === "recovery_pending"
+          ) {
+            if (!antigravitySupports("start")) {
+              return json(409, {
+                _tag: "Rejected",
+                detail: "Antigravity does not implement start.",
+              });
+            }
+            const waiting = stored.state;
+            const recovered = yield* reviews.recover(taskId);
+            if (recovered.status === "still_running") {
+              return json(409, {
+                _tag: "Rejected",
+                detail:
+                  "The earlier advisory review is still running. It stays blocked until that process is confirmed stopped.",
+              });
+            }
+            const generation = waiting.run.generation;
+            const nextAttemptId = `retry-${taskId}-${generation + 1}`.slice(0, 128);
+            const resolved = yield* applyBoardWorkflowEvent(
+              waiting,
+              {
+                type: "resolve_recovery",
+                command: {
+                  command: "resolve_recovery",
+                  outcome: "continue",
+                  idempotencyKey: `agy-recover-${taskId}-${generation}`,
+                  taskId,
+                  attemptId: waiting.assignment.attemptId,
+                  nextAttemptId,
+                },
+              },
+              `agy-recover-${taskId}-${generation}`,
+              taskId,
+              ledger,
+            );
+            if (resolved._tag !== "Applied" || resolved.state.phase !== "assigned") {
+              return json(409, publicMove(resolved));
+            }
+            const queued = resolved.state;
+            const projectId = projectIdOf(queued);
+            if (projectId === null) {
+              return json(409, {
+                _tag: "Rejected",
+                detail: "This card has no project, so the review cannot be started.",
+              });
+            }
+            const typed = stringField(body, "model")?.trim() ?? "";
+            const requested =
+              typed.length > 0 ? typed : (queued.assignment.advisoryModel?.model ?? undefined);
+            const opened = yield* reviews.start({
+              projectId,
+              taskId,
+              generation: executionGeneration(queued),
+              intake: queued.intake,
+              context: queued.assignment.contextPackage,
+              requestedModel: requested,
+            });
+            if (opened.status === "unavailable") {
+              return json(409, { _tag: "Rejected", detail: opened.detail });
+            }
+            const started = yield* applyBoardWorkflowEvent(
+              queued,
+              { type: "start_execution" },
+              idempotencyKey,
+              taskId,
+              resolved.ledger,
+            );
+            if (started._tag !== "Applied" || started.state.phase !== "executing") {
+              return json(409, publicMove(started));
+            }
+            const resumed = yield* persistApplied(started, card, {
+              taskId,
+              title: stringField(body, "title"),
+              threadId,
+              runId: opened.runId,
+            });
+            if (resumed === "needs-title")
+              return json(400, { detail: "A new task needs a title." });
+            if (resumed !== "stored") return json(400, { detail: "The task could not be stored." });
+            return json(200, {
+              ...publicMove(started),
+              revision: (card?.revision ?? 0) + (started.changed ? 1 : 0),
+            });
           }
           const prepared =
             stored._tag === "Ok" && !replay && decoded.event.type === "qa"

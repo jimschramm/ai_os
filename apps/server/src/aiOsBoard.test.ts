@@ -1899,6 +1899,145 @@ describe("ai-os board route", () => {
     );
   });
 
+  it("keeps an advisory cancel event blocked until the process stops", async () => {
+    let canceled = 0;
+    let starts = 0;
+    let processRunning = true;
+    let worktree = true;
+    const { handler } = handlerFor(undefined, allowRuns, {
+      ...idleReviews,
+      start: () => {
+        starts += 1;
+        return Effect.succeed({ status: "running" as const, runId: `agy-run-${starts}` });
+      },
+      cancel: () => {
+        canceled += 1;
+        return Effect.succeed("requested" as const);
+      },
+      recover: () => {
+        if (processRunning) return Effect.succeed({ status: "still_running" as const });
+        worktree = false;
+        return Effect.succeed({ status: "stopped" as const });
+      },
+    });
+    expect(
+      (
+        await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
+          taskId: "task-agy",
+          title: "Advisory review",
+          idempotencyKey: "intake-agy",
+          event: {
+            type: "intake",
+            intake: { ...intakeV2Example, projectId: "usba", workspaceId: "usba" },
+          },
+        })
+      ).status,
+    ).toBe(200);
+    expect(
+      (
+        await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
+          taskId: "task-agy",
+          column: "Ready",
+          idempotencyKey: "ready-agy",
+        })
+      ).status,
+    ).toBe(200);
+    expect(
+      (
+        await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
+          taskId: "task-agy",
+          title: "Advisory review",
+          idempotencyKey: "assign-agy",
+          event: {
+            type: "assign",
+            assignment: {
+              ...assignmentExample,
+              taskId: "task-agy",
+              attemptId: "attempt-agy",
+              assignmentId: "assignment-agy",
+              instanceId: "antigravity",
+              taskType: "advisory",
+            },
+          },
+        })
+      ).status,
+    ).toBe(200);
+    expect(
+      (
+        await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
+          taskId: "task-agy",
+          column: "Running",
+          idempotencyKey: "run-agy",
+          model: "gemini-4-argon-high",
+        })
+      ).status,
+    ).toBe(200);
+    const canceledEvent = await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
+      taskId: "task-agy",
+      title: "Advisory review",
+      idempotencyKey: "cancel-event-agy",
+      event: {
+        type: "cancel",
+        command: {
+          command: "cancel",
+          idempotencyKey: "cancel-event-agy-c",
+          taskId: "task-agy",
+          attemptId: "attempt-agy",
+        },
+      },
+    });
+    expect(canceledEvent.status).toBe(200);
+    expect(canceled).toBe(1);
+    const after = (await readCards(handler)).find((item) => item.taskId === "task-agy");
+    expect(after?.state.phase).toBe("recovery_pending");
+    const early = await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
+      taskId: "task-agy",
+      title: "Advisory review",
+      idempotencyKey: "continue-agy-early",
+      event: {
+        type: "continue",
+        command: {
+          command: "continue",
+          idempotencyKey: "continue-agy-early-c",
+          taskId: "task-agy",
+          attemptId: "attempt-agy",
+        },
+      },
+    });
+    expect(early.status).toBe(409);
+    expect(starts).toBe(1);
+    expect(worktree).toBe(true);
+    const held = (await readCards(handler)).find((item) => item.taskId === "task-agy");
+    expect(held?.state.phase).toBe("recovery_pending");
+    expect(held?.state.phase === "recovery_pending" ? held.state.assignment.attemptId : "").toBe(
+      "attempt-agy",
+    );
+    processRunning = false;
+    const again = await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
+      taskId: "task-agy",
+      title: "Advisory review",
+      idempotencyKey: "continue-agy",
+      model: "gemini-4-argon-high",
+      event: {
+        type: "continue",
+        command: {
+          command: "continue",
+          idempotencyKey: "continue-agy-c",
+          taskId: "task-agy",
+          attemptId: "attempt-agy",
+        },
+      },
+    });
+    expect(again.status).toBe(200);
+    expect(starts).toBe(2);
+    expect(worktree).toBe(false);
+    const restarted = (await readCards(handler)).find((item) => item.taskId === "task-agy");
+    expect(restarted?.state.phase).toBe("executing");
+    expect(restarted?.state.phase === "executing" ? restarted.state.assignment.attemptId : "").toBe(
+      "retry-task-agy-2",
+    );
+  });
+
   it("keeps an interrupted advisory review blocked until the old process stops", async () => {
     let starts = 0;
     let processRunning = true;
