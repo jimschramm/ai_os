@@ -7,7 +7,9 @@ import {
   ADAPTER_BOARD_EVENTS_PATH,
   ADAPTER_BOARD_MOVE_PATH,
   ADAPTER_BOARD_PATH,
+  ADAPTER_MEMORY_COMMIT_PATH,
   ADAPTER_MEMORY_RESOLVE_PATH,
+  ADAPTER_MEMORY_SUPPLY_PATH,
   ADAPTER_MEMORY_WRITE_PATH,
   type AdapterBoardCard,
 } from "@t3tools/ai-os-adapter/board";
@@ -36,10 +38,9 @@ import {
   executionLaunchKey,
   ContractTransitionError,
   openBoardTask,
-  orientationText,
   initialMemoryLedger,
+  launchMemoryLines,
   promptCarriesMemory,
-  taskWritePrompt,
   requestKanbanMove,
   reviewSteward,
   runtimeForAssignment,
@@ -92,11 +93,13 @@ import { memoryDatabasePath, openMemoryDatabase, readMemoryLedger } from "./aiOs
 import { resolveMemoryConflictSync } from "./aiOsSteward.ts";
 import {
   attemptWriteTokenSync,
+  commitLaunchReadSync,
   commitTaskReadSync,
   prepareTaskMemorySync,
   readAttemptActivitySync,
   recordTaskWriteSync,
   submitAttemptMemorySync,
+  supplyLaunchReadSync,
   withTaskMemory,
 } from "./aiOsTaskMemory.ts";
 import type { AdvisoryExecution, AdvisorySuccess } from "@t3tools/ai-os-adapter";
@@ -480,10 +483,11 @@ const suppliedForLaunch = (file: string, state: BoardSequence) =>
         writeToken: attemptWriteTokenSync(database, prepared.receipt.attemptId),
       };
     });
-    const lines = [
-      ...orientationText(supplied.prepared.package),
-      ...taskWritePrompt(supplied.prepared.package, ADAPTER_MEMORY_WRITE_PATH, supplied.writeToken),
-    ];
+    const lines = launchMemoryLines(
+      supplied.prepared.package,
+      ADAPTER_MEMORY_WRITE_PATH,
+      supplied.writeToken,
+    );
     const prompt = renderSuppliedPrompt(state.intake, supplied.prepared.contextPackage, lines);
     if (
       !promptCarriesMemory(supplied.prepared.package, prompt) ||
@@ -848,15 +852,36 @@ export const layer = Layer.unwrap(
         if (card.state.phase === "executing") inFlight.add(card.state.assignment.attemptId);
       }
       const notices = reviewSteward(memory.ledger, memory.activity, inFlight);
+      const projectOf = (card: AdapterBoardCard): string | null =>
+        "intake" in card.state ? card.state.intake.projectId : null;
+      const taskIds = new Set(cards.map((card) => card.taskId));
+      const firstOfProject = new Map<string, string>();
+      for (const card of cards) {
+        const projectId = projectOf(card);
+        if (projectId !== null && !firstOfProject.has(projectId)) {
+          firstOfProject.set(projectId, card.taskId);
+        }
+      }
+      const byTask = new Map<string, Array<(typeof notices)[number]>>();
+      const seenNotices = new Set<string>();
+      for (const notice of notices) {
+        if (seenNotices.has(notice.noticeId)) continue;
+        const owner = taskIds.has(notice.taskId)
+          ? notice.taskId
+          : (firstOfProject.get(notice.projectId) ?? null);
+        if (owner === null) continue;
+        seenNotices.add(notice.noticeId);
+        const list = byTask.get(owner) ?? [];
+        list.push(notice);
+        byTask.set(owner, list);
+      }
       return cards.map((card) => {
-        const projectId = "intake" in card.state ? card.state.intake.projectId : null;
+        const projectId = projectOf(card);
         const facts =
           projectId === null
             ? []
             : memory.ledger.graph.facts.filter((fact) => fact.projectId === projectId);
-        const steward = notices.filter(
-          (notice) => notice.taskId === card.taskId || notice.projectId === projectId,
-        );
+        const steward = byTask.get(card.taskId) ?? [];
         // Drop a previous join. An empty list has to replace the field, or a
         // resolved conflict stays on the card.
         const { steward: _previousSteward, memoryFacts: _previousFacts, ...rest } = card;
@@ -2022,6 +2047,68 @@ export const layer = Layer.unwrap(
         detail: catalog.detail,
       });
     }).pipe(Effect.catchTags(authResponse));
+    const supplyMemory = Effect.gen(function* () {
+      yield* authorize(AuthOrchestrationOperateScope);
+      const request = yield* HttpServerRequest.HttpServerRequest;
+      const text = yield* request.text.pipe(Effect.orElseSucceed(() => ""));
+      return yield* writes.withPermits(1)(
+        Effect.gen(function* () {
+          const body = readJson(text);
+          if (!isRecord(body)) return json(400, { detail: "Expected a JSON object." });
+          const supplied = yield* withTaskMemory(taskMemoryFile(config.stateDir), (database) =>
+            supplyLaunchReadSync(database, body, ADAPTER_MEMORY_WRITE_PATH),
+          ).pipe(
+            Effect.map((value) => ({ _tag: "Ok" as const, value })),
+            Effect.catch((error) => Effect.succeed({ _tag: "No" as const, detail: error.message })),
+          );
+          if (supplied._tag === "No") return json(400, { detail: supplied.detail });
+          return json(200, {
+            lines: [...supplied.value.lines],
+            writeToken: supplied.value.writeToken,
+            digest: supplied.value.digest,
+            contextPackage: supplied.value.contextPackage,
+          });
+        }),
+      );
+    }).pipe(
+      Effect.catchTags(authResponse),
+      Effect.catch((cause) =>
+        failEnvironmentInternal("internal_error", cause).pipe(
+          Effect.catchTags({
+            EnvironmentInternalError: (error) => HttpServerRespondable.toResponse(error),
+          }),
+        ),
+      ),
+    );
+    const commitMemory = Effect.gen(function* () {
+      yield* authorize(AuthOrchestrationOperateScope);
+      const request = yield* HttpServerRequest.HttpServerRequest;
+      const text = yield* request.text.pipe(Effect.orElseSucceed(() => ""));
+      return yield* writes.withPermits(1)(
+        Effect.gen(function* () {
+          const body = readJson(text);
+          if (!isRecord(body)) return json(400, { detail: "Expected a JSON object." });
+          const committed = yield* withTaskMemory(taskMemoryFile(config.stateDir), (database) =>
+            commitLaunchReadSync(database, body),
+          ).pipe(
+            Effect.map(() => ({ _tag: "Ok" as const })),
+            Effect.catch((error) => Effect.succeed({ _tag: "No" as const, detail: error.message })),
+          );
+          if (committed._tag === "No") return json(409, { detail: committed.detail });
+          publishAttempts();
+          return json(200, { stored: true });
+        }),
+      );
+    }).pipe(
+      Effect.catchTags(authResponse),
+      Effect.catch((cause) =>
+        failEnvironmentInternal("internal_error", cause).pipe(
+          Effect.catchTags({
+            EnvironmentInternalError: (error) => HttpServerRespondable.toResponse(error),
+          }),
+        ),
+      ),
+    );
     const resolveConflict = Effect.gen(function* () {
       yield* authorize(AuthOrchestrationOperateScope);
       const request = yield* HttpServerRequest.HttpServerRequest;
@@ -2137,6 +2224,8 @@ export const layer = Layer.unwrap(
       HttpRouter.add("POST", ADAPTER_BOARD_MOVE_PATH, move),
       HttpRouter.add("POST", ADAPTER_BOARD_EVENT_PATH, workflowEvent),
       HttpRouter.add("POST", ADAPTER_MEMORY_RESOLVE_PATH, resolveConflict),
+      HttpRouter.add("POST", ADAPTER_MEMORY_SUPPLY_PATH, supplyMemory),
+      HttpRouter.add("POST", ADAPTER_MEMORY_COMMIT_PATH, commitMemory),
       HttpRouter.add("POST", ADAPTER_MEMORY_WRITE_PATH, writeMemory),
       HttpRouter.add("GET", ADAPTER_ANTIGRAVITY_MODELS_PATH, models),
       Layer.effectDiscard(

@@ -441,8 +441,12 @@ const applyMemory = (
   if (newer === undefined || newer.acceptance !== "accepted") {
     return Effect.fail(memoryError(event.type, "The newer fact must already be accepted."));
   }
-  if (older === undefined || older.acceptance !== "accepted") {
-    return Effect.fail(memoryError(event.type, "The older fact must already be accepted."));
+  // A proposal was never accepted. Closing it still uses the superseded shape:
+  // the resolver is the actor who accepted the newer fact.
+  if (older === undefined || (older.acceptance !== "accepted" && older.acceptance !== "proposed")) {
+    return Effect.fail(
+      memoryError(event.type, "The older fact must already be accepted or still proposed."),
+    );
   }
   if (newer.factId === older.factId) {
     return Effect.fail(memoryError(event.type, "A fact cannot supersede itself."));
@@ -458,8 +462,8 @@ const applyMemory = (
     body: older.body,
     provenance: older.provenance,
     validity: older.validity,
-    acceptedBy: older.acceptedBy,
-    acceptedAt: older.acceptedAt,
+    acceptedBy: older.acceptance === "accepted" ? older.acceptedBy : newer.acceptedBy,
+    acceptedAt: older.acceptance === "accepted" ? older.acceptedAt : newer.acceptedAt,
     supersededBy: newer.factId,
   };
   return Effect.succeed(

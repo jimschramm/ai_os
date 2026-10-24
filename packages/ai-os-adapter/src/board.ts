@@ -16,6 +16,8 @@ export const ADAPTER_BOARD_MOVE_PATH = "/api/ai-os/board/move";
 export const ADAPTER_BOARD_EVENT_PATH = "/api/ai-os/board/event";
 export const ADAPTER_ANTIGRAVITY_MODELS_PATH = "/api/ai-os/antigravity/models";
 export const ADAPTER_MEMORY_RESOLVE_PATH = "/api/ai-os/memory/resolve";
+export const ADAPTER_MEMORY_SUPPLY_PATH = "/api/ai-os/memory/supply";
+export const ADAPTER_MEMORY_COMMIT_PATH = "/api/ai-os/memory/commit";
 export const ADAPTER_MEMORY_WRITE_PATH = "/api/ai-os/memory/write";
 
 export interface AdapterBoardCard {
@@ -28,7 +30,7 @@ export interface AdapterBoardCard {
   readonly updatedAt: string;
   /** Attempt reads and writes joined from memory. Absent on snapshots saved before that join. */
   readonly attempts?: readonly AttemptMemoryActivityV1[];
-  /** Steward notices for this card's project. The Needs you list is the notification channel. */
+  /** Steward notices for this card. Each notice is on one card. The Needs you list is the notification channel. */
   readonly steward?: readonly StewardNoticeV1[];
   /** Accepted and proposed facts for this card's project. The drawer reads these. */
   readonly memoryFacts?: readonly MemoryFactV1[];

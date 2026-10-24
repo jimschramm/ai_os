@@ -415,6 +415,12 @@ export interface GrokT3Adapter extends WorkerAdapter<AttemptSession, AdapterBoar
   readonly pause: (taskId: string) => Effect.Effect<AttemptSession, GrokT3Error>;
 }
 
+/** Default worker id recorded on a launch this adapter starts. */
+export const GROK_T3_WORKER_ID = "codex-t3";
+
+/** The first attempt id this adapter assigns. It has to stay a contract id. */
+export const recordedAttemptId = (taskId: string): string => `${taskId}-attempt-1`;
+
 /** Capabilities this adapter actually implements. Retrieval of foreign assignments is not one of them. */
 export const GROK_T3_CAPABILITIES: ReadonlySet<WorkerCapability> = new Set([
   "start",
@@ -437,7 +443,7 @@ export const createGrokT3Adapter = (input: {
   readonly instanceId?: string;
 }): GrokT3Adapter => {
   const store = input.store ?? memorySessionStore();
-  const workerId = input.workerId ?? "codex-t3";
+  const workerId = input.workerId ?? GROK_T3_WORKER_ID;
   // A hardcoded slug is rejected by a pinned provider. Callers pass a model the server offers.
   const model = input.model?.trim() ?? "";
   const resolvedInstanceId = input.instanceId ?? T3_LAUNCH_DEFAULTS.instanceId;
@@ -548,7 +554,7 @@ export const createGrokT3Adapter = (input: {
   const assignmentFor = (taskId: string, context: ContextPackageSnapshotV1) => ({
     version: "v1" as const,
     taskId,
-    attemptId: `${taskId}-attempt-1`,
+    attemptId: recordedAttemptId(taskId),
     assignmentId: `${taskId}-assignment-1`,
     workerId,
     implementerModel: { model },

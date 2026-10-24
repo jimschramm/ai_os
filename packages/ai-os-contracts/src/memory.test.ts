@@ -12,6 +12,7 @@ import {
   historyFacts,
   initialMemoryGraph,
   packageFacts,
+  packageProposals,
 } from "./memory.ts";
 
 const at = "2026-10-21T15:00:00Z";
@@ -73,6 +74,52 @@ const request = {
 };
 
 const failure = (graph: unknown, event: unknown) => Effect.flip(applyMemoryEvent(graph, event));
+
+it.effect("closes a proposal by superseding it from the accepted fact", () =>
+  Effect.gen(function* () {
+    let graph = yield* applyMemoryEvent(initialMemoryGraph, {
+      type: "propose_fact",
+      fact: fact("decision-new"),
+    });
+    graph = yield* applyMemoryEvent(graph, {
+      type: "accept_fact",
+      factId: "decision-new",
+      acceptedBy: "jim",
+      acceptedAt: at,
+    });
+    graph = yield* applyMemoryEvent(graph, {
+      type: "propose_fact",
+      fact: fact("decision-old"),
+    });
+    graph = yield* applyMemoryEvent(graph, {
+      type: "supersede",
+      relationship: {
+        acceptance: "accepted",
+        relationshipId: "rel-close",
+        projectId: "usba",
+        relationshipType: "SUPERSEDES",
+        fromId: "decision-new",
+        toId: "decision-old",
+        provenance: { actorId: "jim", at },
+        validity: { from: at, until: null },
+        acceptedBy: "jim",
+        acceptedAt: at,
+      },
+    });
+    assert.strictEqual(
+      graph.facts.find((item) => item.factId === "decision-old")?.acceptance,
+      "superseded",
+    );
+    assert.deepStrictEqual(
+      packageProposals(graph, "usba", at).map((item) => item.factId),
+      [],
+    );
+    assert.deepStrictEqual(
+      packageFacts(graph, "usba", at).map((item) => item.factId),
+      ["decision-new"],
+    );
+  }),
+);
 
 it.effect("accepts only documented node kinds and relationship types", () =>
   Effect.gen(function* () {

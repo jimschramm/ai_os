@@ -525,6 +525,84 @@ const supersedesEdge = (
 const conflictIdFor = (submissionId: string, index: number): string | null =>
   contractId(`conflict-${submissionId}-${index}`);
 
+const acceptanceResolves = (
+  submission: SubmissionV1,
+  plan: PublishPlan,
+  conflict: MemoryConflictV1,
+): boolean =>
+  plan.mode === "accepted" &&
+  conflict.resolvedBySubmissionId === null &&
+  conflict.projectId === submission.projectId &&
+  (plan.kept.some((item) => item.identity === conflict.identity) ||
+    plan.facts.some((item) => item.identity === conflict.identity) ||
+    plan.replacements.some(
+      (replacement) =>
+        replacement.previous.projectId === conflict.projectId &&
+        (replacement.previous.factId === conflict.acceptedFactId ||
+          replacement.previous.identity === conflict.identity),
+    ));
+
+/**
+ * A resolution leaves the competing proposals in the graph, marked superseded
+ * by the fact that stands. They were not accepted, so a later package does
+ * not supply them, and the drawer no longer shows them as proposed.
+ */
+const closeCompetingProposals = (
+  graph: MemoryGraphV1,
+  submission: SubmissionV1,
+  plan: PublishPlan,
+  priorConflicts: readonly MemoryConflictV1[],
+): Effect.Effect<MemoryGraphV1, ContractTransitionError> =>
+  Effect.gen(function* () {
+    if (plan.mode !== "accepted") return graph;
+    const winners = new Map<string, string>();
+    for (const item of plan.facts) winners.set(item.identity, item.fact.factId);
+    for (const item of plan.kept) {
+      if (!winners.has(item.identity)) winners.set(item.identity, item.factId);
+    }
+    const targets: Array<{ readonly winnerId: string; readonly proposalId: string }> = [];
+    const seen = new Set<string>();
+    for (const conflict of priorConflicts) {
+      if (!acceptanceResolves(submission, plan, conflict)) continue;
+      const winnerId = winners.get(conflict.identity);
+      if (winnerId === undefined) continue;
+      for (const factId of [conflict.acceptedFactId, conflict.proposedFactId]) {
+        if (factId === winnerId || seen.has(factId)) continue;
+        const fact = graph.facts.find((item) => item.factId === factId);
+        if (fact?.acceptance !== "proposed") continue;
+        seen.add(factId);
+        targets.push({ winnerId, proposalId: factId });
+      }
+    }
+    let next = graph;
+    let index = plan.replacements.length;
+    for (const target of targets) {
+      const winner = next.facts.find((fact) => fact.factId === target.winnerId);
+      if (winner === undefined || winner.acceptance !== "accepted") continue;
+      const relationshipId = contractId(`sup-${submission.submissionId}-${index}`);
+      index += 1;
+      if (relationshipId === null) {
+        return yield* invalid("The supersession id does not fit the id rules.");
+      }
+      next = yield* applyMemoryEvent(next, {
+        type: "supersede",
+        relationship: {
+          acceptance: "accepted",
+          relationshipId,
+          projectId: submission.projectId,
+          relationshipType: "SUPERSEDES",
+          fromId: winner.factId,
+          toId: target.proposalId,
+          provenance: winner.provenance,
+          validity: { from: winner.validity.from, until: null },
+          acceptedBy: winner.acceptedBy,
+          acceptedAt: winner.acceptedAt,
+        },
+      });
+    }
+    return next;
+  });
+
 const publish = (
   ledger: MemoryLedgerV1,
   submission: SubmissionV1,
@@ -574,6 +652,7 @@ const publish = (
         });
       }
     }
+    graph = yield* closeCompetingProposals(graph, submission, plan, ledger.conflicts);
     const identities = [
       ...ledger.identities,
       ...plan.facts.map((item) => ({
@@ -625,16 +704,7 @@ const publish = (
     const conflicts =
       plan.mode === "accepted"
         ? ledger.conflicts.map((conflict) =>
-            conflict.resolvedBySubmissionId === null &&
-            conflict.projectId === submission.projectId &&
-            (plan.kept.some((item) => item.identity === conflict.identity) ||
-              plan.facts.some((item) => item.identity === conflict.identity) ||
-              plan.replacements.some(
-                (replacement) =>
-                  replacement.previous.projectId === conflict.projectId &&
-                  (replacement.previous.factId === conflict.acceptedFactId ||
-                    replacement.previous.identity === conflict.identity),
-              ))
+            acceptanceResolves(submission, plan, conflict)
               ? { ...conflict, resolvedBySubmissionId: submission.submissionId }
               : conflict,
           )
