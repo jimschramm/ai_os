@@ -3302,15 +3302,14 @@ describe("ai-os request route", () => {
     const { handler } = handlerFor(undefined, runs);
     expect((await configure(handler)).status).toBe(200);
     const started = await ask(handler);
-    expect(started.status).toBe(409);
-    expect(await started.json()).toMatchObject({
-      detail: "The QA run did not return a verdict.",
-    });
+    expect(started.status).toBe(200);
     const card = await demo(handler);
-    expect(card?.state.phase).toBe("awaiting_qa");
-    if (card?.state.phase !== "awaiting_qa") throw new Error("expected the card to stay in review");
-    expect(card.state.recordedVerdict).toBeUndefined();
-    expect(card.qaRun).toMatchObject({ commitSha: SUBMITTED, settled: "rejected" });
+    expect(card?.state.phase).toBe("qa_incomplete");
+    if (card?.state.phase !== "qa_incomplete") throw new Error("expected incomplete QA");
+    expect(card.state.qaLabel).toBe("Awaiting a verified reviewer");
+    expect(card.state.findings[0]?.defect).toBe("The QA run did not return a verdict.");
+    expect("recordedVerdict" in card.state).toBe(false);
+    expect(card.qaRun?.commitSha).toBe(SUBMITTED);
   };
 
   it("stores no verdict when the QA run has no text", async () => {
@@ -3368,6 +3367,71 @@ describe("ai-os request route", () => {
       ["codex", "gpt-6-astra"],
     ]);
     expect(launches[1]?.prompt).toContain(`Review this exact submitted revision: ${sha}`);
+  });
+
+  it("records a verdict the reviewer returns by following the QA prompt", async () => {
+    const launches: Array<{ model: string; instanceId: string; prompt: string }> = [];
+    const runs: AiOsBoard.BoardRuns["Service"] = {
+      ...allowRuns,
+      launch: (input) => {
+        launches.push({
+          model: input.model,
+          instanceId: input.instanceId,
+          prompt: input.prompt,
+        });
+        const reviewing = input.model === "gpt-6-astra";
+        return Effect.succeed({
+          threadId: reviewing ? "thread-qa" : "thread-impl",
+          runId: reviewing ? "run-qa" : "run-impl",
+          disposition: reviewing ? "completed" : "active",
+          summary: reviewing ? null : "Shipped the page.",
+        });
+      },
+      watchThread: (threadId) => {
+        if (threadId !== "thread-qa") {
+          return Effect.succeed({
+            threadId,
+            runId: "run-impl",
+            status: "completed" as const,
+            text: "Shipped the page.",
+            revision: SUBMITTED,
+            requestedModel: "gpt-5.6-sol",
+            actualModel: "gpt-5.6-sol",
+          });
+        }
+        const prompt = launches.find((item) => item.model === "gpt-6-astra")?.prompt ?? "";
+        const marker = "Reply with only this JSON.";
+        const form = JSON.parse(prompt.slice(prompt.indexOf(marker) + marker.length).trim()) as {
+          qaModel: string;
+          verdict: string;
+          findings: Array<{ defect: string; evidence: string; expectedBehavior: string }>;
+        };
+        form.qaModel = "gpt-6-astra";
+        form.verdict = "rework";
+        form.findings = [finding];
+        return Effect.succeed({
+          threadId,
+          runId: "run-qa",
+          status: "completed" as const,
+          text: JSON.stringify(form),
+          revision: SUBMITTED,
+          requestedModel: "gpt-6-astra",
+          actualModel: "gpt-6-astra",
+        });
+      },
+    };
+    const { handler } = handlerFor(undefined, runs);
+    expect((await configure(handler)).status).toBe(200);
+    const started = await ask(handler);
+    expect(started.status).toBe(200);
+    const card = await demo(handler);
+    expect(card?.state.phase).toBe("awaiting_qa");
+    if (card?.state.phase !== "awaiting_qa") throw new Error("expected the card to stay in review");
+    expect(card.state.recordedVerdict?.verdict).toBe("rework");
+    expect(card.state.recordedVerdict?.artifactRevision).toEqual({ type: "git", sha: SUBMITTED });
+    expect(card.state.recordedVerdict?.findings).toEqual([finding]);
+    expect(launches[1]?.prompt).toContain("Reply with only this JSON.");
+    expect(launches[1]?.prompt).toContain(`"sha":"${SUBMITTED}"`);
   });
 
   it("records an independent QA verdict and leaves the card in review", async () => {

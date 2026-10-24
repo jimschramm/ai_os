@@ -50,6 +50,7 @@ import {
   Intake,
   ContractTransitionError,
   needsWorkerNotice,
+  QA_INCOMPLETE_LABEL,
   openBoardTask,
   initialMemoryLedger,
   launchMemoryLines,
@@ -1500,7 +1501,10 @@ export const layer = Layer.unwrap(
       rejection: null,
       touched: false,
     });
-    const verdictForReview = (text: string | null) => {
+    const verdictForReview = (
+      state: Extract<BoardSequence, { phase: "awaiting_qa" }>,
+      text: string | null,
+    ) => {
       if (text === null || text.trim().length === 0) return Effect.succeed(null);
       let parsed: unknown;
       try {
@@ -1510,7 +1514,49 @@ export const layer = Layer.unwrap(
       }
       const body = isRecord(parsed) && isRecord(parsed.qa) ? parsed.qa : parsed;
       if (!isRecord(body)) return Effect.succeed(null);
-      return decodeQaVerdictV1(body).pipe(Effect.catch(() => Effect.succeed(null)));
+      // The reviewer fills the judgment. The ids and the implementer are already known.
+      const merged = {
+        ...body,
+        version: "v1",
+        taskId: state.acknowledgment.taskId,
+        attemptId: state.assignment.attemptId,
+        artifactRevision: state.completion.artifactRevision,
+        implementerModel: modelSlug(
+          state.run.implementerRuntime?.actual ?? state.assignment.implementerModel,
+        ),
+        ...(body.verdict === "accept"
+          ? { acceptedRevision: state.completion.artifactRevision }
+          : {}),
+      };
+      return decodeQaVerdictV1(merged).pipe(Effect.catch(() => Effect.succeed(null)));
+    };
+    const qaPromptSuffix = (
+      state: Extract<BoardSequence, { phase: "awaiting_qa" }>,
+      sha: string,
+    ): string => {
+      const form = {
+        version: "v1",
+        taskId: state.acknowledgment.taskId,
+        attemptId: state.assignment.attemptId,
+        availability: "available",
+        qaModel: "<qa-model>",
+        implementerModel: modelSlug(
+          state.run.implementerRuntime?.actual ?? state.assignment.implementerModel,
+        ),
+        verdict: "rework",
+        artifactRevision: { type: "git", sha },
+        findings: [
+          {
+            defect: "Describe the defect.",
+            evidence: "Where you saw it.",
+            expectedBehavior: "What should be true.",
+          },
+        ],
+      };
+      return `Review this exact submitted revision: ${sha}
+Set qaModel to the base model that ran this review. Set verdict to rework or accept. For accept, findings may be empty.
+Reply with only this JSON.
+${encodeJson(form)}`;
     };
     const settleQaVerdict = (
       outcome: KanbanMoveResult & { readonly _tag: "Applied" },
@@ -1520,12 +1566,44 @@ export const layer = Layer.unwrap(
       Effect.gen(function* () {
         if (outcome.state.phase !== "awaiting_qa") return keepQa(outcome, qaRun);
         const waiting = outcome.state;
-        const verdict = yield* verdictForReview(view.text);
+        const verdict = yield* verdictForReview(waiting, view.text);
         if (verdict === null || verdict.availability !== "available") {
+          const incomplete = yield* decodeSequenceState({
+            phase: "qa_incomplete",
+            intake: waiting.intake,
+            acknowledgment: waiting.acknowledgment,
+            assignment: waiting.assignment,
+            completion: waiting.completion,
+            findings: [
+              {
+                defect: "The QA run did not return a verdict.",
+                evidence: "The reviewer reply was not a QA verdict.",
+                expectedBehavior: "Reply with only the QA verdict JSON.",
+              },
+            ],
+            artifactRevision: waiting.completion.artifactRevision,
+            attemptedVerdict: "rework",
+            reworkRevision: waiting.reworkRevision,
+            reworkLedger: waiting.reworkLedger,
+            run: waiting.run,
+            commands: waiting.commands,
+            qaLabel: QA_INCOMPLETE_LABEL,
+          }).pipe(
+            Effect.map((state) => ({ _tag: "Ok" as const, state })),
+            Effect.catch(() => Effect.succeed({ _tag: "No" as const })),
+          );
+          if (incomplete._tag === "No") {
+            return {
+              outcome: { ...outcome, changed: true },
+              qaRun: { ...qaRun, settled: "rejected" as const },
+              rejection: "The QA run did not return a verdict.",
+              touched: true,
+            };
+          }
           return {
-            outcome: { ...outcome, changed: true },
-            qaRun: { ...qaRun, settled: "rejected" as const },
-            rejection: "The QA run did not return a verdict.",
+            outcome: { ...outcome, state: incomplete.state, changed: true },
+            qaRun,
+            rejection: null,
             touched: true,
           };
         }
@@ -1660,7 +1738,7 @@ export const layer = Layer.unwrap(
             model: modelSlug(worker.model),
             instanceId: worker.instanceId,
             idempotencyKey: `qa-${waiting.acknowledgment.taskId}-${revision.sha}`,
-            promptSuffix: `Review this exact submitted revision: ${revision.sha}`,
+            promptSuffix: qaPromptSuffix(waiting, revision.sha),
           });
           if (opened._tag === "No") return keepQa(outcome, null);
           const qaRunId = opened.launched.runId;
