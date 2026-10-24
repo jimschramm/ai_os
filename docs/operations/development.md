@@ -35,7 +35,6 @@ That directory is T3 Code's live database.
 An install that already used the old `~/.t3` default does not move itself.
 Copy that data into `~/.ai_os-home`, or set `T3CODE_HOME` to keep the old directory.
 There is no automatic migration.
-On Jim's machine the ai_os data, including the Drive token, is already in `~/.ai_os-home`.
 See [test data](../../AGENTS.md#test-data) for copying a consistent database snapshot.
 
 Read ports from the `[dev-runner]` output. Worktrees derive stable preferences from their paths,
