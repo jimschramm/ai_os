@@ -11,6 +11,7 @@ import { describe, expect, it } from "vite-plus/test";
 import {
   advisoryEnvironment,
   advisoryUsage,
+  antigravitySupports,
   listAntigravityModels,
   parseCliRun,
   parseModelList,
@@ -172,8 +173,21 @@ describe("antigravity model rules", () => {
     expect(parseModelList("usage: agy models\n")).toEqual([]);
   });
 
-  it("records token counts and leaves subscription quota unknown", () => {
-    const reported = advisoryUsage({
+  it("declares advisory capabilities and does not resume or heartbeat", () => {
+    expect(antigravitySupports("start")).toBe(true);
+    expect(antigravitySupports("cancel")).toBe(true);
+    expect(antigravitySupports("report_status")).toBe(true);
+    expect(antigravitySupports("return_artifacts")).toBe(true);
+    expect(antigravitySupports("report_usage")).toBe(true);
+    expect(antigravitySupports("receive_context")).toBe(true);
+    expect(antigravitySupports("idempotency")).toBe(true);
+    expect(antigravitySupports("resume")).toBe(false);
+    expect(antigravitySupports("heartbeat")).toBe(false);
+    expect(antigravitySupports("retrieve_assignments")).toBe(false);
+  });
+
+  it("records token counts for the model that ran and does not substitute the request", () => {
+    const unreported = advisoryUsage({
       projectId: "usba",
       taskId: "task-demo",
       attemptId: "attempt-1",
@@ -183,7 +197,19 @@ describe("antigravity model rules", () => {
       inputTokens: 12,
       outputTokens: 4,
     });
+    expect(unreported).toEqual([]);
+    const reported = advisoryUsage({
+      projectId: "usba",
+      taskId: "task-demo",
+      attemptId: "attempt-1",
+      agentId: "antigravity",
+      requestedModel: "gemini-4-argon-high",
+      actualModel: "gpt-6-astra",
+      inputTokens: 12,
+      outputTokens: 4,
+    });
     expect(reported.map((entry) => entry.kind)).toEqual(["reported_tokens", "unknown"]);
+    expect(reported[0]).toMatchObject({ attribution: { model: "gpt-6-astra" } });
     const missing = advisoryUsage({
       projectId: "usba",
       taskId: "task-demo",

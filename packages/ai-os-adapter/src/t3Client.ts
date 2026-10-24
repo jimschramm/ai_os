@@ -122,6 +122,10 @@ export interface T3ThreadView {
   readonly revision: string | null;
   readonly inputTokens?: number;
   readonly outputTokens?: number;
+  /** Model the orchestration run was asked to use. Null when the run has not reported one. */
+  readonly requestedModel?: string | null;
+  /** Model the provider session reported. Null is not the request and not the assignment. */
+  readonly actualModel?: string | null;
 }
 
 export interface T3ContinueRequest {
@@ -261,12 +265,16 @@ export const threadViewFromProjection = (
   );
   const revision = projection.checkpoints.at(-1)?.ref ?? null;
   const usage = projection.providerTurns.at(-1)?.tokenUsage;
+  const requested = run?.modelSelection.model.trim() ?? "";
+  const reported = projection.providerSessions.at(-1)?.model?.trim() ?? "";
   return {
     threadId,
     runId: run?.id ?? null,
     status,
     text: assistant?.text ?? null,
     revision,
+    requestedModel: requested.length > 0 ? requested : null,
+    actualModel: reported.length > 0 ? reported : null,
     ...(usage?.inputTokens === undefined ? {} : { inputTokens: usage.inputTokens }),
     ...(usage?.outputTokens === undefined ? {} : { outputTokens: usage.outputTokens }),
   };

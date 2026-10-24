@@ -48,6 +48,7 @@ const idleReviews: AiOsAntigravity.AntigravityReviews["Service"] = {
   start: () => Effect.die("Antigravity review was not expected."),
   watch: () => Effect.succeed(null),
   cancel: () => Effect.succeed("already_stopped"),
+  recover: () => Effect.succeed({ status: "stopped" as const }),
 };
 
 const allowRuns: AiOsBoard.BoardRuns["Service"] = {
@@ -1171,7 +1172,7 @@ describe("ai-os board route", () => {
         });
       },
     });
-    for (const [index, event] of happyPathEvents.slice(0, 7).entries()) {
+    for (const [index, event] of happyPathEvents.slice(0, 9).entries()) {
       const posted = await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
         taskId: "task-usba-page",
         title: "Tournament page",
@@ -1365,13 +1366,25 @@ describe("ai-os board route", () => {
     expect(after?.state.phase).toBe("assigned");
   });
 
-  it("returns an advisory review to Ready after a restart and starts it again", async () => {
+  it("keeps an interrupted advisory review blocked until the old process stops", async () => {
     let starts = 0;
+    let processRunning = true;
+    let worktree = true;
+    let stopSignals = 0;
     const reviews = {
       ...idleReviews,
       start: () => {
         starts += 1;
         return Effect.succeed({ status: "running" as const, runId: `agy-run-${starts}` });
+      },
+      watch: () => Effect.succeed(null),
+      recover: () => {
+        if (processRunning) {
+          stopSignals += 1;
+          return Effect.succeed({ status: "still_running" as const });
+        }
+        worktree = false;
+        return Effect.succeed({ status: "stopped" as const });
       },
     };
     const first = handlerFor(undefined, allowRuns, reviews);
@@ -1431,8 +1444,25 @@ describe("ai-os board route", () => {
     expect(starts).toBe(1);
     const second = handlerFor(first.stateDir, allowRuns, reviews);
     const recovered = (await readCards(second.handler)).find((item) => item.taskId === "task-agy");
-    expect(recovered?.state.phase).toBe("assigned");
+    expect(recovered?.state.phase).toBe("recovery_pending");
     expect(recovered?.threadId).toBeNull();
+    expect(stopSignals).toBe(0);
+    expect(worktree).toBe(true);
+    const blocked = await postJson(second.handler, ADAPTER_BOARD_MOVE_PATH, {
+      taskId: "task-agy",
+      column: "Running",
+      idempotencyKey: "run-agy-blocked",
+      model: "gemini-4-argon-high",
+    });
+    expect(blocked.status).toBe(409);
+    expect(stopSignals).toBe(1);
+    expect(worktree).toBe(true);
+    expect(starts).toBe(1);
+    const stillBlocked = (await readCards(second.handler)).find(
+      (item) => item.taskId === "task-agy",
+    );
+    expect(stillBlocked?.state.phase).toBe("recovery_pending");
+    processRunning = false;
     const again = await postJson(second.handler, ADAPTER_BOARD_MOVE_PATH, {
       taskId: "task-agy",
       column: "Running",
@@ -1441,7 +1471,35 @@ describe("ai-os board route", () => {
     });
     expect(again.status).toBe(200);
     expect(starts).toBe(2);
+    expect(worktree).toBe(false);
     const restarted = (await readCards(second.handler)).find((item) => item.taskId === "task-agy");
     expect(restarted?.state.phase).toBe("executing");
+    expect(restarted?.state.phase === "executing" ? restarted.state.assignment.attemptId : "").toBe(
+      "retry-task-agy-2",
+    );
+    const late = await postJson(second.handler, ADAPTER_BOARD_EVENT_PATH, {
+      taskId: "task-agy",
+      idempotencyKey: "late-agy",
+      event: {
+        type: "report_progress",
+        report: {
+          version: "v1",
+          taskId: "task-agy",
+          attemptId: "attempt-agy",
+          generation: restarted?.state.phase === "executing" ? restarted.state.run.generation : 1,
+          leaseId: restarted?.state.phase === "executing" ? restarted.state.run.leaseId : "lease-1",
+          status: "working",
+          blockers: [],
+          partialArtifacts: [],
+        },
+      },
+    });
+    expect(late.status).toBe(409);
+    const after = (await readCards(second.handler)).find((item) => item.taskId === "task-agy");
+    expect(after?.state.phase).toBe("executing");
+    expect(after?.state.phase === "executing" ? after.state.assignment.attemptId : "").toBe(
+      "retry-task-agy-2",
+    );
+    expect(after?.state.phase === "executing" ? after.state.run.progress : "touched").toBeNull();
   });
 });

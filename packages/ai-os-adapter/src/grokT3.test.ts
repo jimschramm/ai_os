@@ -2,11 +2,13 @@ import * as NodeHttpServer from "@effect/platform-node/NodeHttpServer";
 import { assert, it } from "@effect/vitest";
 import {
   assignmentExample,
+  applySequence,
   decodeAssignmentV1,
   decodeCompletionSubmissionV1,
   decodeIntake,
   decodeSequenceState,
   executionLaunchKey,
+  happyPathEvents,
   intakeV2Example,
   leaseIdFor,
   type KanbanMoveLedger,
@@ -67,8 +69,10 @@ import {
   GrokT3Error,
   decodeAdapterBoard,
   memorySessionStore,
+  observationEvents,
   readAdapterBoard,
   requireCapability,
+  threadViewFromProjection,
   wsT3LocalClient,
   type WorkerAdapter,
 } from "./index.ts";
@@ -706,11 +710,12 @@ it.effect("launches one T3 thread and reads the completion back", () =>
       assert.strictEqual(working.state.phase, "executing");
       if (working.state.phase !== "executing") return;
       assert.strictEqual(working.state.run.progress?.status, "working");
-      assert.strictEqual(working.state.run.usage.length, 1);
-      assert.strictEqual(working.state.run.usage[0]?.kind, "reported_tokens");
+      assert.strictEqual(working.state.run.usage.length, 0);
+      assert.strictEqual(working.state.run.implementerRuntime?.requested?.model, TEST_MODEL);
+      assert.strictEqual(working.state.run.implementerRuntime?.actual, null);
       const again = yield* adapter.observe(recorded.taskId);
       if (again.state.phase !== "executing") return;
-      assert.strictEqual(again.state.run.usage.length, 1);
+      assert.strictEqual(again.state.run.usage.length, 0);
 
       const stale = yield* adapter
         .reportProgress(recorded.taskId, {
@@ -1206,4 +1211,69 @@ it.effect("publishes board cards on the T3 origin", () =>
       assert.strictEqual(readAdapterBoard().length, 2);
     }),
   ),
+);
+
+it.effect("attributes tokens to the provider session model and not the request", () =>
+  Effect.gen(function* () {
+    const executing = yield* applySequence(happyPathEvents.slice(0, 4));
+    const view = {
+      threadId: "thread-1",
+      runId: "run-1",
+      status: "running" as const,
+      text: null,
+      revision: null,
+      inputTokens: 3,
+      outputTokens: 1,
+      requestedModel: "gpt-5.4",
+      actualModel: "gpt-6-sol",
+    };
+    const planned = observationEvents({
+      taskId: "task-usba-page",
+      threadId: "thread-1",
+      state: executing,
+      view,
+      allowLapse: false,
+      workerId: "codex-t3",
+    });
+    const usage = planned.find((item) => item.event.type === "report_usage");
+    if (usage === undefined || usage.event.type !== "report_usage") {
+      return yield* Effect.die("Usage must name the model the runtime reported.");
+    }
+    if (usage.event.measurement.kind !== "reported_tokens") {
+      return yield* Effect.die("The measurement must be reported tokens.");
+    }
+    assert.strictEqual(usage.event.measurement.attribution.model.model, "gpt-6-sol");
+    const unreported = observationEvents({
+      taskId: "task-usba-page",
+      threadId: "thread-1",
+      state: executing,
+      view: { ...view, actualModel: null },
+      allowLapse: false,
+      workerId: "codex-t3",
+    });
+    assert.strictEqual(
+      unreported.some((item) => item.event.type === "report_usage"),
+      false,
+    );
+    const reported = threadViewFromProjection("thread-1", {
+      thread: { modelSelection: { model: "gpt-6-astra" } },
+      runs: [{ id: "run-1", status: "running", modelSelection: { model: "gpt-5.4" } }],
+      messages: [],
+      checkpoints: [],
+      providerTurns: [],
+      providerSessions: [{ model: null }, { model: "gpt-6-sol" }],
+    } as unknown as OrchestrationV2ThreadProjection);
+    assert.strictEqual(reported.requestedModel, "gpt-5.4");
+    assert.strictEqual(reported.actualModel, "gpt-6-sol");
+    const unknown = threadViewFromProjection("thread-1", {
+      thread: { modelSelection: { model: "gpt-6-astra" } },
+      runs: [{ id: "run-1", status: "running", modelSelection: { model: "gpt-5.4" } }],
+      messages: [],
+      checkpoints: [],
+      providerTurns: [],
+      providerSessions: [{ model: "gpt-6-sol" }, { model: null }],
+    } as unknown as OrchestrationV2ThreadProjection);
+    assert.strictEqual(unknown.requestedModel, "gpt-5.4");
+    assert.strictEqual(unknown.actualModel, null);
+  }),
 );

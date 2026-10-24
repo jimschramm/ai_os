@@ -54,7 +54,7 @@ An open attempt has a generation and a lease id minted for that generation (`lea
 | `verdict: rework`           | Moves to `rework`. Findings are required. The reviewed revision is recorded.                                                           |
 | `verdict: accept`           | Moves to `accepted`. `acceptedRevision` must equal `artifactRevision`, and that revision must be the one in the completion submission. |
 
-QA's model name must differ from the assignment's implementer model name. A model is `{ provider?, model }`. Provider is attribution (`openai/gpt-5.4` and `azure/gpt-5.4` are the same model, and so is a bare `gpt-5.4`). The schema check and the transition both compare those canonical model names. The transition rejects a QA model name equal to the assigned implementer (`qa_same_model`) and a payload that names some other implementer model (`implementer_mismatch`). Acceptance compares canonical revisions, so a full git id matches regardless of case. An unavailable verdict cannot also carry an acceptance. There is no event that skips QA.
+QA compares the implementer's actual base model with the reviewer's actual base model. Both come from runtime metadata, not from the assignment and not from a usage measurement. If either actual is unknown, the verdict is `qa_model_unknown` and the work cannot be accepted. Nothing is substituted. A model is `{ provider?, model }`. Provider is attribution (`openai/gpt-5.4` and `azure/gpt-5.4` are the same model, and so is a bare `gpt-5.4`). The schema check compares the two model names on the verdict. The transition compares the runtime actuals. It rejects the same base (`qa_same_model`) and a payload that names a different model than the runtime (`implementer_mismatch`). Acceptance compares canonical revisions, so a full git id matches regardless of case. An unavailable verdict cannot also carry an acceptance. There is no event that skips QA.
 
 ## Progress
 
@@ -76,16 +76,16 @@ Node kinds and relationship types are the ones in [the memory schema](../memory-
 
 Control commands carry an idempotency key. That key is not a completion claim. The key is bound to a canonical fingerprint of the whole command payload. The same key and the same payload replay the current state. The same key and any other payload, including a different owner or blocker, is `idempotency_conflict`.
 
-| Command              | From                                     | Result                                                                              |
-| -------------------- | ---------------------------------------- | ----------------------------------------------------------------------------------- |
-| `cancel`             | assigned, executing, awaiting_qa, rework | `cancelled`. Off the board.                                                         |
-| `continue`           | cancelled                                | `assigned` (Ready). This is the only way back from cancelled.                       |
-| `operator_fail`      | executing                                | `failed`, with an actor and a blocker. Off the board. Not fenced by the lease.      |
-| `retry`              | failed                                   | `executing` at the next generation, until `retryCount` reaches `retryLimit` (3).    |
-| `transfer_ownership` | assigned, executing                      | The worker changes. An executing transfer also advances the generation.             |
-| `resolve_recovery`   | recovery_pending                         | `continue` returns to Ready, `cancel` leaves the board, `fail` records the blocker. |
+| Command              | From                                     | Result                                                                                                                                                                             |
+| -------------------- | ---------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `cancel`             | assigned, executing, awaiting_qa, rework | `cancelled`. Off the board.                                                                                                                                                        |
+| `continue`           | cancelled                                | `assigned` (Ready). This is the only way back from cancelled.                                                                                                                      |
+| `operator_fail`      | executing                                | `failed`, with an actor and a blocker. Off the board. Not fenced by the lease.                                                                                                     |
+| `retry`              | failed                                   | `executing` at the next generation, until `retryCount` reaches `retryLimit` (3).                                                                                                   |
+| `transfer_ownership` | assigned, executing                      | The worker changes. An executing transfer also advances the generation.                                                                                                            |
+| `resolve_recovery`   | recovery_pending                         | `continue` returns to Ready, `cancel` leaves the board, `fail` records the blocker. An advisory continue supplies `nextAttemptId`. A non-advisory continue keeps the open attempt. |
 
-`recovery_pending` accepts no other event. An expired lease or a lapsed heartbeat does not become Ready on its own. A retry past the limit is `retry_limit_reached` and stays `failed`.
+`recovery_pending` accepts no other event. An expired lease, a lapsed heartbeat, or a lost advisory process does not become Ready on its own. Advisory work still uses a process and a worktree, so a retry waits until that process is confirmed stopped, removes the worktree, and starts a new attempt. A late result from the old attempt is `attempt_mismatch`. A retry past the limit is `retry_limit_reached` and stays `failed`.
 
 ## Result delivery
 
@@ -101,8 +101,9 @@ Invalid payloads fail schema decode. These transition errors are `ContractTransi
 | `illegal_transition`                  | The event is not legal for the phase.                                                                              |
 | `task_mismatch`                       | The payload task or usage project is not the acknowledged work.                                                    |
 | `attempt_mismatch`                    | The payload attempt is not the open assignment.                                                                    |
-| `implementer_mismatch`                | QA names a different implementer than the assignment.                                                              |
-| `qa_same_model`                       | QA uses the implementer's model.                                                                                   |
+| `implementer_mismatch`                | QA names a different implementer or reviewer than the runtime.                                                     |
+| `qa_same_model`                       | The reviewer's actual base model is the implementer's actual base model.                                           |
+| `qa_model_unknown`                    | The implementer's actual model or the reviewer's actual model was not reported by the runtime.                     |
 | `revision_mismatch`                   | Rework submits the same artifact revision again.                                                                   |
 | `acceptance_revision_mismatch`        | QA or acceptance names a revision other than the submitted one, or the revision already sent back for rework.      |
 | `recovery_pending_not_ready`          | Any event other than `resolve_recovery` while recovery is pending.                                                 |

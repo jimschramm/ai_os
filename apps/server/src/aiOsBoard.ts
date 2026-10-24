@@ -12,6 +12,7 @@ import {
   makeAdapterBoardHub,
 } from "@t3tools/ai-os-adapter/board-hub";
 import {
+  antigravitySupports,
   launchCommandId,
   observationEvents,
   renderPrompt,
@@ -647,7 +648,6 @@ export const layer = Layer.unwrap(
           state: executing,
           view,
           allowLapse: view.status === "interrupted",
-          model: executing.assignment.implementerModel.model,
           workerId: executing.assignment.workerId,
         });
         let state: BoardSequence = executing;
@@ -706,55 +706,41 @@ export const layer = Layer.unwrap(
             const fresh = cardsNow().find((item) => item.taskId === card.taskId);
             if (fresh === undefined || fresh.state.phase !== "executing") return;
             if (declaredTaskType(fresh.state.assignment) !== "advisory") return;
+            if (!antigravitySupports("report_status")) return;
             const watched = yield* reviews.watch(fresh.taskId);
             const decoded = yield* decodeState(fresh.state);
             if (decoded._tag === "Bad" || decoded.state.phase !== "executing") return;
             // Bind before the nested generator. A closure does not keep the phase narrowing.
             const executing = decoded.state;
+            if (
+              watched !== null &&
+              watched.generation !== undefined &&
+              watched.generation !== executing.run.generation
+            ) {
+              return;
+            }
             const outcome =
               watched === null
-                ? yield* Effect.gen(function* () {
-                    const generation = executing.run.generation;
-                    const attemptId = executing.assignment.attemptId;
-                    const canceled = yield* applyBoardWorkflowEvent(
-                      executing,
-                      {
-                        type: "cancel",
-                        command: {
-                          command: "cancel",
-                          taskId: fresh.taskId,
-                          attemptId,
-                          idempotencyKey: `agy-restart-c-${fresh.taskId}-${generation}`,
-                        },
+                ? yield* applyBoardWorkflowEvent(
+                    executing,
+                    {
+                      type: "lease_expired",
+                      lease: {
+                        taskId: fresh.taskId,
+                        attemptId: executing.assignment.attemptId,
+                        generation: executing.run.generation,
+                        leaseId: executing.run.leaseId,
                       },
-                      `agy-restart-c-${fresh.taskId}-${generation}`,
-                      fresh.taskId,
-                      ledger,
-                    );
-                    if (canceled._tag !== "Applied" || canceled.state.phase !== "cancelled") {
-                      return canceled;
-                    }
-                    return yield* applyBoardWorkflowEvent(
-                      canceled.state,
-                      {
-                        type: "continue",
-                        command: {
-                          command: "continue",
-                          taskId: fresh.taskId,
-                          attemptId,
-                          idempotencyKey: `agy-restart-k-${fresh.taskId}-${generation}`,
-                        },
-                      },
-                      `agy-restart-k-${fresh.taskId}-${generation}`,
-                      fresh.taskId,
-                      canceled.ledger,
-                    );
-                  })
+                    },
+                    `agy-lease-${fresh.taskId}-${executing.run.generation}`,
+                    fresh.taskId,
+                    ledger,
+                  )
                 : watched.status === "running"
                   ? null
-                  : yield* settleAdvisory(decoded.state, ledger, watched.execution, {
+                  : yield* settleAdvisory(executing, ledger, watched.execution, {
                       taskId: fresh.taskId,
-                      workerId: decoded.state.assignment.workerId,
+                      workerId: executing.assignment.workerId,
                     });
             if (outcome === null || outcome._tag !== "Applied" || !outcome.changed) return;
             yield* persistApplied(outcome, fresh, {
@@ -804,6 +790,14 @@ export const layer = Layer.unwrap(
                     "assignment" in decoded.state &&
                     declaredTaskType(decoded.state.assignment) === "advisory"
                   ) {
+                    if (!antigravitySupports("cancel")) {
+                      return {
+                        _tag: "Rejected" as const,
+                        detail: "Antigravity does not implement cancel.",
+                        state: decoded.state,
+                        ledger,
+                      };
+                    }
                     const stopped = yield* asRun(reviews.cancel(taskId));
                     if (stopped._tag === "No") {
                       return {
@@ -874,6 +868,13 @@ export const layer = Layer.unwrap(
                       );
                     }
                     if (declaredTaskType(queued.assignment) === "advisory") {
+                      if (!antigravitySupports("start")) {
+                        return rejectedMove(
+                          "Antigravity does not implement start.",
+                          queued,
+                          ledger,
+                        );
+                      }
                       const typed = stringField(body, "model")?.trim() ?? "";
                       const requested =
                         typed.length > 0
@@ -901,8 +902,9 @@ export const layer = Layer.unwrap(
                       if (started._tag !== "Applied" || started.state.phase !== "executing") {
                         return started;
                       }
-                      const watched =
-                        opened.status === "settled"
+                      const watched = !antigravitySupports("report_status")
+                        ? null
+                        : opened.status === "settled"
                           ? { status: "settled" as const, execution: opened.execution }
                           : yield* reviews.watch(taskId);
                       if (watched === null || watched.status === "running") {
@@ -989,6 +991,82 @@ export const layer = Layer.unwrap(
                           waiting,
                           ledger,
                         );
+                      }
+                      if (declaredTaskType(waiting.assignment) === "advisory") {
+                        if (!antigravitySupports("start")) {
+                          return rejectedMove(
+                            "Antigravity does not implement start.",
+                            waiting,
+                            ledger,
+                          );
+                        }
+                        const recovered = yield* reviews.recover(taskId);
+                        if (recovered.status === "still_running") {
+                          return rejectedMove(
+                            "The earlier advisory review is still running. It stays blocked until that process is confirmed stopped.",
+                            waiting,
+                            ledger,
+                          );
+                        }
+                        const generation = waiting.run.generation;
+                        const nextAttemptId = `retry-${taskId}-${generation + 1}`.slice(0, 128);
+                        const resolved = yield* applyBoardWorkflowEvent(
+                          waiting,
+                          {
+                            type: "resolve_recovery",
+                            command: {
+                              command: "resolve_recovery",
+                              outcome: "continue",
+                              idempotencyKey: `agy-recover-${taskId}-${generation}`,
+                              taskId,
+                              attemptId: waiting.assignment.attemptId,
+                              nextAttemptId,
+                            },
+                          },
+                          `agy-recover-${taskId}-${generation}`,
+                          taskId,
+                          ledger,
+                        );
+                        if (resolved._tag !== "Applied" || resolved.state.phase !== "assigned") {
+                          return resolved;
+                        }
+                        const queued = resolved.state;
+                        const projectId = projectIdOf(queued);
+                        if (projectId === null) {
+                          return rejectedMove(
+                            "This card has no project, so the review cannot be started.",
+                            waiting,
+                            ledger,
+                          );
+                        }
+                        const typed = stringField(body, "model")?.trim() ?? "";
+                        const requested =
+                          typed.length > 0
+                            ? typed
+                            : (queued.assignment.advisoryModel?.model ?? undefined);
+                        const opened = yield* reviews.start({
+                          projectId,
+                          taskId,
+                          generation: queued.nextGeneration,
+                          intake: queued.intake,
+                          context: queued.assignment.contextPackage,
+                          requestedModel: requested,
+                        });
+                        if (opened.status === "unavailable") {
+                          return rejectedMove(opened.detail, waiting, ledger);
+                        }
+                        const started = yield* applyBoardWorkflowEvent(
+                          queued,
+                          { type: "start_execution" },
+                          `agy-start-${taskId}-${queued.nextGeneration}`,
+                          taskId,
+                          resolved.ledger,
+                        );
+                        if (started._tag !== "Applied" || started.state.phase !== "executing") {
+                          return started;
+                        }
+                        launchedRun = opened.runId;
+                        return started;
                       }
                       const threadId = card.threadId;
                       const runId = card.runId ?? null;
@@ -1139,6 +1217,12 @@ export const layer = Layer.unwrap(
               "assignment" in stored.state &&
               declaredTaskType(stored.state.assignment) === "advisory"
             ) {
+              if (!antigravitySupports("cancel")) {
+                return json(409, {
+                  _tag: "Rejected",
+                  detail: "Antigravity does not implement cancel.",
+                });
+              }
               yield* reviews.cancel(taskId);
             } else {
               if (threadId === null || runId === null) {

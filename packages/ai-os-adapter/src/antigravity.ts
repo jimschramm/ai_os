@@ -15,6 +15,21 @@ import {
 } from "@t3tools/ai-os-contracts";
 
 import { renderPrompt as renderTaskPrompt } from "./grokT3.ts";
+import type { WorkerCapability } from "./worker.ts";
+
+/** What the advisory CLI worker implements. It does not resume or heartbeat. */
+export const ANTIGRAVITY_CAPABILITIES: ReadonlySet<WorkerCapability> = new Set([
+  "start",
+  "cancel",
+  "report_status",
+  "return_artifacts",
+  "report_usage",
+  "receive_context",
+  "idempotency",
+]);
+
+export const antigravitySupports = (capability: WorkerCapability): boolean =>
+  ANTIGRAVITY_CAPABILITIES.has(capability);
 
 export interface AntigravityModel {
   readonly slug: string;
@@ -66,6 +81,7 @@ export interface SpawnedCli {
   readonly stderr: AsyncIterable<string>;
   readonly interrupt: () => void;
   readonly exited: Promise<number | null>;
+  readonly pid?: number | null;
 }
 
 export interface CliSpawner {
@@ -430,6 +446,7 @@ export const nodeCliSpawner: CliSpawner = {
       stderr: child.stderr === null ? emptyLines() : linesFrom(child.stderr),
       interrupt,
       exited,
+      pid: child.pid ?? null,
     };
   },
 };
@@ -571,7 +588,9 @@ export const advisoryUsage = (input: {
   readonly inputTokens: number | null;
   readonly outputTokens: number | null;
 }): readonly Record<string, unknown>[] => {
-  const model = input.actualModel ?? input.requestedModel;
+  // Usage names the model the runtime reported. A missing actual is not the request.
+  if (input.actualModel === null) return [];
+  const model = input.actualModel;
   const attribution = {
     projectId: input.projectId,
     taskId: input.taskId,
@@ -615,6 +634,7 @@ export const runAdvisoryReview = async (input: {
   readonly configuredModel: string | undefined;
   readonly timeLimit?: string;
   readonly signal?: AbortSignal;
+  readonly onSpawn?: (pid: number | null) => void;
   readonly command?: string;
   readonly spawner?: CliSpawner;
   readonly git?: GitRunner;
@@ -714,6 +734,7 @@ export const runAdvisoryReview = async (input: {
         cwd: source,
         env: advisoryEnvironment(parent, home, scratch),
       });
+      input.onSpawn?.(spawned.pid ?? null);
     } catch (cause) {
       const detail =
         cause instanceof Error ? cause.message : "The Antigravity CLI could not be started.";

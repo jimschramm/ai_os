@@ -23,6 +23,7 @@ import {
   ContractId,
   IsoDateTime,
   NonNegativeInt,
+  ModelRef,
   PositiveInt,
   canonicalGitSha,
   sameBaseModel,
@@ -91,6 +92,16 @@ export const SequenceEvent = Schema.Union([
     generation: PositiveInt,
     leaseId: ContractId,
   }),
+  Schema.Struct({
+    type: Schema.Literal("record_runtime_models"),
+    taskId: ContractId,
+    attemptId: ContractId,
+    generation: PositiveInt,
+    leaseId: ContractId,
+    role: Schema.Literals(["implementer", "reviewer"]),
+    requested: Schema.NullOr(ModelRef),
+    actual: Schema.NullOr(ModelRef),
+  }),
   Schema.Struct({ type: Schema.Literal("cancel"), command: CancelCommandV1 }),
   Schema.Struct({ type: Schema.Literal("continue"), command: ContinueCommandV1 }),
   Schema.Struct({ type: Schema.Literal("retry"), command: RetryCommandV1 }),
@@ -141,18 +152,48 @@ const payloadMatches = (
 };
 
 const independentQa = (
-  implementer: AssignmentV1["implementerModel"],
-  qa: {
-    readonly qaModel: AssignmentV1["implementerModel"];
-    readonly implementerModel: AssignmentV1["implementerModel"];
+  run: {
+    readonly implementerRuntime?: { readonly actual: ModelRef | null } | undefined;
+    readonly reviewerRuntime?: { readonly actual: ModelRef | null } | undefined;
   },
-): true | string => {
-  if (sameBaseModel(qa.qaModel, implementer)) {
-    return "QA must use a different base model than the implementer.";
+  qa: {
+    readonly qaModel: ModelRef | string;
+    readonly implementerModel: ModelRef | string;
+  },
+):
+  | true
+  | {
+      readonly reason: "qa_model_unknown" | "qa_same_model" | "implementer_mismatch";
+      readonly detail: string;
+    } => {
+  const implementer = run.implementerRuntime?.actual ?? null;
+  const reviewer = run.reviewerRuntime?.actual ?? null;
+  if (implementer === null || reviewer === null) {
+    return {
+      reason: "qa_model_unknown",
+      detail:
+        "Independent QA needs the implementer's actual model and the reviewer's actual model from the runtime.",
+    };
   }
-  return sameModelName(qa.implementerModel, implementer)
-    ? true
-    : "The QA payload names a different implementer than the assignment.";
+  if (sameBaseModel(reviewer, implementer)) {
+    return {
+      reason: "qa_same_model",
+      detail: "QA must use a different base model than the implementer that ran.",
+    };
+  }
+  if (!sameModelName(qa.implementerModel, implementer)) {
+    return {
+      reason: "implementer_mismatch",
+      detail: "The QA payload names a different implementer than the runtime.",
+    };
+  }
+  if (!sameModelName(qa.qaModel, reviewer)) {
+    return {
+      reason: "implementer_mismatch",
+      detail: "The QA payload names a different reviewer than the runtime.",
+    };
+  }
+  return true;
 };
 
 const workerRecordMatchesRun = (
@@ -195,6 +236,12 @@ export const AcknowledgedState = Schema.Struct({
 }).check(Schema.makeFilter((state) => linked(state.acknowledgment)));
 export type AcknowledgedState = typeof AcknowledgedState.Type;
 
+export const RuntimeModelsV1 = Schema.Struct({
+  requested: Schema.NullOr(ModelRef),
+  actual: Schema.NullOr(ModelRef),
+});
+export type RuntimeModelsV1 = typeof RuntimeModelsV1.Type;
+
 export const RunV1 = Schema.Struct({
   generation: PositiveInt,
   leaseId: ContractId,
@@ -203,6 +250,9 @@ export const RunV1 = Schema.Struct({
   retryCount: NonNegativeInt,
   retryLimit: PositiveInt,
   usage: Schema.Array(UsageMeasurementV1),
+  // Recorded from provider runtime metadata. Absent until the runtime reports.
+  implementerRuntime: Schema.optionalKey(RuntimeModelsV1),
+  reviewerRuntime: Schema.optionalKey(RuntimeModelsV1),
   // Absent on runs recorded before advisory review existed.
   advisory: Schema.optionalKey(AdvisoryReviewV1),
 }).check(
@@ -323,9 +373,9 @@ export const ReworkState = Schema.Struct({
     if (qaMatch !== true) {
       return qaMatch;
     }
-    const models = independentQa(state.assignment.implementerModel, state.qa);
+    const models = independentQa(state.run, state.qa);
     if (models !== true) {
-      return models;
+      return models.detail;
     }
     if (!sameRevision(state.qa.artifactRevision, state.reworkRevision)) {
       return "Rework records the revision that was reviewed.";
@@ -356,9 +406,9 @@ export const AcceptedState = Schema.Struct({
     if (qaMatch !== true) {
       return qaMatch;
     }
-    const models = independentQa(state.assignment.implementerModel, state.qa);
+    const models = independentQa(state.run, state.qa);
     if (models !== true) {
-      return models;
+      return models.detail;
     }
     if (!sameRevision(state.qa.acceptedRevision, state.qa.artifactRevision)) {
       return "Acceptance is bound to the exact artifact revision.";
@@ -462,12 +512,13 @@ export const LEGAL_EVENTS = {
     "report_usage",
     "record_advisory",
     "deliver_review",
+    "record_runtime_models",
     "cancel",
     "fail",
     "operator_fail",
     "transfer_ownership",
   ],
-  awaiting_qa: ["qa", "cancel"],
+  awaiting_qa: ["qa", "cancel", "record_runtime_models"],
   rework: ["start_execution", "cancel"],
   accepted: ["start_execution", "deliver"],
   review_delivered: [],
@@ -524,6 +575,7 @@ const contractFor = (event: SequenceEvent): ContractName => {
       return "usage";
     case "record_advisory":
     case "deliver_review":
+    case "record_runtime_models":
       return "sequence";
     case "cancel":
     case "continue":
@@ -792,15 +844,9 @@ const applyQa = (
         commands: state.commands,
       };
     }
-    const implementer = state.assignment.implementerModel;
-    const independence = independentQa(implementer, qa);
-    if (independence !== true) {
-      return yield* reject(
-        state,
-        event,
-        sameBaseModel(qa.qaModel, implementer) ? "qa_same_model" : "implementer_mismatch",
-        independence,
-      );
+    const checked = independentQa(state.run, qa);
+    if (checked !== true) {
+      return yield* reject(state, event, checked.reason, checked.detail);
     }
     if (!sameRevision(qa.artifactRevision, state.completion.artifactRevision)) {
       return yield* reject(
@@ -1067,6 +1113,94 @@ const applyAdvisory = (
     };
   });
 
+const mergeRuntimeModel = (
+  current: ModelRef | null | undefined,
+  next: ModelRef | null,
+): ModelRef | null | "conflict" => {
+  const had = current ?? null;
+  if (next === null) return had;
+  if (had === null) return next;
+  return sameModelName(had, next) ? had : "conflict";
+};
+
+const mergedRuntime = (
+  current: RuntimeModelsV1 | undefined,
+  event: Extract<SequenceEvent, { type: "record_runtime_models" }>,
+): RuntimeModelsV1 | "conflict" => {
+  const requested = mergeRuntimeModel(current?.requested, event.requested);
+  const actual = mergeRuntimeModel(current?.actual, event.actual);
+  if (requested === "conflict" || actual === "conflict") return "conflict";
+  return { requested, actual };
+};
+
+const applyRuntimeModels = (
+  state: SequenceState,
+  event: Extract<SequenceEvent, { type: "record_runtime_models" }>,
+): Effect.Effect<SequenceState, ContractTransitionError> =>
+  Effect.gen(function* () {
+    if (event.role === "implementer") {
+      if (state.phase !== "executing") {
+        return yield* reject(
+          state,
+          event,
+          "illegal_transition",
+          `Cannot record_runtime_models for ${event.role} from ${state.phase}.`,
+        );
+      }
+      const executing = state;
+      yield* matchesWork(executing, event, event);
+      if (
+        event.generation !== executing.run.generation ||
+        event.leaseId !== executing.run.leaseId
+      ) {
+        return yield* reject(
+          executing,
+          event,
+          "stale_generation",
+          "The write names a stale generation or lease.",
+        );
+      }
+      const recorded = mergedRuntime(executing.run.implementerRuntime, event);
+      if (recorded === "conflict") {
+        return yield* reject(
+          executing,
+          event,
+          "illegal_transition",
+          "The runtime already reported a different model. Nothing was substituted.",
+        );
+      }
+      return { ...executing, run: { ...executing.run, implementerRuntime: recorded } };
+    }
+    if (state.phase !== "awaiting_qa") {
+      return yield* reject(
+        state,
+        event,
+        "illegal_transition",
+        `Cannot record_runtime_models for ${event.role} from ${state.phase}.`,
+      );
+    }
+    const awaiting = state;
+    yield* matchesWork(awaiting, event, event);
+    if (event.generation !== awaiting.run.generation || event.leaseId !== awaiting.run.leaseId) {
+      return yield* reject(
+        awaiting,
+        event,
+        "stale_generation",
+        "The write names a stale generation or lease.",
+      );
+    }
+    const recorded = mergedRuntime(awaiting.run.reviewerRuntime, event);
+    if (recorded === "conflict") {
+      return yield* reject(
+        awaiting,
+        event,
+        "illegal_transition",
+        "The runtime already reported a different model. Nothing was substituted.",
+      );
+    }
+    return { ...awaiting, run: { ...awaiting.run, reviewerRuntime: recorded } };
+  });
+
 const applyDeliverReview = (
   state: SequenceState,
   event: Extract<SequenceEvent, { type: "deliver_review" }>,
@@ -1313,11 +1447,32 @@ const applyResolveRecovery = (
     yield* matchesWork(state, event, event.command);
     const commands = yield* withCommand(state, event, event.command);
     if (event.command.outcome === "continue") {
+      const advisory = declaredTaskType(state.assignment) === "advisory";
+      if (advisory && event.command.nextAttemptId === undefined) {
+        return yield* reject(
+          state,
+          event,
+          "illegal_transition",
+          "An advisory retry needs a new attempt id so a late result from the old attempt is rejected.",
+        );
+      }
+      if (!advisory && event.command.nextAttemptId !== undefined) {
+        return yield* reject(
+          state,
+          event,
+          "illegal_transition",
+          "Only an advisory retry changes the attempt.",
+        );
+      }
+      const nextAttemptId = event.command.nextAttemptId;
       return {
         phase: "assigned" as const,
         intake: state.intake,
         acknowledgment: state.acknowledgment,
-        assignment: state.assignment,
+        assignment:
+          advisory && nextAttemptId !== undefined
+            ? { ...state.assignment, attemptId: nextAttemptId }
+            : state.assignment,
         reworkRevision: state.reworkRevision,
         heldRun: state.run,
         commands,
@@ -1472,6 +1627,8 @@ const transition = (
         return yield* applyAdvisory(state, event);
       case "deliver_review":
         return yield* applyDeliverReview(state, event);
+      case "record_runtime_models":
+        return yield* applyRuntimeModels(state, event);
       case "cancel":
         return yield* applyCancel(state, event);
       case "continue":
@@ -1547,6 +1704,7 @@ const contractNameOf = (value: unknown): ContractName => {
       return "usage";
     case "record_advisory":
     case "deliver_review":
+    case "record_runtime_models":
       return "sequence";
     case "cancel":
     case "continue":
