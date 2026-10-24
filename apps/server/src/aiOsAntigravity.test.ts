@@ -175,6 +175,51 @@ it.effect("does not signal a pid whose start identity changed", () =>
   }),
 );
 
+it.effect("leaves a live review running when its identity cannot be read", () =>
+  Effect.gen(function* () {
+    const signaled: number[] = [];
+    yield* useReviews(
+      {
+        pidAlive: () => true,
+        readIdentity: async () => null,
+        signal: (pid) => {
+          signaled.push(pid);
+        },
+      },
+      (reviews, dir) =>
+        Effect.gen(function* () {
+          const unread = writeMarker(dir, "task-unread", {
+            pid: 4242,
+            writtenAt: -1,
+            bootId: "boot-live",
+            startTicks: "50",
+          });
+          const root = NodePath.join(dir, "antigravity", "task-unread", "root");
+          const source = NodePath.join(root, "attempt", "source");
+          NodeFS.mkdirSync(source, { recursive: true });
+          expect(yield* reviews.recover("task-unread")).toEqual({ status: "still_running" });
+          expect(signaled).toEqual([]);
+          expect(NodeFS.existsSync(unread)).toBe(true);
+          expect(NodeFS.existsSync(source)).toBe(true);
+          yield* reviews.sweep("task-unread");
+          expect(signaled).toEqual([]);
+          expect(NodeFS.existsSync(unread)).toBe(true);
+          expect(NodeFS.existsSync(source)).toBe(true);
+
+          const unmarked = writeMarker(dir, "task-unmarked", {
+            pid: 4242,
+            writtenAt: -1,
+          });
+          expect(yield* reviews.recover("task-unmarked")).toEqual({ status: "still_running" });
+          expect(signaled).toEqual([]);
+          expect(NodeFS.existsSync(unmarked)).toBe(true);
+          yield* reviews.sweep("task-unmarked");
+          expect(NodeFS.existsSync(unmarked)).toBe(true);
+        }),
+    );
+  }),
+);
+
 it.effect("deletes the marker when the review finishes", () =>
   Effect.gen(function* () {
     const dir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "agy-finish-"));

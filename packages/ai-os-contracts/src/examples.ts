@@ -146,7 +146,7 @@ export const happyPathEvents: ReadonlyArray<SequenceEvent> = [
     actual: { model: "gpt-5.4" },
   },
   { type: "submit_completion", completion: completionExample },
-  { type: "qa", qa: qaWaitingExample },
+  { type: "qa", threadId: "thread-qa", qa: qaWaitingExample },
   {
     type: "record_runtime_models",
     taskId: "task-usba-page",
@@ -157,7 +157,7 @@ export const happyPathEvents: ReadonlyArray<SequenceEvent> = [
     requested: { model: "claude-sonnet-5" },
     actual: { model: "claude-sonnet-5" },
   },
-  { type: "qa", qa: qaReworkExample },
+  { type: "qa", threadId: "thread-qa", qa: qaReworkExample },
   { type: "start_execution" },
   {
     type: "record_runtime_models",
@@ -180,5 +180,5 @@ export const happyPathEvents: ReadonlyArray<SequenceEvent> = [
     requested: { model: "claude-sonnet-5" },
     actual: { model: "claude-sonnet-5" },
   },
-  { type: "qa", qa: qaAcceptExample },
+  { type: "qa", threadId: "thread-qa", qa: qaAcceptExample },
 ];

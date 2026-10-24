@@ -36,6 +36,7 @@ import { DeliveryAckV1, ResultDeliveryV1, ackFor, deliveryFingerprint } from "./
 import {
   ContractName,
   ContractTransitionError,
+  QA_INCOMPLETE_LABEL,
   RECOVERY_PENDING_LABEL,
   REVIEW_DELIVERED_LABEL,
   SequencePhase,
@@ -50,7 +51,7 @@ import {
   ProgressReportV1,
   WorkerFailV1,
 } from "./progress.ts";
-import { QaAcceptV1, QaReworkV1, QaUnavailableV1, QaVerdictV1 } from "./qa.ts";
+import { QaAcceptV1, QaFindingV1, QaReworkV1, QaUnavailableV1, QaVerdictV1 } from "./qa.ts";
 import { UsageMeasurementV1 } from "./usage.ts";
 
 export const KanbanColumn = Schema.Literals([
@@ -76,7 +77,20 @@ export const SequenceEvent = Schema.Union([
     type: Schema.Literal("submit_completion"),
     completion: CompletionSubmissionV1,
   }),
-  Schema.Struct({ type: Schema.Literal("qa"), qa: QaVerdictV1 }),
+  Schema.Struct({
+    type: Schema.Literal("qa"),
+    qa: QaVerdictV1,
+    threadId: Schema.optional(ContractId),
+    runId: Schema.optional(ContractId),
+  }).check(
+    Schema.makeFilter((event) =>
+      event.qa.availability !== "available" ||
+      event.threadId !== undefined ||
+      event.runId !== undefined
+        ? true
+        : "QA must name the submitting session's thread or run.",
+    ),
+  ),
   Schema.Struct({ type: Schema.Literal("report_progress"), report: ProgressReportV1 }),
   Schema.Struct({ type: Schema.Literal("heartbeat"), heartbeat: HeartbeatV1 }),
   Schema.Struct({ type: Schema.Literal("heartbeat_lapsed"), lapse: HeartbeatLapseV1 }),
@@ -194,6 +208,24 @@ const independentQa = (
     };
   }
   return true;
+};
+
+/** Legacy cards omit both runtime records. A stored verdict that has both is checked again. */
+const storedIndependence = (state: {
+  readonly run: {
+    readonly implementerRuntime?: { readonly actual: ModelRef | null } | undefined;
+    readonly reviewerRuntime?: { readonly actual: ModelRef | null } | undefined;
+  };
+  readonly qa: {
+    readonly qaModel: ModelRef | string;
+    readonly implementerModel: ModelRef | string;
+  };
+}): true | string => {
+  if (state.run.implementerRuntime === undefined || state.run.reviewerRuntime === undefined) {
+    return true;
+  }
+  const checked = independentQa(state.run, state.qa);
+  return checked === true ? true : checked.detail;
 };
 
 const workerRecordMatchesRun = (
@@ -353,6 +385,34 @@ export const AwaitingQaState = Schema.Struct({
 );
 export type AwaitingQaState = typeof AwaitingQaState.Type;
 
+export const QaIncompleteState = Schema.Struct({
+  phase: Schema.Literal("qa_incomplete"),
+  intake: Intake,
+  acknowledgment: IntakeAcknowledgmentV1,
+  assignment: AssignmentV1,
+  completion: CompletionSubmissionV1,
+  findings: Schema.Array(QaFindingV1),
+  artifactRevision: ArtifactRevisionV1,
+  attemptedVerdict: Schema.Literals(["rework", "accept"]),
+  reworkRevision: Schema.NullOr(ArtifactRevisionV1),
+  run: RunV1,
+  commands: Schema.Array(AppliedCommandV1),
+  qaLabel: Schema.Literal(QA_INCOMPLETE_LABEL),
+}).check(
+  Schema.makeFilter((state) => {
+    const match = payloadMatches(state.acknowledgment, state.assignment, state.completion);
+    if (match !== true) return match;
+    if (!sameRevision(state.artifactRevision, state.completion.artifactRevision)) {
+      return "QA is bound to the exact revision in the completion submission.";
+    }
+    if (state.attemptedVerdict === "rework" && state.findings.length === 0) {
+      return "Rework findings stay with the incomplete review.";
+    }
+    return workerRecordMatchesRun(state.run, state.completion);
+  }),
+);
+export type QaIncompleteState = typeof QaIncompleteState.Type;
+
 export const ReworkState = Schema.Struct({
   phase: Schema.Literal("rework"),
   intake: Intake,
@@ -373,8 +433,8 @@ export const ReworkState = Schema.Struct({
     if (qaMatch !== true) {
       return qaMatch;
     }
-    // Runtime models are checked when acceptance is applied. A stored rework
-    // card from before those fields existed stays readable.
+    const independence = storedIndependence(state);
+    if (independence !== true) return independence;
     if (!sameRevision(state.qa.artifactRevision, state.reworkRevision)) {
       return "Rework records the revision that was reviewed.";
     }
@@ -404,8 +464,8 @@ export const AcceptedState = Schema.Struct({
     if (qaMatch !== true) {
       return qaMatch;
     }
-    // Runtime models are checked when acceptance is applied. A stored accepted
-    // card from before those fields existed stays readable.
+    const independence = storedIndependence(state);
+    if (independence !== true) return independence;
     if (!sameRevision(state.qa.acceptedRevision, state.qa.artifactRevision)) {
       return "Acceptance is bound to the exact artifact revision.";
     }
@@ -485,6 +545,7 @@ export const SequenceState = Schema.Union([
   AssignedState,
   ExecutingState,
   AwaitingQaState,
+  QaIncompleteState,
   ReworkState,
   AcceptedState,
   ReviewDeliveredState,
@@ -515,6 +576,7 @@ export const LEGAL_EVENTS = {
     "transfer_ownership",
   ],
   awaiting_qa: ["qa", "cancel", "record_runtime_models"],
+  qa_incomplete: ["qa", "cancel", "record_runtime_models"],
   rework: ["start_execution", "cancel"],
   accepted: ["start_execution", "deliver"],
   review_delivered: [],
@@ -542,6 +604,7 @@ export const kanbanColumn = (phase: SequencePhase): KanbanColumn | null => {
     case "failed":
       return "Blocked";
     case "awaiting_qa":
+    case "qa_incomplete":
       return "Review";
     case "accepted":
     case "review_delivered":
@@ -799,7 +862,7 @@ const applyQa = (
   event: Extract<SequenceEvent, { type: "qa" }>,
 ): Effect.Effect<SequenceState, ContractTransitionError> =>
   Effect.gen(function* () {
-    if (state.phase !== "awaiting_qa") {
+    if (state.phase !== "awaiting_qa" && state.phase !== "qa_incomplete") {
       return yield* reject(state, event, "illegal_transition", `Cannot qa from ${state.phase}.`);
     }
     if (workerRecordMatchesRun(state.run, state.completion) !== true) {
@@ -856,6 +919,26 @@ const applyQa = (
         "The revision sent back for rework is not the final revision.",
       );
     }
+    const checked = independentQa(state.run, qa);
+    if (checked !== true && checked.reason === "qa_model_unknown") {
+      return {
+        phase: "qa_incomplete" as const,
+        intake: state.intake,
+        acknowledgment: state.acknowledgment,
+        assignment: state.assignment,
+        completion: state.completion,
+        findings: qa.findings,
+        artifactRevision: qa.artifactRevision,
+        attemptedVerdict: qa.verdict,
+        reworkRevision: state.reworkRevision,
+        run: state.run,
+        commands: state.commands,
+        qaLabel: QA_INCOMPLETE_LABEL,
+      };
+    }
+    if (checked !== true) {
+      return yield* reject(state, event, checked.reason, checked.detail);
+    }
     if (qa.verdict === "rework") {
       return {
         phase: "rework" as const,
@@ -868,12 +951,6 @@ const applyQa = (
         run: state.run,
         commands: state.commands,
       };
-    }
-    // Rework cannot approve the work, so an unknown or matching model does not
-    // block it. Acceptance is the only verdict that compares runtime actuals.
-    const checked = independentQa(state.run, qa);
-    if (checked !== true) {
-      return yield* reject(state, event, checked.reason, checked.detail);
     }
     return {
       phase: "accepted" as const,
@@ -1169,7 +1246,7 @@ const applyRuntimeModels = (
       }
       return { ...executing, run: { ...executing.run, implementerRuntime: recorded } };
     }
-    if (state.phase !== "awaiting_qa") {
+    if (state.phase !== "awaiting_qa" && state.phase !== "qa_incomplete") {
       return yield* reject(
         state,
         event,
@@ -1259,6 +1336,7 @@ const applyCancel = (
       state.phase !== "assigned" &&
       state.phase !== "executing" &&
       state.phase !== "awaiting_qa" &&
+      state.phase !== "qa_incomplete" &&
       state.phase !== "rework"
     ) {
       return yield* reject(
@@ -1653,6 +1731,7 @@ const PHASES = [
   "assigned",
   "executing",
   "awaiting_qa",
+  "qa_incomplete",
   "rework",
   "accepted",
   "review_delivered",

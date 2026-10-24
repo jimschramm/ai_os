@@ -32,6 +32,7 @@ import {
   requestKanbanMove,
   SequenceState,
   type ContextPackageSnapshotV1,
+  type SequenceEvent,
   type KanbanColumn,
   type KanbanMoveLedger,
   type KanbanMoveResult,
@@ -40,7 +41,6 @@ import {
   AuthOrchestrationOperateScope,
   AuthOrchestrationReadScope,
   CommandId,
-  DEFAULT_MODEL,
   MessageId,
   OrchestrationMessageContext,
   ProjectId,
@@ -51,6 +51,7 @@ import {
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
 import * as Data from "effect/Data";
+import * as Hex from "effect/encoding/Hex";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -111,12 +112,6 @@ export interface BoardLaunchResult {
   readonly runId: string | null;
   readonly disposition: BoardLaunchDisposition;
   readonly summary: string | null;
-  /**
-   * Provider session on the launch projection.
-   * Omit both when the caller did not read one. A null actual is not the request.
-   */
-  readonly requestedModel?: string | null;
-  readonly actualModel?: string | null;
 }
 
 /**
@@ -155,6 +150,14 @@ export class BoardRuns extends Context.Service<
       readonly text: string;
     }) => Effect.Effect<{ readonly runId: string | null }, BoardRunError>;
     readonly watchThread: (threadId: string) => Effect.Effect<T3ThreadView | null, BoardRunError>;
+    /**
+     * The submitting QA session. A null view is unverifiable: no actual is recorded,
+     * and the verdict cannot become rework or accept.
+     */
+    readonly readReviewerSession: (input: {
+      readonly threadId: string | null;
+      readonly runId: string | null;
+    }) => Effect.Effect<T3ThreadView | null, BoardRunError>;
     /** Production follows launched runs. Tests leave this off so a tick cannot race the assertion. */
     readonly followRuns: boolean;
   }
@@ -261,7 +264,6 @@ export const liveRuns = Layer.effect(
             const assistant = result.projection.messages.findLast(
               (message) => message.role === "assistant" && message.text.length > 0,
             );
-            const view = threadViewFromProjection(result.threadId, result.projection);
             const disposition: BoardLaunchDisposition =
               status === "completed" ? "completed" : status === "failed" ? "failed" : "active";
             return {
@@ -269,8 +271,6 @@ export const liveRuns = Layer.effect(
               runId: run?.id ?? null,
               disposition,
               summary: assistant?.text ?? null,
-              requestedModel: view.requestedModel ?? null,
-              actualModel: view.actualModel ?? null,
             };
           }),
           Effect.mapError((error) => runError(errorDetail(error, "The run did not launch."))),
@@ -299,7 +299,36 @@ export const liveRuns = Layer.effect(
         Effect.map((projection) => threadViewFromProjection(threadId, projection)),
         Effect.mapError((error) => runError(errorDetail(error, "The thread could not be read."))),
       );
-    return { interrupt, confirmLaunch, launch, continueRun, watchThread, followRuns: true };
+    const readReviewerSession: BoardRuns["Service"]["readReviewerSession"] = (input) =>
+      Effect.gen(function* () {
+        const namedThread =
+          input.threadId !== null && input.threadId.length > 0 ? input.threadId : null;
+        const namedRun = input.runId !== null && input.runId.length > 0 ? input.runId : null;
+        if (namedThread === null && namedRun === null) return null;
+        let resolved = namedThread;
+        if (resolved === null && namedRun !== null) {
+          const snapshot = yield* threads.getShellSnapshot();
+          const wanted = RunId.make(namedRun);
+          const shell = [...snapshot.threads, ...snapshot.archivedThreads].find(
+            (item) => item.latestRunId === wanted || item.activeRunId === wanted,
+          );
+          resolved = shell?.id ?? null;
+        }
+        if (resolved === null) return null;
+        const view = yield* watchThread(resolved);
+        if (view === null) return null;
+        if (namedRun !== null && view.runId !== namedRun) return null;
+        return view;
+      }).pipe(Effect.catch(() => Effect.succeed(null)));
+    return {
+      interrupt,
+      confirmLaunch,
+      launch,
+      continueRun,
+      watchThread,
+      readReviewerSession,
+      followRuns: true,
+    };
   }),
 );
 
@@ -634,7 +663,6 @@ export const layer = Layer.unwrap(
         );
         return "stored" as const;
       });
-    const reviewerThreads = new Map<string, { readonly threadId: string }>();
     const observeThread = (
       state: BoardSequence,
       taskId: string,
@@ -675,48 +703,6 @@ export const layer = Layer.unwrap(
         }
         return { state: next, book: nextBook, changed: nextChanged, runId: view.runId };
       });
-    const ensureReviewer = (
-      state: Extract<BoardSequence, { phase: "awaiting_qa" }>,
-      taskId: string,
-    ) =>
-      Effect.gen(function* () {
-        const key = `${taskId}:${state.run.generation}`;
-        const known = reviewerThreads.get(key);
-        if (known !== undefined) {
-          return {
-            threadId: known.threadId,
-            recordFromLaunch: false,
-            requestedModel: null as string | null,
-            actualModel: null as string | null,
-          };
-        }
-        const projectId = projectIdOf(state);
-        if (projectId === null) return null;
-        const launched = yield* runs
-          .launch({
-            idempotencyKey: `board-review-${taskId}-${state.assignment.attemptId}-${state.run.generation}`,
-            projectId,
-            title: `Review ${taskId}`,
-            prompt: [
-              "Independent QA. Review the submitted work against the requirements.",
-              "Do not change the code. Report defects, the evidence, and the expected behavior.",
-              renderPrompt(state.intake, state.assignment.contextPackage),
-            ].join("\n\n"),
-            model: DEFAULT_MODEL,
-            instanceId: state.assignment.instanceId ?? T3_LAUNCH_DEFAULTS.instanceId,
-            contextPackage: state.assignment.contextPackage,
-          })
-          .pipe(Effect.catchTags({ BoardRunError: () => Effect.succeed(null) }));
-        if (launched === null) return null;
-        reviewerThreads.set(key, { threadId: launched.threadId });
-        return {
-          threadId: launched.threadId,
-          recordFromLaunch:
-            launched.requestedModel !== undefined || launched.actualModel !== undefined,
-          requestedModel: launched.requestedModel ?? null,
-          actualModel: launched.actualModel ?? null,
-        };
-      });
     const followLaunched = (
       outcome: KanbanMoveResult,
       taskId: string,
@@ -724,68 +710,79 @@ export const layer = Layer.unwrap(
       runId: string | null,
     ) =>
       Effect.gen(function* () {
-        if (outcome._tag !== "Applied") return { outcome, runId };
-        let state = outcome.state;
-        let book = outcome.ledger;
-        let changed = outcome.changed;
-        let nextRun = runId;
-        if (state.phase === "executing" && threadId !== null) {
-          const viewed = yield* observeThread(state, taskId, threadId, book, changed);
-          state = viewed.state;
-          book = viewed.book;
-          changed = viewed.changed;
-          nextRun = viewed.runId ?? nextRun;
+        if (
+          outcome._tag !== "Applied" ||
+          outcome.state.phase !== "executing" ||
+          threadId === null
+        ) {
+          return { outcome, runId };
         }
-        if (state.phase === "awaiting_qa" && state.run.reviewerRuntime?.actual == null) {
-          const awaiting = state;
-          const reviewer = yield* ensureReviewer(awaiting, taskId);
-          if (reviewer !== null) {
-            // The launch projection already carries the provider session. Record it
-            // before a later read, and before any verdict, so a missing watch cannot
-            // drop Astra's actual model.
-            if (reviewer.recordFromLaunch) {
-              const planned = observationEvents({
-                taskId,
-                threadId: reviewer.threadId,
-                state: awaiting,
-                view: {
-                  threadId: reviewer.threadId,
-                  runId: null,
-                  status: "running",
-                  text: null,
-                  revision: null,
-                  requestedModel: reviewer.requestedModel,
-                  actualModel: reviewer.actualModel,
-                },
-                allowLapse: false,
-                workerId: awaiting.assignment.workerId,
-              });
-              for (const item of planned) {
-                const applied: KanbanMoveResult = yield* applyBoardWorkflowEvent(
-                  state,
-                  item.event,
-                  item.idempotencyKey,
-                  taskId,
-                  book,
-                );
-                if (applied._tag !== "Applied") break;
-                state = applied.state;
-                book = applied.ledger;
-                changed = changed || applied.changed;
-              }
-            }
-            if (state.phase === "awaiting_qa") {
-              const viewed = yield* observeThread(state, taskId, reviewer.threadId, book, changed);
-              state = viewed.state;
-              book = viewed.book;
-              changed = viewed.changed;
-            }
-          }
-        }
+        const viewed = yield* observeThread(
+          outcome.state,
+          taskId,
+          threadId,
+          outcome.ledger,
+          outcome.changed,
+        );
         return {
-          outcome: { _tag: "Applied" as const, state, ledger: book, changed },
-          runId: nextRun,
+          outcome: {
+            _tag: "Applied" as const,
+            state: viewed.state,
+            ledger: viewed.book,
+            changed: viewed.changed,
+          },
+          runId: viewed.runId ?? runId,
         };
+      });
+    const recordSubmittedReviewer = (
+      state: BoardSequence,
+      event: Extract<SequenceEvent, { type: "qa" }>,
+      taskId: string,
+      idempotencyKey: string,
+      book: KanbanMoveLedger,
+    ) =>
+      Effect.gen(function* () {
+        if (event.qa.availability !== "available") {
+          return { _tag: "Ready" as const, state, book };
+        }
+        if (state.phase !== "awaiting_qa" && state.phase !== "qa_incomplete") {
+          return { _tag: "Ready" as const, state, book };
+        }
+        const view = yield* runs
+          .readReviewerSession({
+            threadId: event.threadId ?? null,
+            runId: event.runId ?? null,
+          })
+          .pipe(Effect.catchTags({ BoardRunError: () => Effect.succeed(null) }));
+        const actual = view?.actualModel?.trim() ?? "";
+        if (view === null || actual.length === 0) {
+          return { _tag: "Ready" as const, state, book };
+        }
+        const requested = view.requestedModel?.trim() ?? "";
+        const digest = yield* crypto
+          .digest(
+            "SHA-256",
+            new TextEncoder().encode(`${taskId}\n${state.run.generation}\n${idempotencyKey}`),
+          )
+          .pipe(Effect.orDie);
+        const applied = yield* applyBoardWorkflowEvent(
+          state,
+          {
+            type: "record_runtime_models",
+            taskId: state.acknowledgment.taskId,
+            attemptId: state.assignment.attemptId,
+            generation: state.run.generation,
+            leaseId: state.run.leaseId,
+            role: "reviewer",
+            requested: requested.length > 0 ? { model: requested } : null,
+            actual: { model: actual },
+          },
+          `reviewer-${Hex.encode(digest)}`,
+          taskId,
+          book,
+        );
+        if (applied._tag !== "Applied") return { _tag: "Rejected" as const, outcome: applied };
+        return { _tag: "Ready" as const, state: applied.state, book: applied.ledger };
       });
     const settleAdvisory = (
       state: BoardSequence,
@@ -1358,15 +1355,28 @@ export const layer = Layer.unwrap(
               }
             }
           }
+          const prepared =
+            stored._tag === "Ok" && !replay && decoded.event.type === "qa"
+              ? yield* recordSubmittedReviewer(
+                  stored.state,
+                  decoded.event,
+                  taskId,
+                  idempotencyKey,
+                  ledger,
+                )
+              : null;
+          if (prepared !== null && prepared._tag === "Rejected") {
+            return json(409, publicMove(prepared.outcome));
+          }
           const outcome =
             stored._tag === "Missing"
               ? yield* openBoardTask(decoded.event, idempotencyKey, taskId, ledger)
               : yield* applyBoardWorkflowEvent(
-                  stored.state,
+                  prepared !== null && prepared._tag === "Ready" ? prepared.state : stored.state,
                   decoded.event,
                   idempotencyKey,
                   taskId,
-                  ledger,
+                  prepared !== null && prepared._tag === "Ready" ? prepared.book : ledger,
                 );
           if (outcome._tag !== "Applied") return json(409, publicMove(outcome));
           const saved = yield* persistApplied(outcome, card, {
@@ -1395,9 +1405,7 @@ export const layer = Layer.unwrap(
     );
     const followExecuting = Effect.gen(function* () {
       const open = cardsNow().filter(
-        (card) =>
-          card.threadId !== null &&
-          (card.state.phase === "executing" || card.state.phase === "awaiting_qa"),
+        (card) => card.threadId !== null && card.state.phase === "executing",
       );
       for (const card of open) {
         yield* writes.withPermits(1)(
@@ -1406,7 +1414,7 @@ export const layer = Layer.unwrap(
             if (
               fresh === undefined ||
               fresh.threadId === null ||
-              (fresh.state.phase !== "executing" && fresh.state.phase !== "awaiting_qa")
+              fresh.state.phase !== "executing"
             ) {
               return;
             }

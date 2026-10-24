@@ -645,20 +645,37 @@ export const makeAntigravityReviews = (deps: AntigravityDeps = {}) =>
             return { status: "stopped" as const };
           }
           const alive = pidAlive(marker.pid);
-          const live = alive ? yield* Effect.promise(() => readIdentity(marker.pid ?? -1)) : null;
-          const confirmed = confirmedReviewPid(marker, live, alive);
-          if (confirmed !== null) {
-            const again = yield* Effect.promise(() => readIdentity(confirmed));
-            if (sameProcess(marker, again)) {
-              signalStop(confirmed);
-              return { status: "still_running" as const };
-            }
+          if (!alive) {
+            yield* Effect.promise(() =>
+              sweepAdvisoryIsolation({ root: marker.isolationRoot, pid: null }),
+            );
+            yield* Effect.promise(() => rm(markerFor(taskId), { force: true }));
+            return { status: "stopped" as const };
           }
-          yield* Effect.promise(() =>
-            sweepAdvisoryIsolation({ root: marker.isolationRoot, pid: null }),
-          );
-          yield* Effect.promise(() => rm(markerFor(taskId), { force: true }));
-          return { status: "stopped" as const };
+          const live = yield* Effect.promise(() => readIdentity(marker.pid ?? -1));
+          // Unreadable /proc, or a marker that never stored boot id and start ticks.
+          // A live pid in that state is still the review. Do not signal it or delete its marker.
+          if (live === null || marker.bootId == null || marker.startTicks == null) {
+            return { status: "still_running" as const };
+          }
+          if (!sameProcess(marker, live)) {
+            yield* Effect.promise(() =>
+              sweepAdvisoryIsolation({ root: marker.isolationRoot, pid: null }),
+            );
+            yield* Effect.promise(() => rm(markerFor(taskId), { force: true }));
+            return { status: "stopped" as const };
+          }
+          const again = yield* Effect.promise(() => readIdentity(marker.pid ?? -1));
+          if (again === null) return { status: "still_running" as const };
+          if (!sameProcess(marker, again)) {
+            yield* Effect.promise(() =>
+              sweepAdvisoryIsolation({ root: marker.isolationRoot, pid: null }),
+            );
+            yield* Effect.promise(() => rm(markerFor(taskId), { force: true }));
+            return { status: "stopped" as const };
+          }
+          signalStop(marker.pid);
+          return { status: "still_running" as const };
         });
       const sweep: AntigravityReviews["Service"]["sweep"] = (taskId) =>
         Effect.gen(function* () {
@@ -671,6 +688,9 @@ export const makeAntigravityReviews = (deps: AntigravityDeps = {}) =>
             marker?.pid != null && alive
               ? yield* Effect.promise(() => readIdentity(marker.pid ?? -1))
               : null;
+          if (alive && (live === null || marker?.bootId == null || marker?.startTicks == null)) {
+            return;
+          }
           const pid = marker === null ? null : confirmedReviewPid(marker, live, alive);
           const cleaned = yield* Effect.promise(() => sweepAdvisoryIsolation({ root, pid }));
           if (!cleaned) return;
