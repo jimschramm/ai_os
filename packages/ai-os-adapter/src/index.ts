@@ -18,6 +18,7 @@ export {
   type ObservationEvent,
   readAdapterBoard,
   renderPrompt,
+  renderSuppliedPrompt,
   type AttemptSession,
   type GrokT3Adapter,
   type SessionStore,

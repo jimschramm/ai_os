@@ -18,6 +18,7 @@ import { ContextPackageView } from "./ContextPackageView";
 import { useDialogCycle } from "./dialogFocus";
 import { CortexView } from "./CortexView";
 import { MemoryBrowser } from "./MemoryBrowser";
+import { ATTEMPT_ACTIVITY } from "./memoryFixtures";
 import { UsageGauges } from "./UsageGauges";
 import { AdvisoryReviewSection } from "./AdvisoryReview";
 import { hasLiveBoard, tasksForBoard } from "./adapterBoard";
@@ -224,6 +225,7 @@ export function OperationsDashboard() {
         projectLabel={memoryProject.label}
         currentTaskId={currentTaskId}
         currentTaskTitle={currentTask?.title ?? null}
+        activity={ATTEMPT_ACTIVITY}
         review={review}
         selectedId={memoryId}
         notes={memoryNotes}

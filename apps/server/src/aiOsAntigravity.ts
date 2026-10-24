@@ -43,6 +43,7 @@ export class AntigravityReviews extends Context.Service<
       readonly generation: number;
       readonly intake: Intake;
       readonly context: ContextPackageSnapshotV1;
+      readonly orientation?: readonly string[];
       readonly requestedModel: string | undefined;
     }) => Effect.Effect<AdvisoryOpen>;
     readonly watch: (taskId: string) => Effect.Effect<AdvisoryWatch | null>;
@@ -576,6 +577,7 @@ export const makeAntigravityReviews = (deps: AntigravityDeps = {}) =>
                   isolationRoot,
                   context: input.context,
                   intake: input.intake,
+                  ...(input.orientation === undefined ? {} : { orientation: input.orientation }),
                   requestedModel: choice.slug,
                   configuredModel: configuredModel(),
                   signal: job.abort.signal,

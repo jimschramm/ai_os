@@ -1,4 +1,9 @@
-import { packageFacts, type MemoryFactV1, type MemoryNodeKindV1 } from "@t3tools/ai-os-contracts";
+import {
+  packageFacts,
+  type AttemptMemoryActivityV1,
+  type MemoryFactV1,
+  type MemoryNodeKindV1,
+} from "@t3tools/ai-os-contracts";
 
 import type { OperationsTask } from "./fixtures";
 import {
@@ -296,6 +301,18 @@ export function contextPackageView(task: OperationsTask): ContextPackageView | n
     versionIds: snapshot.memoryVersions,
     records,
   };
+}
+
+export function attemptActivityFor(
+  activity: readonly AttemptMemoryActivityV1[],
+  projectId: string,
+  currentTaskId: string | null,
+): readonly AttemptMemoryActivityV1[] {
+  return activity.filter((item) => {
+    if (item.projectId !== projectId) return false;
+    if (currentTaskId !== null && item.taskId !== currentTaskId) return false;
+    return true;
+  });
 }
 
 export function currentFacts(projectId: string): readonly MemoryFactV1[] {

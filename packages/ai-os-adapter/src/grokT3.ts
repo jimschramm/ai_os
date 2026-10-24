@@ -96,6 +96,17 @@ export const renderPrompt = (intake: Intake, context: ContextPackageSnapshotV1):
   ].join("\n");
 };
 
+/** Orientation is appended in full. Artifact logs are already summarized by the caller. */
+export const renderSuppliedPrompt = (
+  intake: Intake,
+  context: ContextPackageSnapshotV1,
+  orientation: readonly string[],
+): string => {
+  const base = renderPrompt(intake, context);
+  if (orientation.length === 0) return base;
+  return [base, "", "Orientation", ...orientation.map((line) => `- ${line}`)].join("\n");
+};
+
 const fail = (reason: GrokT3Error["reason"], detail: string) =>
   Effect.fail(new GrokT3Error({ reason, detail }));
 
