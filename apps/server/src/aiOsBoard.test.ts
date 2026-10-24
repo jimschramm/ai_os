@@ -26,7 +26,11 @@ import {
   intakeV2Example,
   leaseIdFor,
 } from "@t3tools/ai-os-contracts";
-import { AuthOrchestrationOperateScope, AuthOrchestrationReadScope } from "@t3tools/contracts";
+import {
+  AuthOrchestrationOperateScope,
+  AuthOrchestrationReadScope,
+  DEFAULT_MODEL,
+} from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import { HttpRouter, HttpServerRequest } from "effect/http";
@@ -694,7 +698,7 @@ describe("ai-os board route", () => {
       idempotencyKey: "fast-1",
     });
     expect(moved.status).toBe(200);
-    expect(launches).toBe(1);
+    expect(launches).toBe(2);
     expect(await phaseOfHandler(handler)).toBe("awaiting_qa");
     const again = await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
       taskId: "task-demo",
@@ -702,7 +706,7 @@ describe("ai-os board route", () => {
       idempotencyKey: "fast-2",
     });
     expect(again.status).toBe(409);
-    expect(launches).toBe(1);
+    expect(launches).toBe(2);
     expect(await phaseOfHandler(handler)).toBe("awaiting_qa");
   });
 
@@ -1253,6 +1257,137 @@ describe("ai-os board route", () => {
     expect(card?.state.phase === "executing" ? card.state.run.progress?.status : null).toBe(
       "working",
     );
+  });
+
+  const modelName = (value: unknown): string | null => {
+    if (typeof value === "string") return value;
+    if (
+      value !== null &&
+      typeof value === "object" &&
+      "model" in value &&
+      typeof value.model === "string"
+    ) {
+      return value.model;
+    }
+    return null;
+  };
+
+  const reviewRuns = (
+    reviewerActual: string | null,
+  ): { readonly runs: AiOsBoard.BoardRuns["Service"]; readonly models: string[] } => {
+    const models: string[] = [];
+    const runs: AiOsBoard.BoardRuns["Service"] = {
+      ...allowRuns,
+      launch: (input) => {
+        models.push(input.model);
+        const reviewer = input.model === DEFAULT_MODEL;
+        return Effect.succeed({
+          threadId: reviewer ? "thread-qa" : "thread-impl",
+          runId: reviewer ? "run-qa" : "run-impl",
+          disposition: "active",
+          summary: null,
+        });
+      },
+      watchThread: (threadId) =>
+        Effect.succeed(
+          threadId === "thread-qa"
+            ? {
+                threadId,
+                runId: "run-qa",
+                status: "running" as const,
+                text: null,
+                revision: null,
+                requestedModel: DEFAULT_MODEL,
+                actualModel: reviewerActual,
+              }
+            : {
+                threadId,
+                runId: "run-impl",
+                status: "completed" as const,
+                text: "Shipped the page.",
+                revision: null,
+                requestedModel: "gpt-5.4",
+                actualModel: "gpt-5.4",
+              },
+        ),
+    };
+    return { runs, models };
+  };
+
+  const acceptVerdict = (revision: {
+    readonly type: "named";
+    readonly kind: "deployment" | "document" | "page" | "preview";
+    readonly id: string;
+  }) => ({
+    version: "v1" as const,
+    taskId: "task-demo",
+    attemptId: "attempt-1",
+    availability: "available" as const,
+    qaModel: DEFAULT_MODEL,
+    implementerModel: "gpt-5.4",
+    verdict: "accept" as const,
+    artifactRevision: revision,
+    acceptedRevision: revision,
+    findings: [],
+  });
+
+  it("reaches accepted after the reviewer session reports Astra", async () => {
+    const { runs, models } = reviewRuns(DEFAULT_MODEL);
+    const { handler } = handlerFor(undefined, runs);
+    await reachAssigned(handler);
+    const moved = await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
+      taskId: "task-demo",
+      column: "Running",
+      idempotencyKey: "review-run",
+    });
+    expect(moved.status).toBe(200);
+    expect(models).toEqual(["gpt-5.4", DEFAULT_MODEL]);
+    const waiting = (await readCards(handler)).find((card) => card.taskId === "task-demo");
+    expect(waiting?.state.phase).toBe("awaiting_qa");
+    if (waiting?.state.phase !== "awaiting_qa") throw new Error("expected review");
+    expect(modelName(waiting.state.run.implementerRuntime?.actual)).toBe("gpt-5.4");
+    expect(modelName(waiting.state.run.reviewerRuntime?.actual)).toBe(DEFAULT_MODEL);
+    const revision = waiting.state.completion.artifactRevision;
+    if (revision.type !== "named") throw new Error("expected a named revision");
+    const accepted = await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
+      taskId: "task-demo",
+      title: "Demo task",
+      idempotencyKey: "qa-accept",
+      event: { type: "qa", qa: acceptVerdict(revision) },
+    });
+    expect(accepted.status).toBe(200);
+    expect(await phaseOfHandler(handler)).toBe("accepted");
+  });
+
+  it("rejects acceptance when the reviewer session has not reported a model", async () => {
+    const { runs } = reviewRuns(null);
+    const { handler } = handlerFor(undefined, runs);
+    await reachAssigned(handler);
+    const moved = await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
+      taskId: "task-demo",
+      column: "Running",
+      idempotencyKey: "review-unknown",
+    });
+    expect(moved.status).toBe(200);
+    const waiting = (await readCards(handler)).find((card) => card.taskId === "task-demo");
+    expect(waiting?.state.phase).toBe("awaiting_qa");
+    if (waiting?.state.phase !== "awaiting_qa") throw new Error("expected review");
+    expect(modelName(waiting.state.run.implementerRuntime?.actual)).toBe("gpt-5.4");
+    expect(modelName(waiting.state.run.reviewerRuntime?.requested)).toBe(DEFAULT_MODEL);
+    expect(waiting.state.run.reviewerRuntime?.actual).toBeNull();
+    const revision = waiting.state.completion.artifactRevision;
+    if (revision.type !== "named") throw new Error("expected a named revision");
+    const rejected = await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
+      taskId: "task-demo",
+      title: "Demo task",
+      idempotencyKey: "qa-unknown",
+      event: { type: "qa", qa: acceptVerdict(revision) },
+    });
+    expect(rejected.status).toBe(409);
+    expect(await rejected.json()).toMatchObject({
+      detail: expect.stringMatching(/actual model/),
+    });
+    expect(await phaseOfHandler(handler)).toBe("awaiting_qa");
   });
 
   it("resumes a blocked card on the same thread and does not continue twice", async () => {

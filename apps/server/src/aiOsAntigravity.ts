@@ -22,6 +22,7 @@ import {
   type SequenceState,
 } from "@t3tools/ai-os-contracts";
 import { ProjectId } from "@t3tools/contracts";
+import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -74,8 +75,62 @@ const ActiveReviewFile = Schema.Struct({
   pid: Schema.NullOr(Schema.Number),
   isolationRoot: Schema.String.check(Schema.isMinLength(1)),
   generation: Schema.Number,
+  // Absent on markers written before the server-start cutoff existed.
+  writtenAt: Schema.optional(Schema.Number),
+  bootId: Schema.optional(Schema.NullOr(Schema.String)),
+  startTicks: Schema.optional(Schema.NullOr(Schema.String)),
 });
 type ActiveReview = typeof ActiveReviewFile.Type;
+
+export interface ProcessIdentity {
+  readonly bootId: string;
+  readonly startTicks: string;
+}
+
+/** Field 22 of /proc/pid/stat, the start time in clock ticks since boot. */
+export const startTicksOf = (stat: string): string | null => {
+  const end = stat.lastIndexOf(")");
+  if (end < 0) return null;
+  const ticks = stat.slice(end + 2).split(" ")[19];
+  return ticks !== undefined && /^[0-9]+$/.test(ticks) ? ticks : null;
+};
+
+export const readProcessIdentity = async (pid: number): Promise<ProcessIdentity | null> => {
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  try {
+    const bootId = (await readFile("/proc/sys/kernel/random/boot_id", "utf8")).trim();
+    const ticks = startTicksOf(await readFile(`/proc/${pid}/stat`, "utf8"));
+    if (bootId.length === 0 || ticks === null) return null;
+    return { bootId, startTicks: ticks };
+  } catch {
+    return null;
+  }
+};
+
+const sameProcess = (marker: ActiveReview, live: ProcessIdentity | null): boolean =>
+  live !== null &&
+  marker.bootId != null &&
+  marker.startTicks != null &&
+  marker.bootId === live.bootId &&
+  marker.startTicks === live.startTicks;
+
+/** A live pid is signaled only when the marker's boot id and start time still match. */
+export const confirmedReviewPid = (
+  marker: ActiveReview,
+  live: ProcessIdentity | null,
+  alive: boolean,
+): number | null => {
+  if (marker.pid === null || marker.pid === process.pid || !alive) return null;
+  return sameProcess(marker, live) ? marker.pid : null;
+};
+
+interface AntigravityDeps {
+  readonly runReview?: typeof runAdvisoryReview;
+  readonly readIdentity?: (pid: number) => Promise<ProcessIdentity | null>;
+  readonly pidAlive?: (pid: number) => boolean;
+  readonly signal?: (pid: number) => void;
+  readonly listModels?: () => Promise<AntigravityCatalog>;
+}
 
 const decodeActiveReviewFile = Schema.decodeUnknownSync(Schema.fromJsonString(ActiveReviewFile));
 const encodeActiveReviewFile = Schema.encodeSync(Schema.fromJsonString(ActiveReviewFile));
@@ -352,224 +407,286 @@ const stop = (detail: string, requestedModel: string | null = null): AdvisoryExe
   actualModel: null,
 });
 
-export const liveAntigravity = Layer.effect(
-  AntigravityReviews,
-  Effect.gen(function* () {
-    const projects = yield* ProjectStore.ProjectStoreV2;
-    const config = yield* ServerConfig.ServerConfig;
-    const path = yield* Path.Path;
-    const scope = yield* Effect.scope;
-    const jobs = new Map<
-      string,
-      {
-        readonly abort: AbortController;
-        readonly runId: string;
-        readonly generation: number;
-        execution: AdvisoryExecution | null;
-      }
-    >();
-    const markerFor = (taskId: string) =>
-      path.join(config.stateDir, "antigravity", taskId, "active.json");
-    const readMarker = (taskId: string) =>
-      Effect.promise(async (): Promise<ActiveReview | null> => {
-        try {
-          return decodeActiveReviewFile(await readFile(markerFor(taskId), "utf8"));
-        } catch {
-          return null;
+export const makeAntigravityReviews = (deps: AntigravityDeps = {}) =>
+  Layer.effect(
+    AntigravityReviews,
+    Effect.gen(function* () {
+      const projects = yield* ProjectStore.ProjectStoreV2;
+      const config = yield* ServerConfig.ServerConfig;
+      const path = yield* Path.Path;
+      const scope = yield* Effect.scope;
+      const jobs = new Map<
+        string,
+        {
+          readonly abort: AbortController;
+          readonly runId: string;
+          readonly generation: number;
+          execution: AdvisoryExecution | null;
         }
-      });
-    const writeMarker = (taskId: string, marker: ActiveReview) =>
-      Effect.promise(async () => {
-        const file = markerFor(taskId);
-        await mkdir(path.dirname(file), { recursive: true });
-        await writeFile(file, encodeActiveReviewFile(marker));
-      });
-    const signalStop = (pid: number): void => {
-      try {
-        process.kill(pid, "SIGINT");
-      } catch {
-        // The pid exited between the check and the signal.
-      }
-    };
-    const pidAlive = (pid: number): boolean => {
-      if (!Number.isInteger(pid) || pid <= 0 || pid === process.pid) return false;
-      try {
-        process.kill(pid, 0);
-        return true;
-      } catch (error) {
-        return (
-          typeof error === "object" && error !== null && "code" in error && error.code === "EPERM"
-        );
-      }
-    };
-    const listModels = () =>
-      Effect.promise(() => listAntigravityModels({ configuredModel: configuredModel() }));
-    const watch: AntigravityReviews["Service"]["watch"] = (taskId) =>
-      Effect.sync(() => {
-        const job = jobs.get(taskId);
-        if (job === undefined) return null;
-        return job.execution === null
-          ? { status: "running" as const, generation: job.generation }
-          : { status: "settled" as const, execution: job.execution, generation: job.generation };
-      });
-    const cancel: AntigravityReviews["Service"]["cancel"] = (taskId) =>
-      Effect.sync(() => {
-        const job = jobs.get(taskId);
-        if (job === undefined || job.execution !== null) return "already_stopped" as const;
-        job.abort.abort();
-        return "requested" as const;
-      });
-    const start: AntigravityReviews["Service"]["start"] = (input) =>
-      Effect.gen(function* () {
-        const current = jobs.get(input.taskId);
-        if (current !== undefined && current.execution === null) {
-          return { status: "running" as const, runId: current.runId };
-        }
-        const workspace = yield* projects.get(ProjectId.make(input.projectId)).pipe(
-          Effect.map((row) => (Option.isSome(row) ? row.value.workspaceRoot : null)),
-          Effect.orElseSucceed(() => null),
-        );
-        if (workspace === null) {
-          return {
-            status: "unavailable" as const,
-            detail: "This project has no workspace on this server.",
-            models: [] as readonly string[],
-          };
-        }
-        const catalog = yield* Effect.promise(() =>
-          listAntigravityModels({ configuredModel: configuredModel() }),
-        );
-        const choice = resolveModelChoice({
-          discovered: catalog.source === "cli" ? catalog.models : null,
-          requested: input.requestedModel,
-          configured: configuredModel(),
-        });
-        if (!choice.ok) {
-          return { status: "unavailable" as const, detail: choice.detail, models: choice.models };
-        }
-        const runId = `agy-${input.taskId}-${input.generation}`;
-        const job = {
-          abort: new AbortController(),
-          runId,
-          generation: input.generation,
-          execution: null as AdvisoryExecution | null,
-        };
-        jobs.set(input.taskId, job);
-        const isolationRoot = path.join(
-          config.stateDir,
-          "antigravity",
-          input.taskId,
-          String(input.generation),
-          runId,
-        );
-        yield* writeMarker(input.taskId, {
-          pid: null,
-          isolationRoot,
-          generation: input.generation,
-        });
-        yield* Effect.forkIn(
-          Effect.callback<void>((resume, signal) => {
-            const abort = () => job.abort.abort();
-            signal.addEventListener("abort", abort, { once: true });
-            void runAdvisoryReview({
-              repoRoot: workspace,
-              isolationRoot,
-              context: input.context,
-              intake: input.intake,
-              requestedModel: choice.slug,
-              configuredModel: configuredModel(),
-              signal: job.abort.signal,
-              onSpawn: (pid) => {
-                void writeFile(
-                  markerFor(input.taskId),
-                  encodeActiveReviewFile({
-                    pid,
-                    isolationRoot,
-                    generation: input.generation,
-                  }),
-                ).catch(() => undefined);
-              },
-            }).then(
-              (execution) => {
-                job.execution = execution;
-                resume(Effect.void);
-              },
-              (error: unknown) => {
-                job.execution = stop(
-                  error instanceof Error
-                    ? error.message
-                    : "The Antigravity CLI could not be started.",
-                  choice.slug,
-                );
-                resume(Effect.void);
-              },
-            );
-            return Effect.sync(() => signal.removeEventListener("abort", abort));
-          }),
-          scope,
-        );
-        return { status: "running" as const, runId };
-      });
-    const recover: AntigravityReviews["Service"]["recover"] = (taskId) =>
-      Effect.gen(function* () {
-        const job = jobs.get(taskId);
-        if (job !== undefined && job.execution === null) {
-          job.abort.abort();
-          return { status: "still_running" as const };
-        }
-        const marker = yield* readMarker(taskId);
-        if (job !== undefined && job.execution !== null) {
-          if (marker !== null) {
-            yield* Effect.promise(() => sweepAdvisoryIsolation({ root: marker.isolationRoot }));
-            yield* Effect.promise(() => rm(markerFor(taskId), { force: true }));
+      >();
+      const markerFor = (taskId: string) =>
+        path.join(config.stateDir, "antigravity", taskId, "active.json");
+      const readMarker = (taskId: string) =>
+        Effect.promise(async (): Promise<ActiveReview | null> => {
+          try {
+            return decodeActiveReviewFile(await readFile(markerFor(taskId), "utf8"));
+          } catch {
+            return null;
           }
-          jobs.delete(taskId);
-          return { status: "stopped" as const };
-        }
-        if (marker === null) return { status: "stopped" as const };
-        if (marker.pid === process.pid) return { status: "still_running" as const };
-        if (marker.pid !== null && pidAlive(marker.pid)) {
-          signalStop(marker.pid);
-          return { status: "still_running" as const };
-        }
-        if (marker.pid === null) {
-          const present = yield* Effect.promise(async () => {
-            try {
-              await access(marker.isolationRoot);
-              return true;
-            } catch {
-              return false;
-            }
+        });
+      const writeMarker = (taskId: string, marker: ActiveReview) =>
+        Effect.promise(async () => {
+          const file = markerFor(taskId);
+          await mkdir(path.dirname(file), { recursive: true });
+          await writeFile(file, encodeActiveReviewFile(marker));
+        });
+      const signalStop =
+        deps.signal ??
+        ((pid: number): void => {
+          try {
+            process.kill(pid, "SIGINT");
+          } catch {
+            // The pid exited between the check and the signal.
+          }
+        });
+      const pidAlive =
+        deps.pidAlive ??
+        ((pid: number): boolean => {
+          if (!Number.isInteger(pid) || pid <= 0 || pid === process.pid) return false;
+          try {
+            process.kill(pid, 0);
+            return true;
+          } catch (error) {
+            return (
+              typeof error === "object" &&
+              error !== null &&
+              "code" in error &&
+              error.code === "EPERM"
+            );
+          }
+        });
+      const readIdentity = deps.readIdentity ?? readProcessIdentity;
+      const runReview = deps.runReview ?? runAdvisoryReview;
+      const serverStartedAt = yield* Clock.currentTimeMillis;
+      const releaseMarker = (taskId: string, generation: number) =>
+        Effect.promise(async () => {
+          try {
+            const current = decodeActiveReviewFile(await readFile(markerFor(taskId), "utf8"));
+            if (current.generation !== generation) return;
+          } catch {
+            return;
+          }
+          await rm(markerFor(taskId), { force: true });
+        });
+      const isolationPresent = (root: string) =>
+        Effect.promise(async () => {
+          try {
+            await access(root);
+            return true;
+          } catch {
+            return false;
+          }
+        });
+      const listModels = () =>
+        Effect.promise(() => listAntigravityModels({ configuredModel: configuredModel() }));
+      const watch: AntigravityReviews["Service"]["watch"] = (taskId) =>
+        Effect.sync(() => {
+          const job = jobs.get(taskId);
+          if (job === undefined) return null;
+          return job.execution === null
+            ? { status: "running" as const, generation: job.generation }
+            : { status: "settled" as const, execution: job.execution, generation: job.generation };
+        });
+      const cancel: AntigravityReviews["Service"]["cancel"] = (taskId) =>
+        Effect.sync(() => {
+          const job = jobs.get(taskId);
+          if (job === undefined || job.execution !== null) return "already_stopped" as const;
+          job.abort.abort();
+          return "requested" as const;
+        });
+      const start: AntigravityReviews["Service"]["start"] = (input) =>
+        Effect.gen(function* () {
+          const current = jobs.get(input.taskId);
+          if (current !== undefined && current.execution === null) {
+            return { status: "running" as const, runId: current.runId };
+          }
+          const workspace = yield* projects.get(ProjectId.make(input.projectId)).pipe(
+            Effect.map((row) => (Option.isSome(row) ? row.value.workspaceRoot : null)),
+            Effect.orElseSucceed(() => null),
+          );
+          if (workspace === null) {
+            return {
+              status: "unavailable" as const,
+              detail: "This project has no workspace on this server.",
+              models: [] as readonly string[],
+            };
+          }
+          const catalog = yield* Effect.promise(() =>
+            (
+              deps.listModels ??
+              (() => listAntigravityModels({ configuredModel: configuredModel() }))
+            )(),
+          );
+          const choice = resolveModelChoice({
+            discovered: catalog.source === "cli" ? catalog.models : null,
+            requested: input.requestedModel,
+            configured: configuredModel(),
           });
-          if (present) return { status: "still_running" as const };
+          if (!choice.ok) {
+            return { status: "unavailable" as const, detail: choice.detail, models: choice.models };
+          }
+          const runId = `agy-${input.taskId}-${input.generation}`;
+          const job = {
+            abort: new AbortController(),
+            runId,
+            generation: input.generation,
+            execution: null as AdvisoryExecution | null,
+          };
+          jobs.set(input.taskId, job);
+          const isolationRoot = path.join(
+            config.stateDir,
+            "antigravity",
+            input.taskId,
+            String(input.generation),
+            runId,
+          );
+          const writtenAt = yield* Clock.currentTimeMillis;
+          yield* writeMarker(input.taskId, {
+            pid: null,
+            isolationRoot,
+            generation: input.generation,
+            writtenAt,
+            bootId: null,
+            startTicks: null,
+          });
+          yield* Effect.forkIn(
+            Effect.gen(function* () {
+              const execution = yield* Effect.callback<AdvisoryExecution>((resume, signal) => {
+                const abort = () => job.abort.abort();
+                signal.addEventListener("abort", abort, { once: true });
+                void runReview({
+                  repoRoot: workspace,
+                  isolationRoot,
+                  context: input.context,
+                  intake: input.intake,
+                  requestedModel: choice.slug,
+                  configuredModel: configuredModel(),
+                  signal: job.abort.signal,
+                  onSpawn: (pid) => {
+                    const writePid = (identity: { bootId: string; startTicks: string } | null) =>
+                      writeFile(
+                        markerFor(input.taskId),
+                        encodeActiveReviewFile({
+                          pid,
+                          isolationRoot,
+                          generation: input.generation,
+                          writtenAt,
+                          bootId: identity?.bootId ?? null,
+                          startTicks: identity?.startTicks ?? null,
+                        }),
+                      ).catch(() => undefined);
+                    if (pid === null) {
+                      void writePid(null);
+                      return;
+                    }
+                    void readIdentity(pid).then(writePid);
+                  },
+                }).then(
+                  (value) => resume(Effect.succeed(value)),
+                  (error: unknown) =>
+                    resume(
+                      Effect.succeed(
+                        stop(
+                          error instanceof Error
+                            ? error.message
+                            : "The Antigravity CLI could not be started.",
+                          choice.slug,
+                        ),
+                      ),
+                    ),
+                );
+                return Effect.sync(() => signal.removeEventListener("abort", abort));
+              });
+              if (jobs.get(input.taskId) === job) job.execution = execution;
+              yield* releaseMarker(input.taskId, input.generation);
+            }),
+            scope,
+          );
+          return { status: "running" as const, runId };
+        });
+      const recover: AntigravityReviews["Service"]["recover"] = (taskId) =>
+        Effect.gen(function* () {
+          const job = jobs.get(taskId);
+          if (job !== undefined && job.execution === null) {
+            job.abort.abort();
+            return { status: "still_running" as const };
+          }
+          const marker = yield* readMarker(taskId);
+          if (job !== undefined && job.execution !== null) {
+            if (marker !== null) {
+              yield* Effect.promise(() => sweepAdvisoryIsolation({ root: marker.isolationRoot }));
+              yield* Effect.promise(() => rm(markerFor(taskId), { force: true }));
+            }
+            jobs.delete(taskId);
+            return { status: "stopped" as const };
+          }
+          if (marker === null) return { status: "stopped" as const };
+          if (marker.pid === process.pid) return { status: "still_running" as const };
+          if (marker.pid === null) {
+            const fresh = marker.writtenAt !== undefined && marker.writtenAt >= serverStartedAt;
+            if (fresh) return { status: "still_running" as const };
+            const present = yield* isolationPresent(marker.isolationRoot);
+            if (present) {
+              yield* Effect.promise(() =>
+                sweepAdvisoryIsolation({ root: marker.isolationRoot, pid: null }),
+              );
+            }
+            yield* Effect.promise(() => rm(markerFor(taskId), { force: true }));
+            return { status: "stopped" as const };
+          }
+          const alive = pidAlive(marker.pid);
+          const live = alive ? yield* Effect.promise(() => readIdentity(marker.pid ?? -1)) : null;
+          const confirmed = confirmedReviewPid(marker, live, alive);
+          if (confirmed !== null) {
+            const again = yield* Effect.promise(() => readIdentity(confirmed));
+            if (sameProcess(marker, again)) {
+              signalStop(confirmed);
+              return { status: "still_running" as const };
+            }
+          }
+          yield* Effect.promise(() =>
+            sweepAdvisoryIsolation({ root: marker.isolationRoot, pid: null }),
+          );
           yield* Effect.promise(() => rm(markerFor(taskId), { force: true }));
           return { status: "stopped" as const };
+        });
+      const sweep: AntigravityReviews["Service"]["sweep"] = (taskId) =>
+        Effect.gen(function* () {
+          const job = jobs.get(taskId);
+          if (job !== undefined && job.execution === null) return;
+          const marker = yield* readMarker(taskId);
+          const root = marker?.isolationRoot ?? path.join(config.stateDir, "antigravity", taskId);
+          const alive = marker?.pid != null && pidAlive(marker.pid);
+          const live =
+            marker?.pid != null && alive
+              ? yield* Effect.promise(() => readIdentity(marker.pid ?? -1))
+              : null;
+          const pid = marker === null ? null : confirmedReviewPid(marker, live, alive);
+          const cleaned = yield* Effect.promise(() => sweepAdvisoryIsolation({ root, pid }));
+          if (!cleaned) return;
+          yield* Effect.promise(() => rm(markerFor(taskId), { force: true }));
+          if (job !== undefined) jobs.delete(taskId);
+        });
+      const stored = yield* Effect.promise(async () => {
+        try {
+          return await readdir(path.join(config.stateDir, "antigravity"));
+        } catch {
+          return [] as string[];
         }
-        yield* Effect.promise(() => sweepAdvisoryIsolation({ root: marker.isolationRoot }));
-        yield* Effect.promise(() => rm(markerFor(taskId), { force: true }));
-        return { status: "stopped" as const };
       });
-    const sweep: AntigravityReviews["Service"]["sweep"] = (taskId) =>
-      Effect.gen(function* () {
-        const job = jobs.get(taskId);
-        if (job !== undefined && job.execution === null) return;
-        const marker = yield* readMarker(taskId);
-        const root = marker?.isolationRoot ?? path.join(config.stateDir, "antigravity", taskId);
-        const cleaned = yield* Effect.promise(() =>
-          sweepAdvisoryIsolation({ root, pid: marker?.pid ?? null }),
-        );
-        if (!cleaned) return;
-        yield* Effect.promise(() => rm(markerFor(taskId), { force: true }));
-        if (job !== undefined) jobs.delete(taskId);
-      });
-    const stored = yield* Effect.promise(async () => {
-      try {
-        return await readdir(path.join(config.stateDir, "antigravity"));
-      } catch {
-        return [] as string[];
-      }
-    });
-    for (const taskId of stored) yield* sweep(taskId);
-    return { listModels, start, watch, cancel, recover, sweep };
-  }),
-);
+      for (const taskId of stored) yield* sweep(taskId);
+      return { listModels, start, watch, cancel, recover, sweep };
+    }),
+  );
+
+export const liveAntigravity = makeAntigravityReviews();

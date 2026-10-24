@@ -373,10 +373,8 @@ export const ReworkState = Schema.Struct({
     if (qaMatch !== true) {
       return qaMatch;
     }
-    const models = independentQa(state.run, state.qa);
-    if (models !== true) {
-      return models.detail;
-    }
+    // Runtime models are checked when qa is applied. Cards saved before those
+    // fields existed stay readable.
     if (!sameRevision(state.qa.artifactRevision, state.reworkRevision)) {
       return "Rework records the revision that was reviewed.";
     }
@@ -406,10 +404,8 @@ export const AcceptedState = Schema.Struct({
     if (qaMatch !== true) {
       return qaMatch;
     }
-    const models = independentQa(state.run, state.qa);
-    if (models !== true) {
-      return models.detail;
-    }
+    // Runtime models are checked when qa is applied. Cards saved before those
+    // fields existed stay readable.
     if (!sameRevision(state.qa.acceptedRevision, state.qa.artifactRevision)) {
       return "Acceptance is bound to the exact artifact revision.";
     }

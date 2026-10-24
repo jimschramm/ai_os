@@ -151,16 +151,27 @@ const sameReportedModel = (
   next: string | null,
 ): boolean => stored != null && next !== null && sameModelName(stored, next);
 
-/** The first runtime report stands. A later different model is not written over it. */
+/**
+ * The first runtime report stands. A later different model is not written over it.
+ * Actual comes only from the provider session on the view. A missing actual stays missing.
+ */
 const runtimeObservation = (input: {
   readonly taskId: string;
   readonly attemptId: string;
-  readonly state: Extract<SequenceState, { phase: "executing" }>;
+  readonly generation: number;
+  readonly leaseId: string;
+  readonly stored:
+    | {
+        readonly requested: { readonly model: string } | null;
+        readonly actual: { readonly model: string } | null;
+      }
+    | undefined;
   readonly view: T3ThreadView;
+  readonly role: "implementer" | "reviewer";
 }): ObservationEvent | null => {
   const requested = modelRef(input.view.requestedModel);
   const actual = modelRef(input.view.actualModel);
-  const stored = input.state.run.implementerRuntime;
+  const stored = input.stored;
   const requestedConflict =
     stored !== undefined &&
     requested !== null &&
@@ -180,22 +191,21 @@ const runtimeObservation = (input: {
   const nextActual =
     stored === undefined ? actual : !actualConflict && stored.actual === null ? actual : null;
   if (nextRequested === null && nextActual === null) return null;
-  const run = input.state.run;
   const suffix =
     stored === undefined
-      ? "implementer"
+      ? input.role
       : nextActual !== null
-        ? "implementer-actual"
-        : "implementer-requested";
+        ? `${input.role}-actual`
+        : `${input.role}-requested`;
   return {
-    idempotencyKey: `runtime-${input.taskId}-${run.generation}-${suffix}`,
+    idempotencyKey: `runtime-${input.taskId}-${input.generation}-${suffix}`,
     event: {
       type: "record_runtime_models",
       taskId: input.taskId,
       attemptId: input.attemptId,
-      generation: run.generation,
-      leaseId: run.leaseId,
-      role: "implementer",
+      generation: input.generation,
+      leaseId: input.leaseId,
+      role: input.role,
       requested: nextRequested,
       actual: nextActual,
     },
@@ -210,6 +220,20 @@ export const observationEvents = (input: {
   readonly allowLapse: boolean;
   readonly workerId: string;
 }): readonly ObservationEvent[] => {
+  if (input.state.phase === "awaiting_qa") {
+    if (input.view === null) return [];
+    const awaiting = input.state;
+    const reviewer = runtimeObservation({
+      taskId: input.taskId,
+      attemptId: awaiting.assignment.attemptId,
+      generation: awaiting.run.generation,
+      leaseId: awaiting.run.leaseId,
+      stored: awaiting.run.reviewerRuntime,
+      view: input.view,
+      role: "reviewer",
+    });
+    return reviewer === null ? [] : [reviewer];
+  }
   if (input.state.phase !== "executing") return [];
   const run = input.state.run;
   const attemptId = input.state.assignment.attemptId;
@@ -233,7 +257,15 @@ export const observationEvents = (input: {
     ];
   }
   const view = input.view;
-  const runtime = runtimeObservation({ taskId, attemptId, state: input.state, view });
+  const runtime = runtimeObservation({
+    taskId,
+    attemptId,
+    generation: run.generation,
+    leaseId: run.leaseId,
+    stored: input.state.run.implementerRuntime,
+    view,
+    role: "implementer",
+  });
   if (view.status === "running") {
     const events: ObservationEvent[] = [];
     if (runtime !== null) events.push(runtime);

@@ -1064,6 +1064,51 @@ it.effect("rejects an accepted phase that has no completion or independent QA ve
   }),
 );
 
+it.effect("decodes a stored card from before runtime models were recorded", () =>
+  Effect.gen(function* () {
+    const accepted = yield* applySequence(happyPathEvents);
+    if (accepted.phase !== "accepted") {
+      return yield* Effect.die("The happy path must accept the final revision.");
+    }
+    const legacyAccepted = yield* decodeSequenceState({
+      ...accepted,
+      run: {
+        generation: accepted.run.generation,
+        leaseId: accepted.run.leaseId,
+        leaseExpiresAt: accepted.run.leaseExpiresAt,
+        progress: accepted.run.progress,
+        retryCount: accepted.run.retryCount,
+        retryLimit: accepted.run.retryLimit,
+        usage: accepted.run.usage,
+      },
+    });
+    assert.strictEqual(legacyAccepted.phase, "accepted");
+    if (legacyAccepted.phase !== "accepted") return;
+    assert.strictEqual(legacyAccepted.run.implementerRuntime, undefined);
+    assert.strictEqual(legacyAccepted.run.reviewerRuntime, undefined);
+
+    const rework = yield* applySequence(happyPathEvents.slice(0, 9));
+    if (rework.phase !== "rework") return yield* Effect.die("The path must be in rework.");
+    const legacyRework = yield* decodeSequenceState({
+      ...rework,
+      run: {
+        generation: rework.run.generation,
+        leaseId: rework.run.leaseId,
+        leaseExpiresAt: rework.run.leaseExpiresAt,
+        progress: rework.run.progress,
+        retryCount: rework.run.retryCount,
+        retryLimit: rework.run.retryLimit,
+        usage: rework.run.usage,
+      },
+    });
+    assert.strictEqual(legacyRework.phase, "rework");
+
+    const awaiting = yield* applySequence(happyPathEvents.slice(0, 6));
+    const rejected = yield* failure(awaiting, { type: "qa", qa: qaAcceptExample });
+    assert.strictEqual(rejected.reason, "qa_model_unknown");
+  }),
+);
+
 it.effect("stores an assignment snapshot that later caller mutation cannot change", () =>
   Effect.gen(function* () {
     const memoryVersions = ["decision-12"];

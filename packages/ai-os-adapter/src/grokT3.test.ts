@@ -1277,3 +1277,50 @@ it.effect("attributes tokens to the provider session model and not the request",
     assert.strictEqual(unknown.actualModel, null);
   }),
 );
+
+it.effect("records the reviewer's provider session while awaiting QA", () =>
+  Effect.gen(function* () {
+    const awaiting = yield* applySequence(happyPathEvents.slice(0, 6));
+    if (awaiting.phase !== "awaiting_qa") {
+      return yield* Effect.die("Completion must wait for QA.");
+    }
+    const view = {
+      threadId: "thread-qa",
+      runId: "run-qa",
+      status: "running" as const,
+      text: null,
+      revision: null,
+      requestedModel: "gpt-6-astra",
+      actualModel: "gpt-6-astra",
+    };
+    const planned = observationEvents({
+      taskId: "task-usba-page",
+      threadId: "thread-qa",
+      state: awaiting,
+      view,
+      allowLapse: false,
+      workerId: "codex-t3",
+    });
+    const recorded = planned.find((item) => item.event.type === "record_runtime_models");
+    if (recorded === undefined || recorded.event.type !== "record_runtime_models") {
+      return yield* Effect.die("Awaiting QA must record the reviewer runtime.");
+    }
+    assert.strictEqual(recorded.event.role, "reviewer");
+    assert.strictEqual(recorded.event.actual?.model, "gpt-6-astra");
+    const unknown = observationEvents({
+      taskId: "task-usba-page",
+      threadId: "thread-qa",
+      state: awaiting,
+      view: { ...view, actualModel: null },
+      allowLapse: false,
+      workerId: "codex-t3",
+    });
+    const missing = unknown.find((item) => item.event.type === "record_runtime_models");
+    if (missing === undefined || missing.event.type !== "record_runtime_models") {
+      return yield* Effect.die("A requested reviewer model is still recorded.");
+    }
+    assert.strictEqual(missing.event.role, "reviewer");
+    assert.strictEqual(missing.event.requested?.model, "gpt-6-astra");
+    assert.strictEqual(missing.event.actual, null);
+  }),
+);

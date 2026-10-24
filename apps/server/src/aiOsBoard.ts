@@ -40,6 +40,7 @@ import {
   AuthOrchestrationOperateScope,
   AuthOrchestrationReadScope,
   CommandId,
+  DEFAULT_MODEL,
   MessageId,
   OrchestrationMessageContext,
   ProjectId,
@@ -68,6 +69,7 @@ import {
   AntigravityReviews,
   applyAdvisoryExecution,
   applyAdvisoryStop,
+  type AdvisoryOpen,
 } from "./aiOsAntigravity.ts";
 import type { AdvisoryExecution } from "@t3tools/ai-os-adapter";
 import * as EnvironmentAuth from "./auth/EnvironmentAuth.ts";
@@ -623,6 +625,76 @@ export const layer = Layer.unwrap(
         );
         return "stored" as const;
       });
+    const reviewerThreads = new Map<string, { readonly threadId: string }>();
+    const observeThread = (
+      state: BoardSequence,
+      taskId: string,
+      threadId: string,
+      book: KanbanMoveLedger,
+      changed: boolean,
+    ) =>
+      Effect.gen(function* () {
+        const view = yield* runs
+          .watchThread(threadId)
+          .pipe(Effect.catchTags({ BoardRunError: () => Effect.succeed(null) }));
+        if (view === null || !("assignment" in state)) {
+          return { state, book, changed, runId: null as string | null };
+        }
+        const planned = observationEvents({
+          taskId,
+          threadId,
+          state,
+          view,
+          allowLapse: view.status === "interrupted",
+          workerId: state.assignment.workerId,
+        });
+        let next: BoardSequence = state;
+        let nextBook = book;
+        let nextChanged = changed;
+        for (const item of planned) {
+          const applied: KanbanMoveResult = yield* applyBoardWorkflowEvent(
+            next,
+            item.event,
+            item.idempotencyKey,
+            taskId,
+            nextBook,
+          );
+          if (applied._tag !== "Applied") break;
+          next = applied.state;
+          nextBook = applied.ledger;
+          nextChanged = nextChanged || applied.changed;
+        }
+        return { state: next, book: nextBook, changed: nextChanged, runId: view.runId };
+      });
+    const ensureReviewer = (
+      state: Extract<BoardSequence, { phase: "awaiting_qa" }>,
+      taskId: string,
+    ) =>
+      Effect.gen(function* () {
+        const key = `${taskId}:${state.run.generation}`;
+        const known = reviewerThreads.get(key);
+        if (known !== undefined) return known.threadId;
+        const projectId = projectIdOf(state);
+        if (projectId === null) return null;
+        const launched = yield* runs
+          .launch({
+            idempotencyKey: `board-review-${taskId}-${state.assignment.attemptId}-${state.run.generation}`,
+            projectId,
+            title: `Review ${taskId}`,
+            prompt: [
+              "Independent QA. Review the submitted work against the requirements.",
+              "Do not change the code. Report defects, the evidence, and the expected behavior.",
+              renderPrompt(state.intake, state.assignment.contextPackage),
+            ].join("\n\n"),
+            model: DEFAULT_MODEL,
+            instanceId: state.assignment.instanceId ?? T3_LAUNCH_DEFAULTS.instanceId,
+            contextPackage: state.assignment.contextPackage,
+          })
+          .pipe(Effect.catchTags({ BoardRunError: () => Effect.succeed(null) }));
+        if (launched === null) return null;
+        reviewerThreads.set(key, { threadId: launched.threadId });
+        return launched.threadId;
+      });
     const followLaunched = (
       outcome: KanbanMoveResult,
       taskId: string,
@@ -630,45 +702,31 @@ export const layer = Layer.unwrap(
       runId: string | null,
     ) =>
       Effect.gen(function* () {
-        if (
-          outcome._tag !== "Applied" ||
-          outcome.state.phase !== "executing" ||
-          threadId === null
-        ) {
-          return { outcome, runId };
-        }
-        const executing = outcome.state;
-        const view = yield* runs
-          .watchThread(threadId)
-          .pipe(Effect.catchTags({ BoardRunError: () => Effect.succeed(null) }));
-        if (view === null) return { outcome, runId };
-        const planned = observationEvents({
-          taskId,
-          threadId,
-          state: executing,
-          view,
-          allowLapse: view.status === "interrupted",
-          workerId: executing.assignment.workerId,
-        });
-        let state: BoardSequence = executing;
-        let book: KanbanMoveLedger = outcome.ledger;
+        if (outcome._tag !== "Applied") return { outcome, runId };
+        let state = outcome.state;
+        let book = outcome.ledger;
         let changed = outcome.changed;
-        for (const item of planned) {
-          const next: KanbanMoveResult = yield* applyBoardWorkflowEvent(
-            state,
-            item.event,
-            item.idempotencyKey,
-            taskId,
-            book,
-          );
-          if (next._tag !== "Applied") break;
-          state = next.state;
-          book = next.ledger;
-          changed = changed || next.changed;
+        let nextRun = runId;
+        if (state.phase === "executing" && threadId !== null) {
+          const viewed = yield* observeThread(state, taskId, threadId, book, changed);
+          state = viewed.state;
+          book = viewed.book;
+          changed = viewed.changed;
+          nextRun = viewed.runId ?? nextRun;
+        }
+        if (state.phase === "awaiting_qa" && state.run.reviewerRuntime?.actual == null) {
+          const awaiting = state;
+          const reviewerThread = yield* ensureReviewer(awaiting, taskId);
+          if (reviewerThread !== null) {
+            const viewed = yield* observeThread(awaiting, taskId, reviewerThread, book, changed);
+            state = viewed.state;
+            book = viewed.book;
+            changed = viewed.changed;
+          }
         }
         return {
           outcome: { _tag: "Applied" as const, state, ledger: book, changed },
-          runId: view.runId ?? runId,
+          runId: nextRun,
         };
       });
     const settleAdvisory = (
@@ -784,6 +842,47 @@ export const layer = Layer.unwrap(
           const asked = yield* requestKanbanMove(decoded.state, requestInput);
           let launchedThread = card.threadId;
           let launchedRun = card.runId ?? null;
+          const openAdvisoryRun = (
+            queued: Extract<BoardSequence, { phase: "assigned" } | { phase: "rework" }>,
+            projectId: string,
+            book: KanbanMoveLedger,
+            rejectedState: BoardSequence,
+          ) =>
+            Effect.gen(function* () {
+              if (!antigravitySupports("start")) {
+                return rejectedMove("Antigravity does not implement start.", rejectedState, book);
+              }
+              const typed = stringField(body, "model")?.trim() ?? "";
+              const requested =
+                typed.length > 0 ? typed : (queued.assignment.advisoryModel?.model ?? undefined);
+              const generation = executionGeneration(queued);
+              const opened = yield* reviews.start({
+                projectId,
+                taskId,
+                generation,
+                intake: queued.intake,
+                context: queued.assignment.contextPackage,
+                requestedModel: requested,
+              });
+              if (opened.status === "unavailable") {
+                return rejectedMove(opened.detail, rejectedState, book);
+              }
+              const started = yield* applyBoardWorkflowEvent(
+                queued,
+                { type: "start_execution" },
+                `agy-start-${taskId}-${generation}`,
+                taskId,
+                book,
+              );
+              if (started._tag !== "Applied" || started.state.phase !== "executing") {
+                return started;
+              }
+              return {
+                _tag: "Running" as const,
+                started,
+                opened: opened as Exclude<AdvisoryOpen, { status: "unavailable" }>,
+              };
+            });
           const outcome =
             asked._tag === "NeedsInterrupt"
               ? yield* Effect.gen(function* () {
@@ -869,52 +968,20 @@ export const layer = Layer.unwrap(
                       );
                     }
                     if (declaredTaskType(queued.assignment) === "advisory") {
-                      if (!antigravitySupports("start")) {
-                        return rejectedMove(
-                          "Antigravity does not implement start.",
-                          queued,
-                          ledger,
-                        );
-                      }
-                      const typed = stringField(body, "model")?.trim() ?? "";
-                      const requested =
-                        typed.length > 0
-                          ? typed
-                          : (queued.assignment.advisoryModel?.model ?? undefined);
-                      const opened = yield* reviews.start({
-                        projectId,
-                        taskId,
-                        generation: executionGeneration(queued),
-                        intake: queued.intake,
-                        context: queued.assignment.contextPackage,
-                        requestedModel: requested,
-                      });
-                      if (opened.status === "unavailable") {
-                        return rejectedMove(opened.detail, queued, ledger);
-                      }
-                      const generation = executionGeneration(queued);
-                      const started = yield* applyBoardWorkflowEvent(
-                        queued,
-                        { type: "start_execution" },
-                        `agy-start-${taskId}-${generation}`,
-                        taskId,
-                        ledger,
-                      );
-                      if (started._tag !== "Applied" || started.state.phase !== "executing") {
-                        return started;
-                      }
+                      const opened = yield* openAdvisoryRun(queued, projectId, ledger, queued);
+                      if (opened._tag !== "Running") return opened;
                       const watched = !antigravitySupports("report_status")
                         ? null
-                        : opened.status === "settled"
-                          ? { status: "settled" as const, execution: opened.execution }
+                        : opened.opened.status === "settled"
+                          ? { status: "settled" as const, execution: opened.opened.execution }
                           : yield* reviews.watch(taskId);
                       if (watched === null || watched.status === "running") {
-                        launchedRun = opened.runId;
-                        return started;
+                        launchedRun = opened.opened.runId;
+                        return opened.started;
                       }
                       return yield* settleAdvisory(
-                        started.state,
-                        started.ledger,
+                        opened.started.state,
+                        opened.started.ledger,
                         watched.execution,
                         {
                           taskId,
@@ -1040,34 +1107,15 @@ export const layer = Layer.unwrap(
                             ledger,
                           );
                         }
-                        const typed = stringField(body, "model")?.trim() ?? "";
-                        const requested =
-                          typed.length > 0
-                            ? typed
-                            : (queued.assignment.advisoryModel?.model ?? undefined);
-                        const opened = yield* reviews.start({
-                          projectId,
-                          taskId,
-                          generation: queued.nextGeneration,
-                          intake: queued.intake,
-                          context: queued.assignment.contextPackage,
-                          requestedModel: requested,
-                        });
-                        if (opened.status === "unavailable") {
-                          return rejectedMove(opened.detail, waiting, ledger);
-                        }
-                        const started = yield* applyBoardWorkflowEvent(
+                        const opened = yield* openAdvisoryRun(
                           queued,
-                          { type: "start_execution" },
-                          `agy-start-${taskId}-${queued.nextGeneration}`,
-                          taskId,
+                          projectId,
                           resolved.ledger,
+                          waiting,
                         );
-                        if (started._tag !== "Applied" || started.state.phase !== "executing") {
-                          return started;
-                        }
-                        launchedRun = opened.runId;
-                        return started;
+                        if (opened._tag !== "Running") return opened;
+                        launchedRun = opened.opened.runId;
+                        return opened.started;
                       }
                       const threadId = card.threadId;
                       const runId = card.runId ?? null;
@@ -1289,7 +1337,9 @@ export const layer = Layer.unwrap(
     );
     const followExecuting = Effect.gen(function* () {
       const open = cardsNow().filter(
-        (card) => card.state.phase === "executing" && card.threadId !== null,
+        (card) =>
+          card.threadId !== null &&
+          (card.state.phase === "executing" || card.state.phase === "awaiting_qa"),
       );
       for (const card of open) {
         yield* writes.withPermits(1)(
@@ -1297,8 +1347,8 @@ export const layer = Layer.unwrap(
             const fresh = cardsNow().find((item) => item.taskId === card.taskId);
             if (
               fresh === undefined ||
-              fresh.state.phase !== "executing" ||
-              fresh.threadId === null
+              fresh.threadId === null ||
+              (fresh.state.phase !== "executing" && fresh.state.phase !== "awaiting_qa")
             ) {
               return;
             }

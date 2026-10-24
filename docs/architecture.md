@@ -90,7 +90,7 @@ Workers run in isolated workspaces and worktrees. Agent-to-agent exchanges are t
 
 Code, including infrastructure-as-code, adapters, and ai_os itself, follows implement, verify, correct, reverify, accept.
 
-QA runs on a different base model from the implementer's actual runtime model. It receives the requirements and the actual artifacts, and it runs the checks. If the implementer's actual model or the reviewer's actual model is unknown, QA cannot accept the work. A finding is a defect, the evidence, and the expected behavior. Acceptance binds to the exact final revision. A later change reruns the affected checks. Unavailable QA is a visible wait. There is no bypass. Which adapter ran the task does not decide whether QA is required.
+QA runs on a different base model from the implementer's actual runtime model. It receives the requirements and the actual artifacts, and it runs the checks. If the implementer's actual model or the reviewer's actual model is unknown, QA cannot accept the work. While a card is awaiting QA, the board starts the reviewer on Astra and records the model that reviewer's provider session reports. The model Astra was asked to use is not the actual when the session has not reported one. A finding is a defect, the evidence, and the expected behavior. Acceptance binds to the exact final revision. A later change reruns the affected checks. Unavailable QA is a visible wait. There is no bypass. Which adapter ran the task does not decide whether QA is required.
 
 Evidence is diffs, commits, tests, browser checks, previews, deployment identities, and readbacks. A completion claim does not establish that the work happened. Agreement between models is not sufficient. Non-code deliverables get the verification that fits them.
 
@@ -200,7 +200,7 @@ Reliability rules:
 - Idempotent operations.
 - Live authorization checks.
 - Bounded retries.
-- `recovery_pending`: an expired lease or a lost advisory process stays Blocked, labeled "Execution status unknown", until the earlier process is confirmed stopped. Advisory work is read-only, and that does not make a retry safe: it still uses resources and can produce duplicate or late results. Late results from the old attempt are rejected. It never returns to Ready on its own. The exception is an advisory restart: after that process is confirmed stopped, In Progress leaves Blocked and starts a new attempt. While the process might still be running, the card stays Blocked.
+- `recovery_pending`: an expired lease or a lost advisory process stays Blocked, labeled "Execution status unknown", until the earlier process is confirmed stopped. Advisory work is read-only, and that does not make a retry safe: it still uses resources and can produce duplicate or late results. Late results from the old attempt are rejected. It never returns to Ready on its own. The exception is an advisory restart: after that process is confirmed stopped, In Progress leaves Blocked and starts a new attempt. While the process might still be running, the card stays Blocked. A review marker with no pid that was written before this server started is stopped. A pid is signaled only when its boot id and start time still match the marker, so a reused pid is left alone. The marker is removed when the review finishes.
 
 A maintainer agent handles platform health, with independent QA and an external recovery path for when the maintainer itself is down. Operations cover backups, restore, updates, diagnostics, and docs.
 

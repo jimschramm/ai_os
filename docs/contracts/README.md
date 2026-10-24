@@ -10,19 +10,19 @@ The package is `@t3tools/ai-os-contracts` (`packages/ai-os-contracts`). Schemas 
 
 Request, assignment, execution, independent QA, rework, accepted result. Progress, usage, control, and delivery extend that sequence. Shared memory is a separate graph.
 
-| Phase            | Kanban  | Legal events                                                                                                                                  |
-| ---------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| idle             |         | intake                                                                                                                                        |
-| requested        |         | acknowledge                                                                                                                                   |
-| acknowledged     | Ready   | assign                                                                                                                                        |
-| assigned         | Ready   | start_execution, cancel, transfer_ownership                                                                                                   |
-| executing        | Running | submit_completion, lease_expired, report_progress, heartbeat, heartbeat_lapsed, report_usage, cancel, fail, operator_fail, transfer_ownership |
-| awaiting_qa      | Review  | qa, cancel                                                                                                                                    |
-| rework           | Ready   | start_execution, cancel                                                                                                                       |
-| accepted         | Done    | start_execution, deliver                                                                                                                      |
-| recovery_pending | Blocked | resolve_recovery                                                                                                                              |
-| failed           |         | retry                                                                                                                                         |
-| cancelled        |         | continue                                                                                                                                      |
+| Phase            | Kanban  | Legal events                                                                                                                                                         |
+| ---------------- | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| idle             |         | intake                                                                                                                                                               |
+| requested        |         | acknowledge                                                                                                                                                          |
+| acknowledged     | Ready   | assign                                                                                                                                                               |
+| assigned         | Ready   | start_execution, cancel, transfer_ownership                                                                                                                          |
+| executing        | Running | submit_completion, lease_expired, report_progress, heartbeat, heartbeat_lapsed, report_usage, record_runtime_models, cancel, fail, operator_fail, transfer_ownership |
+| awaiting_qa      | Review  | qa, cancel, record_runtime_models                                                                                                                                    |
+| rework           | Ready   | start_execution, cancel                                                                                                                                              |
+| accepted         | Done    | start_execution, deliver                                                                                                                                             |
+| recovery_pending | Blocked | resolve_recovery                                                                                                                                                     |
+| failed           |         | retry                                                                                                                                                                |
+| cancelled        |         | continue                                                                                                                                                             |
 
 `requested` is the durable receipt of the intake. It is not confirmed, and it is not on the board yet. Acknowledge is the confirmation, and it carries the task link. A later `start_execution` from `accepted` drops the previous acceptance, so a new revision has to be submitted and reviewed again. `failed` and `cancelled` are off the board.
 
@@ -55,6 +55,8 @@ An open attempt has a generation and a lease id minted for that generation (`lea
 | `verdict: accept`           | Moves to `accepted`. `acceptedRevision` must equal `artifactRevision`, and that revision must be the one in the completion submission. |
 
 QA compares the implementer's actual base model with the reviewer's actual base model. Both come from runtime metadata, not from the assignment and not from a usage measurement. If either actual is unknown, the verdict is `qa_model_unknown` and the work cannot be accepted. Nothing is substituted. A model is `{ provider?, model }`. Provider is attribution (`openai/gpt-5.4` and `azure/gpt-5.4` are the same model, and so is a bare `gpt-5.4`). The schema check compares the two model names on the verdict. The transition compares the runtime actuals. It rejects the same base (`qa_same_model`) and a payload that names a different model than the runtime (`implementer_mismatch`). Acceptance compares canonical revisions, so a full git id matches regardless of case. An unavailable verdict cannot also carry an acceptance. There is no event that skips QA.
+
+The comparison runs when `qa` is applied. A stored `rework` or `accepted` card still decodes when `implementerRuntime` or `reviewerRuntime` is absent. Those fields were added after cards were already saved, and loading one does not apply the rule again. A new verdict against an unknown actual is still `qa_model_unknown`.
 
 ## Progress
 
