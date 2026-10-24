@@ -115,10 +115,86 @@ it.effect("flags a missing write and an open conflict for the agent that made th
     assert.strictEqual(conflict?.authorId, "agent-b");
     assert.strictEqual(conflict?.acceptedFactId, "fact-accepted");
     assert.strictEqual(conflict?.proposedFactId, "fact-agent-b");
+    assert.equal(conflict?.summary.includes("conflicts with accepted memory"), true);
+    assert.equal(conflict?.summary.includes("Saturday games start at 7:00."), true);
+    assert.equal(conflict?.summary.includes("Saturday games start at 8:30."), true);
     assert.strictEqual(
       notices.some((notice) => notice.attemptId === "attempt-b" && notice.kind === "missing_write"),
       false,
     );
+  }),
+);
+
+it.effect("names a conflict between two proposals as a proposal", () =>
+  Effect.gen(function* () {
+    const first = yield* applySubmission(
+      initialMemoryLedger,
+      {
+        version: "v1",
+        submissionId: "submission-a",
+        idempotencyKey: "key-a",
+        projectId: "usba",
+        authorId: "agent-a",
+        taskId: "task-page",
+        attemptId: "attempt-a",
+        evidence: [{ evidenceId: "evidence-a", note: "Agent A read the schedule." }],
+        expectedVersions: [],
+        intent: "propose",
+        facts: [
+          {
+            identity: "tournament-start",
+            fact: {
+              acceptance: "proposed",
+              factId: "fact-a",
+              projectId: "usba",
+              kind: "Decision",
+              body: "Saturday games start at 7:00.",
+              provenance: { actorId: "agent-a", at },
+              validity: { from: at, until: null },
+            },
+          },
+        ],
+        relationships: [],
+      },
+      authority,
+    );
+    const second = yield* applySubmission(
+      first.ledger,
+      {
+        version: "v1",
+        submissionId: "submission-b",
+        idempotencyKey: "key-b",
+        projectId: "usba",
+        authorId: "agent-b",
+        taskId: "task-page",
+        attemptId: "attempt-b",
+        evidence: [{ evidenceId: "evidence-b", note: "Agent B read a later note." }],
+        expectedVersions: [],
+        intent: "propose",
+        facts: [
+          {
+            identity: "tournament-start",
+            fact: {
+              acceptance: "proposed",
+              factId: "fact-b",
+              projectId: "usba",
+              kind: "Decision",
+              body: "Saturday games start at 8:30.",
+              provenance: { actorId: "agent-b", at },
+              validity: { from: at, until: null },
+            },
+          },
+        ],
+        relationships: [],
+      },
+      authority,
+    );
+    assert.strictEqual(second.receipt.outcome, "conflict");
+    const notices = reviewSteward(second.ledger, []);
+    const conflict = notices.find((notice) => notice.kind === "open_conflict");
+    assert.equal(conflict?.summary.includes("conflicts with a proposal"), true);
+    assert.equal(conflict?.summary.includes("accepted memory"), false);
+    assert.strictEqual(notices.filter((notice) => notice.kind === "open_conflict").length, 1);
   }),
 );
 

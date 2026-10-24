@@ -43,6 +43,30 @@ const clip = (value: string): string => {
 const factBody = (facts: readonly MemoryFactV1[], factId: string): string =>
   facts.find((fact) => fact.factId === factId)?.body ?? factId;
 
+const factAcceptance = (facts: readonly MemoryFactV1[], factId: string): string | undefined =>
+  facts.find((fact) => fact.factId === factId)?.acceptance;
+
+/**
+ * The side named acceptedFactId is the earlier statement. It is accepted
+ * knowledge only when that fact was accepted. Two proposals are not that.
+ */
+const conflictSummary = (
+  authorId: string,
+  facts: readonly MemoryFactV1[],
+  acceptedFactId: string,
+  proposedFactId: string,
+): string => {
+  const accepted = clip(factBody(facts, acceptedFactId));
+  const proposed = clip(factBody(facts, proposedFactId));
+  const left = factAcceptance(facts, acceptedFactId);
+  const right = factAcceptance(facts, proposedFactId);
+  const relation =
+    left === "accepted" || right === "accepted"
+      ? "conflicts with accepted memory"
+      : "conflicts with a proposal";
+  return clip(`${authorId} ${relation}: ${accepted} / ${proposed}`);
+};
+
 /**
  * Open conflicts, and ended attempts that read memory without writing.
  * `inFlightAttemptIds` is the card's active assignment. A running attempt has
@@ -75,12 +99,17 @@ export const reviewSteward = (
       }),
     );
   }
+  const seenConflicts = new Set<string>();
   for (const conflict of ledger.conflicts) {
-    if (conflict.resolvedBySubmissionId !== null) continue;
-    const accepted = clip(factBody(ledger.graph.facts, conflict.acceptedFactId));
-    const proposed = clip(factBody(ledger.graph.facts, conflict.proposedFactId));
-    const summary = clip(
-      `${conflict.authorId} conflicts with accepted memory: ${accepted} / ${proposed}`,
+    if (conflict.resolvedBySubmissionId !== null || seenConflicts.has(conflict.conflictId)) {
+      continue;
+    }
+    seenConflicts.add(conflict.conflictId);
+    const summary = conflictSummary(
+      conflict.authorId,
+      ledger.graph.facts,
+      conflict.acceptedFactId,
+      conflict.proposedFactId,
     );
     notices.push(
       decodeStewardNoticeV1({

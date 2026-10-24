@@ -2,7 +2,7 @@ import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 
-import { packageFacts } from "./memory.ts";
+import { packageFacts, packageProposals } from "./memory.ts";
 import {
   applySubmission,
   initialMemoryLedger,
@@ -217,6 +217,11 @@ it.effect("accepts a new version from the authority and resolves the open confli
       corrected.ledger.conflicts[0]?.resolvedBySubmissionId,
       "submission-correction",
     );
+    assert.strictEqual(
+      corrected.ledger.graph.facts.find((fact) => fact.factId === "fact-agent")?.acceptance,
+      "superseded",
+    );
+    assert.deepStrictEqual(packageProposals(corrected.ledger.graph, "usba", at), []);
     const stale = yield* applySubmission(
       corrected.ledger,
       proposal("late", "Saturday games start at 6:00.", {
@@ -291,6 +296,11 @@ it.effect("keeps the accepted statement when the authority resolves the conflict
     assert.deepStrictEqual(kept.receipt.factIds, ["fact-accepted"]);
     assert.strictEqual(kept.ledger.conflicts[0]?.resolvedBySubmissionId, "submission-keep");
     assert.strictEqual(
+      kept.ledger.graph.facts.find((fact) => fact.factId === "fact-agent")?.acceptance,
+      "superseded",
+    );
+    assert.deepStrictEqual(packageProposals(kept.ledger.graph, "usba", at), []);
+    assert.strictEqual(
       kept.ledger.graph.facts.find((fact) => fact.factId === "fact-keep"),
       undefined,
     );
@@ -324,6 +334,75 @@ it.effect("keeps the accepted statement when the authority resolves the conflict
     assert.strictEqual(repeat.receipt.outcome, "rejected");
     assert.strictEqual(repeat.receipt.detail, "That statement is already accepted.");
     assert.strictEqual(repeat.ledger.receipts.length, first.ledger.receipts.length);
+  }),
+);
+
+it.effect("supersedes both proposals when the authority resolves their conflict", () =>
+  Effect.gen(function* () {
+    const left = yield* applySubmission(
+      initialMemoryLedger,
+      proposal("left", "Saturday games start at 7:00.", { attemptId: "attempt-left" }),
+      authority,
+    );
+    const right = yield* applySubmission(
+      left.ledger,
+      proposal("right", "Saturday games start at 8:30.", {
+        attemptId: "attempt-right",
+        authorId: "agent-b",
+        facts: [
+          {
+            identity: "tournament-start",
+            fact: {
+              acceptance: "proposed",
+              factId: "fact-right",
+              projectId: "usba",
+              kind: "Decision",
+              body: "Saturday games start at 8:30.",
+              provenance: { actorId: "agent-b", at },
+              validity: { from: at, until: null },
+            },
+          },
+        ],
+      }),
+      authority,
+    );
+    assert.strictEqual(right.receipt.outcome, "conflict");
+    const resolved = yield* applySubmission(
+      right.ledger,
+      proposal("resolved", "Saturday games start at 7:30.", {
+        authorId: authority,
+        intent: "accept",
+        facts: [
+          {
+            identity: "tournament-start",
+            fact: {
+              acceptance: "proposed",
+              factId: "fact-resolved",
+              projectId: "usba",
+              kind: "Decision",
+              body: "Saturday games start at 7:30.",
+              provenance: { actorId: authority, at },
+              validity: { from: at, until: null },
+            },
+          },
+        ],
+      }),
+      authority,
+    );
+    assert.strictEqual(resolved.receipt.outcome, "accepted");
+    assert.strictEqual(
+      resolved.ledger.graph.facts.find((fact) => fact.factId === "fact-left")?.acceptance,
+      "superseded",
+    );
+    assert.strictEqual(
+      resolved.ledger.graph.facts.find((fact) => fact.factId === "fact-right")?.acceptance,
+      "superseded",
+    );
+    assert.deepStrictEqual(
+      packageFacts(resolved.ledger.graph, "usba", at).map((fact) => fact.factId),
+      ["fact-resolved"],
+    );
+    assert.deepStrictEqual(packageProposals(resolved.ledger.graph, "usba", at), []);
   }),
 );
 

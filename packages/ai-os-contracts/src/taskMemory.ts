@@ -2,7 +2,7 @@ import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 
 import {
-  type ContextPackageSnapshotV1,
+  ContextPackageSnapshotV1,
   declaredTaskType,
   decodeContextPackageSnapshotV1,
   freezeSnapshot,
@@ -34,7 +34,7 @@ import {
 export const TaskRuntimeV1 = Schema.Literals(["codex", "cursor", "antigravity"]);
 export type TaskRuntimeV1 = typeof TaskRuntimeV1.Type;
 
-export const TaskMemoryRequestV1 = Schema.Struct({
+const requestFields = {
   projectId: ContractId,
   taskId: ContractId,
   attemptId: ContractId,
@@ -44,8 +44,27 @@ export const TaskMemoryRequestV1 = Schema.Struct({
   requirements: ContractText,
   authorizationScope: ContractText,
   createdAt: IsoDateTime,
-});
+};
+
+export const TaskMemoryRequestV1 = Schema.Struct(requestFields);
 export type TaskMemoryRequestV1 = typeof TaskMemoryRequestV1.Type;
+
+/** Stored after the launch that carried this package is accepted. */
+export const TaskMemoryCommitV1 = Schema.Struct({
+  ...requestFields,
+  writeToken: ContractId,
+  digest: ContractId,
+});
+export type TaskMemoryCommitV1 = typeof TaskMemoryCommitV1.Type;
+
+/** Lines and context a launch path appends. Nothing is stored until commit. */
+export const TaskMemorySupplyV1 = Schema.Struct({
+  lines: Schema.NonEmptyArray(ContractText),
+  writeToken: ContractId,
+  digest: ContractId,
+  contextPackage: ContextPackageSnapshotV1,
+});
+export type TaskMemorySupplyV1 = typeof TaskMemorySupplyV1.Type;
 
 export const OrientationLineV1 = Schema.Struct({
   factId: ContractId,
@@ -283,6 +302,16 @@ export const taskWritePrompt = (
   "This attempt has one write. A stale or contradictory proposal is kept as a conflict for the Memory Steward.",
 ];
 
+/** Orientation plus the write instructions. Every launch path appends this list. */
+export const launchMemoryLines = (
+  memoryPackage: TaskMemoryPackageV1,
+  writePath: string,
+  writeToken: string,
+): readonly string[] => [
+  ...orientationText(memoryPackage),
+  ...taskWritePrompt(memoryPackage, writePath, writeToken),
+];
+
 export interface PreparedTaskMemory {
   readonly package: TaskMemoryPackageV1;
   readonly receipt: ReadReceiptV1;
@@ -497,6 +526,8 @@ export const taskWriteSubmission = (
   });
 
 export const decodeTaskMemoryPackageV1 = decodePackage;
+export const decodeTaskMemorySupplyV1 = Schema.decodeUnknownEffect(TaskMemorySupplyV1, strictParse);
+export const decodeTaskMemoryCommitV1 = Schema.decodeUnknownEffect(TaskMemoryCommitV1, strictParse);
 export const decodeReadReceiptV1 = decodeReceipt;
 export const decodeAttemptMemoryActivityV1 = Schema.decodeUnknownEffect(
   AttemptMemoryActivityV1,

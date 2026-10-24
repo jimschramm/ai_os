@@ -7,7 +7,9 @@ import {
   decodeAttemptMemoryActivityV1,
   decodeContextPackageSnapshotV1,
   decodeReadReceiptV1,
+  decodeTaskMemoryCommitV1,
   decodeTaskMemoryPackageV1,
+  launchMemoryLines,
   prepareTaskMemory,
   taskWriteSubmission,
   type AttemptMemoryActivityV1,
@@ -170,6 +172,52 @@ export const commitTaskReadSync = (
     if (isContractTransitionError(error)) throw error;
     throw invalid("The memory database could not record the read receipt.");
   }
+};
+
+/**
+ * The package and write lines for a launch. The token is not stored.
+ * A later commit stores the token the launch actually sent.
+ */
+export const supplyLaunchReadSync = (
+  database: NodeSqlite.DatabaseSync,
+  request: unknown,
+  writePath: string,
+): {
+  readonly lines: readonly string[];
+  readonly writeToken: string;
+  readonly digest: string;
+  readonly contextPackage: PreparedTaskMemory["contextPackage"];
+} => {
+  const prepared = prepareTaskMemorySync(database, request);
+  const writeToken = attemptWriteTokenSync(database, prepared.receipt.attemptId);
+  return {
+    lines: launchMemoryLines(prepared.package, writePath, writeToken),
+    writeToken,
+    digest: prepared.package.digest,
+    contextPackage: prepared.contextPackage,
+  };
+};
+
+/** Store the read for the package that was placed in an accepted launch. */
+export const commitLaunchReadSync = (
+  database: NodeSqlite.DatabaseSync,
+  body: unknown,
+): PreparedTaskMemory => {
+  const decoded = Effect.runSync(
+    decodeTaskMemoryCommitV1(body).pipe(
+      Effect.mapError(() => invalid("The memory commit does not match the schema.")),
+    ),
+  );
+  const { writeToken, digest, ...request } = decoded;
+  const prepared = prepareTaskMemorySync(database, request);
+  if (prepared.package.digest !== digest) {
+    throw invalid("The memory package changed before the read was stored.");
+  }
+  const stored = storedWriteToken(database, prepared.receipt.attemptId);
+  if (stored !== null && stored !== writeToken) {
+    throw invalid("This write token belongs to a different attempt.");
+  }
+  return commitTaskReadSync(database, prepared, writeToken);
 };
 
 /** Prepare and commit. Callers that launch must commit only after the prompt includes the package. */

@@ -12,7 +12,9 @@ import {
   ADAPTER_BOARD_EVENTS_PATH,
   ADAPTER_BOARD_MOVE_PATH,
   ADAPTER_BOARD_PATH,
+  ADAPTER_MEMORY_COMMIT_PATH,
   ADAPTER_MEMORY_RESOLVE_PATH,
+  ADAPTER_MEMORY_SUPPLY_PATH,
   ADAPTER_MEMORY_WRITE_PATH,
   decodeAdapterBoard,
   encodeAdapterBoard,
@@ -2541,6 +2543,7 @@ describe("ai-os board route", () => {
     const notice = before?.steward?.find((item) => item.kind === "open_conflict");
     if (notice?.conflictId == null) throw new Error("expected an open steward conflict");
     expect(notice.authorId).toBe("agent-b");
+    expect(notice.summary).toContain("conflicts with accepted memory");
     expect(
       before?.attempts?.some(
         (item) => item.attemptId === "attempt-b" && item.write?.outcome === "conflict",
@@ -2574,6 +2577,11 @@ describe("ai-os board route", () => {
         (fact) => fact.body === "Saturday games start at 7:30." && fact.acceptance === "accepted",
       ),
     ).toBe(true);
+    expect(after?.memoryFacts?.find((fact) => fact.provenance.actorId === "agent-b")).toMatchObject(
+      {
+        acceptance: "superseded",
+      },
+    );
 
     const moved = await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
       taskId: "task-demo",
@@ -2770,8 +2778,17 @@ describe("ai-os board route", () => {
     expect(proposed.status).toBe(200);
     expect(await proposed.json()).toMatchObject({ _tag: "Applied", outcome: "conflict" });
 
-    const visible = (await readCards(handler)).find((card) => card.taskId === "task-next");
-    const notice = visible?.steward?.find((item) => item.kind === "open_conflict");
+    const visibleCards = await readCards(handler);
+    const visible = visibleCards.find((card) => card.taskId === "task-next");
+    const openConflictNotices = visibleCards
+      .flatMap((card) => card.steward ?? [])
+      .filter((item) => item.kind === "open_conflict");
+    expect(openConflictNotices).toHaveLength(1);
+    const notice = openConflictNotices[0];
+    expect(notice?.taskId).toBe("task-next");
+    expect(visible?.steward?.filter((item) => item.kind === "open_conflict")).toHaveLength(1);
+    expect(notice?.summary).toContain("conflicts with a proposal");
+    expect(notice?.summary).not.toContain("accepted memory");
     expect(notice?.authorId).toBe("agent-b");
     expect(notice?.acceptedFactId).toBe(proposedFact?.factId);
     expect(notice?.proposedFactId).toBe("fact-attempt-2-tournament-start");
@@ -2904,9 +2921,12 @@ describe("ai-os board route", () => {
     expect(
       settled?.memoryFacts?.find((item) => item.factId === proposedFact?.factId),
     ).toMatchObject({
-      acceptance: "proposed",
+      acceptance: "superseded",
       provenance: { actorId: "t3-codex" },
     });
+    expect(
+      settled?.memoryFacts?.find((item) => item.factId === "fact-attempt-2-tournament-start"),
+    ).toMatchObject({ acceptance: "superseded" });
 
     expect(
       (
@@ -2965,5 +2985,120 @@ describe("ai-os board route", () => {
     expect(
       later?.attempts?.find((item) => item.attemptId === "attempt-3")?.read.memoryVersions,
     ).toEqual(expect.arrayContaining([...applied.factIds]));
+  });
+
+  it("supplies the launch memory package and stores the read only after commit", async () => {
+    const decision = "Saturday games start at 7:00.";
+    const prompts: string[] = [];
+    const { handler, stateDir } = handlerFor(undefined, {
+      ...allowRuns,
+      launch: (input) => {
+        prompts.push(input.prompt);
+        return Effect.succeed(activeLaunch());
+      },
+    });
+    const database = openMemoryDatabase(NodePath.join(stateDir, "memory.db"));
+    submitMemorySync(
+      database,
+      {
+        version: "v1",
+        submissionId: "submission-start",
+        idempotencyKey: "key-start",
+        projectId: "usba",
+        authorId: "jim",
+        taskId: "task-seed",
+        attemptId: "attempt-seed",
+        evidence: [{ evidenceId: "evidence-start", note: "The schedule file says so." }],
+        expectedVersions: [],
+        intent: "accept",
+        facts: [
+          {
+            identity: "tournament-start",
+            fact: {
+              acceptance: "proposed",
+              factId: "fact-start",
+              projectId: "usba",
+              kind: "Decision",
+              body: decision,
+              provenance: { actorId: "jim", at: "2026-10-24T06:00:00Z" },
+              validity: { from: "2026-10-24T06:00:00Z", until: null },
+            },
+          },
+        ],
+        relationships: [],
+      },
+      "jim",
+    );
+    database.close();
+
+    const request = {
+      projectId: "usba",
+      taskId: "task-live",
+      attemptId: "attempt-live",
+      authorId: "codex-t3",
+      runtime: "codex",
+      repoCommit: exampleRepoCommit,
+      requirements: "The tournament page shows the new schedule.",
+      authorizationScope: "usba-web",
+      createdAt: "2026-10-24T06:00:00Z",
+    };
+    const supplied = await postJson(handler, ADAPTER_MEMORY_SUPPLY_PATH, request);
+    expect(supplied.status).toBe(200);
+    const body = (await supplied.json()) as {
+      readonly lines: readonly string[];
+      readonly writeToken: string;
+      readonly digest: string;
+    };
+    expect(body.lines.join("\n")).toContain(decision);
+    expect(body.lines.join("\n")).toContain(ADAPTER_MEMORY_WRITE_PATH);
+    expect(body.lines.join("\n")).toContain(`Memory write token: ${body.writeToken}`);
+    expect(body.lines.join("\n")).toContain("This attempt has one write");
+    expect(body.lines.join("\n")).toContain("attempt-live");
+
+    const before = openMemoryDatabase(NodePath.join(stateDir, "memory.db"));
+    expect(readAttemptActivitySync(before).some((item) => item.attemptId === "attempt-live")).toBe(
+      false,
+    );
+    before.close();
+
+    const wrong = await postJson(handler, ADAPTER_MEMORY_COMMIT_PATH, {
+      ...request,
+      writeToken: body.writeToken,
+      digest: "b".repeat(32),
+    });
+    expect(wrong.status).toBe(409);
+
+    const committed = await postJson(handler, ADAPTER_MEMORY_COMMIT_PATH, {
+      ...request,
+      writeToken: body.writeToken,
+      digest: body.digest,
+    });
+    expect(committed.status).toBe(200);
+    const saved = openMemoryDatabase(NodePath.join(stateDir, "memory.db"));
+    expect(readAttemptActivitySync(saved).some((item) => item.attemptId === "attempt-live")).toBe(
+      true,
+    );
+    saved.close();
+
+    const otherToken = `wt-${"cd".repeat(16)}`;
+    const mismatched = await postJson(handler, ADAPTER_MEMORY_COMMIT_PATH, {
+      ...request,
+      writeToken: otherToken,
+      digest: body.digest,
+    });
+    expect(mismatched.status).toBe(409);
+
+    await reachAssigned(handler);
+    const moved = await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
+      taskId: "task-demo",
+      column: "Running",
+      idempotencyKey: "launch-supplied",
+    });
+    expect(moved.status).toBe(200);
+    expect(prompts).toHaveLength(1);
+    expect(prompts[0]).toContain(decision);
+    expect(prompts[0]).toContain(ADAPTER_MEMORY_WRITE_PATH);
+    expect(prompts[0]).toContain("This attempt has one write");
+    expect(prompts[0]).toContain("Memory write token:");
   });
 });

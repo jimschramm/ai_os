@@ -1,6 +1,13 @@
 import * as NodeHttpClient from "@effect/platform-node/NodeHttpClient";
 import * as NodeSocket from "@effect/platform-node/NodeSocket";
-import { ContextPackageSnapshotV1, type SequenceEvent } from "@t3tools/ai-os-contracts";
+import {
+  ContextPackageSnapshotV1,
+  decodeTaskMemorySupplyV1,
+  type SequenceEvent,
+  type TaskMemoryCommitV1,
+  type TaskMemoryRequestV1,
+  type TaskMemorySupplyV1,
+} from "@t3tools/ai-os-contracts";
 import {
   AuthAccessTokenResult,
   AuthAccessTokenType,
@@ -38,6 +45,8 @@ import { RpcClientError } from "effect/rpc/RpcClientError";
 import {
   ADAPTER_BOARD_EVENT_PATH,
   ADAPTER_BOARD_PATH,
+  ADAPTER_MEMORY_COMMIT_PATH,
+  ADAPTER_MEMORY_SUPPLY_PATH,
   decodeAdapterBoard,
   type AdapterBoardCard,
 } from "./board.ts";
@@ -97,6 +106,8 @@ const WebSocketTicketJson = Schema.toCodecJson(AuthWebSocketTicketResult);
 const decodeWebSocketTicket = Schema.decodeUnknownEffect(
   Schema.fromJsonString(WebSocketTicketJson),
 );
+const encodeUnknownJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
+const decodeUnknownJson = Schema.decodeEffect(Schema.fromJsonString(Schema.Unknown));
 
 export interface T3LaunchRequest {
   readonly idempotencyKey: string;
@@ -189,6 +200,12 @@ export interface T3LocalClient {
   readonly readBoard: () => Effect.Effect<readonly AdapterBoardCard[], GrokT3Error>;
   readonly listProjectIds: () => Effect.Effect<readonly T3ProjectSummary[], GrokT3Error>;
   readonly listProviderModels: () => Effect.Effect<T3ModelCatalog, GrokT3Error>;
+  /** The memory package and write instructions the board launch appends. */
+  readonly supplyMemory: (
+    request: TaskMemoryRequestV1,
+  ) => Effect.Effect<TaskMemorySupplyV1, GrokT3Error>;
+  /** Store the read after the launch that carried this package is accepted. */
+  readonly commitMemory: (request: TaskMemoryCommitV1) => Effect.Effect<void, GrokT3Error>;
 }
 
 const unavailable = (detail: string) => new GrokT3Error({ reason: "t3_unavailable", detail });
@@ -693,6 +710,67 @@ export const wsT3LocalClient = (options: T3ClientOptions): T3LocalClient => {
       }
       return catalog;
     });
+  const refusedDetail = (text: string, action: string, status: number) =>
+    decodeUnknownJson(text).pipe(
+      Effect.map((parsed) => {
+        if (
+          typeof parsed === "object" &&
+          parsed !== null &&
+          "detail" in parsed &&
+          typeof parsed.detail === "string" &&
+          parsed.detail.length > 0
+        ) {
+          return parsed.detail;
+        }
+        return statusError(status, action).message;
+      }),
+      Effect.orElseSucceed(() => statusError(status, action).message),
+    );
+  const postMemory = (path: string, body: unknown, action: string) =>
+    http(
+      Effect.gen(function* () {
+        const response = yield* responseFor(() =>
+          HttpClientRequest.post(`${origin}${path}`).pipe(
+            HttpClientRequest.bodyText(
+              encodeUnknownJson(body),
+              "application/json",
+            ),
+          ),
+        );
+        const text = yield* response.text;
+        if (response.status >= 400) {
+          return yield* new GrokT3Error({
+            reason: response.status === 401 ? "unauthenticated" : "t3_rejected",
+            detail: yield* refusedDetail(text, action, response.status),
+          });
+        }
+        return text;
+      }),
+    );
+  const supplyMemory = (request: TaskMemoryRequestV1) =>
+    Effect.gen(function* () {
+      const text = yield* postMemory(ADAPTER_MEMORY_SUPPLY_PATH, request, "supply task memory");
+      const parsed = yield* decodeUnknownJson(text).pipe(
+        Effect.mapError(
+          () =>
+            new GrokT3Error({
+              reason: "t3_rejected",
+              detail: "T3 returned an unreadable memory package.",
+            }),
+        ),
+      );
+      return yield* decodeTaskMemorySupplyV1(parsed).pipe(
+        Effect.mapError(
+          () =>
+            new GrokT3Error({
+              reason: "t3_rejected",
+              detail: "T3 returned an unreadable memory package.",
+            }),
+        ),
+      );
+    });
+  const commitMemory = (request: TaskMemoryCommitV1) =>
+    postMemory(ADAPTER_MEMORY_COMMIT_PATH, request, "store the memory read").pipe(Effect.asVoid);
   return {
     launch,
     read,
@@ -703,5 +781,7 @@ export const wsT3LocalClient = (options: T3ClientOptions): T3LocalClient => {
     readBoard,
     listProjectIds,
     listProviderModels,
+    supplyMemory,
+    commitMemory,
   };
 };

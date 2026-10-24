@@ -1,9 +1,17 @@
+import { runtimeForAssignment } from "@t3tools/ai-os-contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 
+import { ADAPTER_MEMORY_WRITE_PATH } from "./board.ts";
 import { GrokT3Error } from "./errors.ts";
-import { clearAdapterBoard, createGrokT3Adapter, type AttemptSession } from "./grokT3.ts";
+import {
+  clearAdapterBoard,
+  createGrokT3Adapter,
+  GROK_T3_WORKER_ID,
+  recordedAttemptId,
+  type AttemptSession,
+} from "./grokT3.ts";
 import {
   T3_LAUNCH_DEFAULTS,
   wsT3LocalClient,
@@ -241,7 +249,8 @@ export const liveTaskId = (title: string, stamp: string): string => {
     .replace(/[-:]/g, "")
     .replace(/\.\d+Z$/i, "Z")
     .toLowerCase();
-  return `live-${slug.length > 0 ? slug : "task"}-${compact}`.slice(0, 128);
+  // `-attempt-1` is appended for the memory package and must stay a contract id.
+  return `live-${slug.length > 0 ? slug : "task"}-${compact}`.slice(0, 118);
 };
 
 const phaseLabel = (session: AttemptSession): string =>
@@ -311,12 +320,41 @@ export const runLiveDriver = (
     }
     const stamp = deps.clock();
     const taskId = liveTaskId(title, stamp);
+    const attemptId = recordedAttemptId(taskId);
+    const memoryRequest = {
+      projectId: project.id,
+      taskId,
+      attemptId,
+      authorId: GROK_T3_WORKER_ID,
+      runtime: runtimeForAssignment({ instanceId: resolved.instanceId }),
+      repoCommit,
+      requirements: prompt,
+      authorizationScope: project.id,
+      createdAt: stamp,
+    };
+    const supplied = yield* deps.client.supplyMemory(memoryRequest);
+    const armed =
+      supplied.contextPackage.requirements === prompt &&
+      supplied.contextPackage.repoCommit === repoCommit &&
+      supplied.contextPackage.authorizationScope === project.id &&
+      supplied.contextPackage.createdAt === stamp &&
+      supplied.lines.some((line) =>
+        line.startsWith(`Memory write: POST ${ADAPTER_MEMORY_WRITE_PATH}`),
+      ) &&
+      supplied.lines.includes(`Memory write token: ${supplied.writeToken}`);
+    if (!armed) {
+      return yield* new GrokT3Error({
+        reason: "invalid_task",
+        detail: "The launch prompt does not include the memory package.",
+      });
+    }
     clearAdapterBoard();
     const adapter = createGrokT3Adapter({
       client: deps.client,
       clock: deps.clock,
       model: resolved.model,
       instanceId: resolved.instanceId,
+      workerId: GROK_T3_WORKER_ID,
     });
     const recorded = yield* adapter.record({
       taskId,
@@ -331,15 +369,15 @@ export const runLiveDriver = (
         authorization: { kind: "explicit", scope: project.id },
         originatingConversationId: "live-driver",
       },
-      context: {
-        requirements: prompt,
-        memoryVersions: [],
-        repoCommit,
-        authorizationScope: project.id,
-        createdAt: stamp,
-      },
+      context: supplied.contextPackage,
+      orientation: supplied.lines,
     });
     const started = yield* adapter.launch(recorded.taskId);
+    yield* deps.client.commitMemory({
+      ...memoryRequest,
+      writeToken: supplied.writeToken,
+      digest: supplied.digest,
+    });
     deps.write(`task ${started.taskId}`);
     if (started.threadId !== null) deps.write(`thread ${started.threadId}`);
 

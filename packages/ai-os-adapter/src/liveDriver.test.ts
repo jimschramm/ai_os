@@ -25,8 +25,14 @@ import {
 } from "effect/http";
 import * as UrlParams from "effect/http/UrlParams";
 
-import { ADAPTER_BOARD_EVENT_PATH, ADAPTER_BOARD_PATH, decodeAdapterBoard } from "./board.ts";
+import {
+  ADAPTER_BOARD_EVENT_PATH,
+  ADAPTER_BOARD_PATH,
+  ADAPTER_MEMORY_WRITE_PATH,
+  decodeAdapterBoard,
+} from "./board.ts";
 import { acceptBoardEvent, makeAdapterBoardHub } from "./boardHub.ts";
+import { GrokT3Error } from "./errors.ts";
 import {
   LIVE_DRIVER_COMMAND,
   LIVE_DRIVER_DEFAULT_ORIGIN,
@@ -209,6 +215,35 @@ const withServer = <A, E, R>(
   }).pipe(Effect.provide(server.layer));
 };
 
+const MEMORY_TOKEN = `wt-${"ab".repeat(16)}`;
+
+const driverMemory = {
+  supplyMemory: (request: {
+    readonly attemptId: string;
+    readonly projectId: string;
+    readonly requirements: string;
+    readonly repoCommit: string;
+    readonly authorizationScope: string;
+    readonly createdAt: string;
+  }) =>
+    Effect.succeed({
+      lines: [
+        `Memory write: POST ${ADAPTER_MEMORY_WRITE_PATH} for attempt ${request.attemptId} in project ${request.projectId}.`,
+        `Memory write token: ${MEMORY_TOKEN}`,
+      ],
+      writeToken: MEMORY_TOKEN,
+      digest: "a".repeat(32),
+      contextPackage: {
+        requirements: request.requirements,
+        memoryVersions: [],
+        repoCommit: request.repoCommit,
+        authorizationScope: request.authorizationScope,
+        createdAt: request.createdAt,
+      },
+    }),
+  commitMemory: () => Effect.void,
+} satisfies Pick<T3LocalClient, "supplyMemory" | "commitMemory">;
+
 const CATALOG: T3ModelCatalog = {
   providers: [
     {
@@ -348,8 +383,14 @@ it.effect("lists project ids and publishes the launched task to the server board
 
       let launched: T3LaunchRequest | undefined;
       let reads = 0;
+      let commits = 0;
       const real = wsT3LocalClient({ origin, pairingToken: PAIR });
       const client: T3LocalClient = {
+        ...driverMemory,
+        commitMemory: () => {
+          commits += 1;
+          return Effect.void;
+        },
         listProjectIds: real.listProjectIds,
         listProviderModels: () => Effect.succeed(CATALOG),
         publishBoard: real.publishBoard,
@@ -405,6 +446,9 @@ it.effect("lists project ids and publishes the launched task to the server board
       assert.strictEqual(launched?.instanceId, "codex");
       assert.strictEqual(launched?.title, "Tournament page");
       assert.equal(launched?.prompt.includes("Update the tournament page schedule."), true);
+      assert.equal(launched?.prompt.includes(ADAPTER_MEMORY_WRITE_PATH), true);
+      assert.equal(launched?.prompt.includes(`Memory write token: ${MEMORY_TOKEN}`), true);
+      assert.strictEqual(commits, 1);
       assert.deepStrictEqual(progress, [
         "task live-tournament-page-20261021t180000z",
         "thread t3-thread-1",
@@ -459,11 +503,63 @@ it.effect("lists loopback projects without exchanging a pairing token", () =>
   ),
 );
 
+it.effect("does not launch when the memory package is missing", () =>
+  Effect.gen(function* () {
+    let launches = 0;
+    const client: T3LocalClient = {
+      ...driverMemory,
+      supplyMemory: () =>
+        Effect.fail(new GrokT3Error({ reason: "t3_rejected", detail: "Memory was not supplied." })),
+      listProjectIds: () =>
+        Effect.succeed([
+          {
+            id: "usba",
+            title: "USBA",
+            workspaceRoot: "/work/usba",
+            defaultModel: { instanceId: "codex", model: "gpt-5.6-sol" },
+          },
+        ]),
+      listProviderModels: () => Effect.succeed(CATALOG),
+      publishBoard: () => Effect.die("publish is unused"),
+      publishEvent: () => Effect.die("publish is unused"),
+      readBoard: () => Effect.succeed([]),
+      interrupt: () => Effect.die("interrupt is unused"),
+      continueRun: () => Effect.die("continue is unused"),
+      launch: () => {
+        launches += 1;
+        return Effect.succeed({ threadId: "t3-thread-1", runId: "run-1", resumed: false });
+      },
+      read: () => Effect.die("read is unused"),
+    };
+    const failed = yield* runLiveDriver(
+      {
+        origin: LIVE_DRIVER_DEFAULT_ORIGIN,
+        pairingToken: PAIR,
+        projectId: "usba",
+        model: undefined,
+        title: "Tournament page",
+        prompt: "Update the tournament page schedule.",
+        listProjects: false,
+      },
+      {
+        client,
+        clock: () => CLOCK,
+        write: () => undefined,
+        sleep: () => Effect.void,
+        readRepoCommit: () => Promise.resolve(SHA),
+      },
+    ).pipe(Effect.flip);
+    assert.strictEqual(failed.detail, "Memory was not supplied.");
+    assert.strictEqual(launches, 0);
+  }),
+);
+
 it.effect("lists projects and launches in one run", () =>
   Effect.gen(function* () {
     const lines: string[] = [];
     let launches = 0;
     const client: T3LocalClient = {
+      ...driverMemory,
       listProjectIds: () =>
         Effect.succeed([
           {
@@ -529,6 +625,7 @@ it.effect("launches the offered default when the configured model is gpt-5.4", (
   Effect.gen(function* () {
     let launched = "";
     const client: T3LocalClient = {
+      ...driverMemory,
       listProjectIds: () =>
         Effect.succeed([
           {
@@ -592,6 +689,7 @@ it.effect("rejects a model the provider does not offer and lists the valid ones"
   Effect.gen(function* () {
     let launches = 0;
     const client: T3LocalClient = {
+      ...driverMemory,
       listProjectIds: () =>
         Effect.succeed([
           {
@@ -735,6 +833,7 @@ it.effect("stays with a task the board interrupts, then follows the resume", () 
       let finish = false;
       const real = wsT3LocalClient({ origin, pairingToken: PAIR });
       const client: T3LocalClient = {
+        ...driverMemory,
         listProjectIds: real.listProjectIds,
         listProviderModels: () => Effect.succeed(CATALOG),
         publishBoard: real.publishBoard,
