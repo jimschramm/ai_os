@@ -45,6 +45,14 @@ const runtimeRecord = (
   actual: { model: actual },
 });
 
+const acceptOn = (qaModel: string, implementerModel: string, revision = revisionOne) => ({
+  ...qaAcceptExample,
+  qaModel,
+  implementerModel,
+  artifactRevision: revision,
+  acceptedRevision: revision,
+});
+
 it.effect("runs request, assignment, execution, QA, rework, and an accepted result", () =>
   Effect.gen(function* () {
     const phases: Array<SequenceState["phase"]> = [];
@@ -301,11 +309,7 @@ it.effect("keeps QA on the runtime implementer when usage names another model", 
     assert.strictEqual(executing.run.implementerRuntime?.requested?.model, "gpt-5.4");
     const unknown = yield* failure(executing, {
       type: "qa",
-      qa: {
-        ...qaAcceptExample,
-        qaModel: "claude-sonnet-5",
-        implementerModel: "gpt-6-sol",
-      },
+      qa: acceptOn("claude-sonnet-5", "gpt-6-sol"),
     });
     assert.strictEqual(unknown.reason, "qa_model_unknown");
     const withSameReviewer = yield* applySequenceEvent(
@@ -314,11 +318,7 @@ it.effect("keeps QA on the runtime implementer when usage names another model", 
     );
     const sameBase = yield* failure(withSameReviewer, {
       type: "qa",
-      qa: {
-        ...qaReworkExample,
-        qaModel: "gpt-6-sol-medium",
-        implementerModel: "gpt-6-astra",
-      },
+      qa: acceptOn("gpt-6-sol-medium", "gpt-6-astra"),
     });
     assert.strictEqual(sameBase.reason, "qa_same_model");
     const substituted = yield* failure(withSameReviewer, {
@@ -338,11 +338,7 @@ it.effect("keeps QA on the runtime implementer when usage names another model", 
     );
     const declared = yield* failure(withReviewer, {
       type: "qa",
-      qa: {
-        ...qaReworkExample,
-        qaModel: "claude-sonnet-5",
-        implementerModel: "gpt-6-sol",
-      },
+      qa: acceptOn("claude-sonnet-5", "gpt-6-sol"),
     });
     assert.strictEqual(declared.reason, "implementer_mismatch");
     const reviewed = yield* applySequenceEvent(withReviewer, {
@@ -369,7 +365,7 @@ it.effect("rejects acceptance when an actual model is unknown", () =>
     ]);
     const missingImplementer = yield* failure(reviewerOnly, {
       type: "qa",
-      qa: qaAcceptExample,
+      qa: acceptOn("claude-sonnet-5", "gpt-5.4"),
     });
     assert.strictEqual(missingImplementer.reason, "qa_model_unknown");
     if (reviewerOnly.phase !== "awaiting_qa") return;
@@ -380,8 +376,37 @@ it.effect("rejects acceptance when an actual model is unknown", () =>
       ...happyPathEvents.slice(0, 4),
       { type: "submit_completion", completion: completionExample },
     ]);
-    const missingBoth = yield* failure(neither, { type: "qa", qa: qaAcceptExample });
+    const missingBoth = yield* failure(neither, {
+      type: "qa",
+      qa: acceptOn("claude-sonnet-5", "gpt-5.4"),
+    });
     assert.strictEqual(missingBoth.reason, "qa_model_unknown");
+  }),
+);
+
+it.effect("applies rework when an actual model is unknown or the same base", () =>
+  Effect.gen(function* () {
+    const unknown = yield* applySequence([
+      ...happyPathEvents.slice(0, 4),
+      { type: "submit_completion", completion: completionExample },
+    ]);
+    const reworked = yield* applySequenceEvent(unknown, { type: "qa", qa: qaReworkExample });
+    assert.strictEqual(reworked.phase, "rework");
+
+    const sameBase = yield* applySequence([
+      ...happyPathEvents.slice(0, 6),
+      runtimeRecord("reviewer", "gpt-5.4"),
+    ]);
+    const stillRework = yield* applySequenceEvent(sameBase, {
+      type: "qa",
+      qa: { ...qaReworkExample, qaModel: "claude-sonnet-5" },
+    });
+    assert.strictEqual(stillRework.phase, "rework");
+    const rejected = yield* failure(sameBase, {
+      type: "qa",
+      qa: acceptOn("claude-sonnet-5", "gpt-5.4"),
+    });
+    assert.strictEqual(rejected.reason, "qa_same_model");
   }),
 );
 
@@ -401,11 +426,7 @@ it.effect("treats Argon efforts as one base and keeps Sol and Astra distinct", (
     ]);
     const sameBase = yield* failure(argon, {
       type: "qa",
-      qa: {
-        ...qaReworkExample,
-        qaModel: "gemini-4-argon-medium",
-        implementerModel: "gpt-6-sol",
-      },
+      qa: acceptOn("gemini-4-argon-medium", "gpt-6-sol"),
     });
     assert.strictEqual(sameBase.reason, "qa_same_model");
 
@@ -443,11 +464,7 @@ it.effect("requires QA to use a different base model than the implementer that r
       yield* applySequenceEvent(awaiting, runtimeRecord("reviewer", "gpt-5.4")),
       {
         type: "qa",
-        qa: {
-          ...qaReworkExample,
-          qaModel: "gpt-5.4",
-          implementerModel: "claude-sonnet-5",
-        },
+        qa: acceptOn("gpt-5.4", "claude-sonnet-5"),
       },
     );
     assert.strictEqual(sameModel.reason, "qa_same_model");
@@ -456,11 +473,7 @@ it.effect("requires QA to use a different base model than the implementer that r
       yield* applySequenceEvent(awaiting, runtimeRecord("reviewer", "claude-sonnet-5")),
       {
         type: "qa",
-        qa: {
-          ...qaReworkExample,
-          qaModel: "claude-sonnet-5",
-          implementerModel: "grok-4",
-        },
+        qa: acceptOn("claude-sonnet-5", "grok-4"),
       },
     );
     assert.strictEqual(otherImplementer.reason, "implementer_mismatch");
@@ -674,11 +687,7 @@ it.effect("does not treat a differently cased model id as a different QA model",
       yield* applySequenceEvent(awaiting, runtimeRecord("reviewer", "GPT-5.4")),
       {
         type: "qa",
-        qa: {
-          ...qaReworkExample,
-          qaModel: "GPT-5.4",
-          implementerModel: "claude-sonnet-5",
-        },
+        qa: acceptOn("GPT-5.4", "claude-sonnet-5"),
       },
     );
     assert.strictEqual(cased.reason, "qa_same_model");
@@ -697,21 +706,13 @@ it.effect("does not treat a differently cased model id as a different QA model",
     const withReviewer = yield* applySequenceEvent(submitted, runtimeRecord("reviewer", "gpt-5.4"));
     const prefixed = yield* failure(withReviewer, {
       type: "qa",
-      qa: {
-        ...qaReworkExample,
-        qaModel: "OpenAI:GPT-5.4",
-        implementerModel: "claude-sonnet-5",
-      },
+      qa: acceptOn("OpenAI:GPT-5.4", "claude-sonnet-5"),
     });
     assert.strictEqual(prefixed.reason, "qa_same_model");
 
     const azure = yield* failure(withReviewer, {
       type: "qa",
-      qa: {
-        ...qaReworkExample,
-        qaModel: "azure/gpt-5.4",
-        implementerModel: "claude-sonnet-5",
-      },
+      qa: acceptOn("azure/gpt-5.4", "claude-sonnet-5"),
     });
     assert.strictEqual(azure.reason, "qa_same_model");
 
@@ -719,11 +720,7 @@ it.effect("does not treat a differently cased model id as a different QA model",
       yield* applySequenceEvent(awaiting, runtimeRecord("reviewer", "gpt-5.4")),
       {
         type: "qa",
-        qa: {
-          ...qaReworkExample,
-          qaModel: "openai/gpt-5.4",
-          implementerModel: "claude-sonnet-5",
-        },
+        qa: acceptOn("openai/gpt-5.4", "claude-sonnet-5"),
       },
     );
     assert.strictEqual(bare.reason, "qa_same_model");
@@ -1104,8 +1101,13 @@ it.effect("decodes a stored card from before runtime models were recorded", () =
     assert.strictEqual(legacyRework.phase, "rework");
 
     const awaiting = yield* applySequence(happyPathEvents.slice(0, 6));
-    const rejected = yield* failure(awaiting, { type: "qa", qa: qaAcceptExample });
+    const rejected = yield* failure(awaiting, {
+      type: "qa",
+      qa: acceptOn("claude-sonnet-5", "gpt-5.4"),
+    });
     assert.strictEqual(rejected.reason, "qa_model_unknown");
+    const reworked = yield* applySequenceEvent(awaiting, { type: "qa", qa: qaReworkExample });
+    assert.strictEqual(reworked.phase, "rework");
   }),
 );
 

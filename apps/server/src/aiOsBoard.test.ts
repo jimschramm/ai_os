@@ -1314,11 +1314,18 @@ describe("ai-os board route", () => {
     return { runs, models };
   };
 
-  const acceptVerdict = (revision: {
-    readonly type: "named";
-    readonly kind: "deployment" | "document" | "page" | "preview";
-    readonly id: string;
-  }) => ({
+  const acceptVerdict = (
+    revision:
+      | {
+          readonly type: "git";
+          readonly sha: string;
+        }
+      | {
+          readonly type: "named";
+          readonly kind: "deployment" | "document" | "page" | "preview";
+          readonly id: string;
+        },
+  ) => ({
     version: "v1" as const,
     taskId: "task-demo",
     attemptId: "attempt-1",
@@ -1388,6 +1395,158 @@ describe("ai-os board route", () => {
       detail: expect.stringMatching(/actual model/),
     });
     expect(await phaseOfHandler(handler)).toBe("awaiting_qa");
+  });
+
+  const sessionLaunchRuns = (
+    reviewerActual: string | null,
+  ): { readonly runs: AiOsBoard.BoardRuns["Service"]; readonly models: string[] } => {
+    const models: string[] = [];
+    let impl = 0;
+    const runs: AiOsBoard.BoardRuns["Service"] = {
+      ...allowRuns,
+      launch: (input) => {
+        models.push(input.model);
+        const reviewer = input.model === DEFAULT_MODEL;
+        if (!reviewer) impl += 1;
+        const n = impl;
+        return Effect.succeed({
+          threadId: reviewer ? `thread-qa-${n}` : `thread-impl-${n}`,
+          runId: reviewer ? `run-qa-${n}` : `run-impl-${n}`,
+          disposition: "active",
+          summary: null,
+          requestedModel: input.model,
+          actualModel: reviewer ? reviewerActual : "gpt-5.4",
+        });
+      },
+      watchThread: (threadId) => {
+        if (threadId.startsWith("thread-qa")) return Effect.succeed(null);
+        const revision = threadId.endsWith("-2") ? "b".repeat(40) : "a".repeat(40);
+        return Effect.succeed({
+          threadId,
+          runId: "run-impl",
+          status: "completed" as const,
+          text: "Shipped the page.",
+          revision,
+          requestedModel: "gpt-5.4",
+          actualModel: "gpt-5.4",
+        });
+      },
+    };
+    return { runs, models };
+  };
+
+  const reworkVerdict = (revision: { readonly type: "git"; readonly sha: string }) => ({
+    version: "v1" as const,
+    taskId: "task-demo",
+    attemptId: "attempt-1",
+    availability: "available" as const,
+    qaModel: DEFAULT_MODEL,
+    implementerModel: "gpt-5.4",
+    verdict: "rework" as const,
+    artifactRevision: revision,
+    findings: [
+      {
+        defect: "The schedule omits the final round.",
+        evidence: "The preview still lists Saturday only.",
+        expectedBehavior: "The page lists Saturday and Sunday.",
+      },
+    ],
+  });
+
+  it("records the reviewer from the QA launch, then reworks and accepts", async () => {
+    const { runs, models } = sessionLaunchRuns(DEFAULT_MODEL);
+    const { handler } = handlerFor(undefined, runs);
+    await reachAssigned(handler);
+    const moved = await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
+      taskId: "task-demo",
+      column: "Running",
+      idempotencyKey: "launch-review",
+    });
+    expect(moved.status).toBe(200);
+    const waiting = (await readCards(handler)).find((card) => card.taskId === "task-demo");
+    expect(waiting?.state.phase).toBe("awaiting_qa");
+    if (waiting?.state.phase !== "awaiting_qa") throw new Error("expected review");
+    expect(modelName(waiting.state.run.implementerRuntime?.actual)).toBe("gpt-5.4");
+    expect(modelName(waiting.state.run.reviewerRuntime?.requested)).toBe(DEFAULT_MODEL);
+    expect(modelName(waiting.state.run.reviewerRuntime?.actual)).toBe(DEFAULT_MODEL);
+    const first = waiting.state.completion.artifactRevision;
+    if (first.type !== "git") throw new Error("expected the provider revision");
+    const reworked = await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
+      taskId: "task-demo",
+      title: "Demo task",
+      idempotencyKey: "qa-rework",
+      event: { type: "qa", qa: reworkVerdict(first) },
+    });
+    expect(reworked.status).toBe(200);
+    expect(await phaseOfHandler(handler)).toBe("rework");
+    const again = await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
+      taskId: "task-demo",
+      column: "Running",
+      idempotencyKey: "launch-review-2",
+    });
+    expect(again.status).toBe(200);
+    const second = (await readCards(handler)).find((card) => card.taskId === "task-demo");
+    expect(second?.state.phase).toBe("awaiting_qa");
+    if (second?.state.phase !== "awaiting_qa") throw new Error("expected the second review");
+    expect(modelName(second.state.run.implementerRuntime?.actual)).toBe("gpt-5.4");
+    expect(modelName(second.state.run.reviewerRuntime?.actual)).toBe(DEFAULT_MODEL);
+    const revision = second.state.completion.artifactRevision;
+    if (revision.type !== "git") throw new Error("expected the corrected revision");
+    expect(revision.sha).not.toBe(first.sha);
+    const accepted = await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
+      taskId: "task-demo",
+      title: "Demo task",
+      idempotencyKey: "qa-accept-2",
+      event: { type: "qa", qa: acceptVerdict(revision) },
+    });
+    expect(accepted.status).toBe(200);
+    expect(await phaseOfHandler(handler)).toBe("accepted");
+    expect(models).toEqual(["gpt-5.4", DEFAULT_MODEL, "gpt-5.4", DEFAULT_MODEL]);
+  });
+
+  it("applies rework and rejects acceptance when the QA launch has no reviewer model", async () => {
+    const { runs } = sessionLaunchRuns(null);
+    const { handler } = handlerFor(undefined, runs);
+    await reachAssigned(handler);
+    const moved = await postJson(handler, ADAPTER_BOARD_MOVE_PATH, {
+      taskId: "task-demo",
+      column: "Running",
+      idempotencyKey: "launch-unknown",
+    });
+    expect(moved.status).toBe(200);
+    const waiting = (await readCards(handler)).find((card) => card.taskId === "task-demo");
+    expect(waiting?.state.phase).toBe("awaiting_qa");
+    if (waiting?.state.phase !== "awaiting_qa") throw new Error("expected review");
+    expect(modelName(waiting.state.run.reviewerRuntime?.requested)).toBe(DEFAULT_MODEL);
+    expect(waiting.state.run.reviewerRuntime?.actual).toBeNull();
+    const revision = waiting.state.completion.artifactRevision;
+    if (revision.type !== "git") throw new Error("expected the provider revision");
+    const rejected = await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
+      taskId: "task-demo",
+      title: "Demo task",
+      idempotencyKey: "qa-unknown-accept",
+      event: {
+        type: "qa",
+        qa: {
+          ...acceptVerdict({ type: "named", kind: "page", id: "unused" }),
+          artifactRevision: revision,
+          acceptedRevision: revision,
+        },
+      },
+    });
+    expect(rejected.status).toBe(409);
+    expect(await rejected.json()).toMatchObject({
+      detail: expect.stringMatching(/actual model/),
+    });
+    expect(await phaseOfHandler(handler)).toBe("awaiting_qa");
+    const reworked = await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
+      taskId: "task-demo",
+      title: "Demo task",
+      idempotencyKey: "qa-unknown-rework",
+      event: { type: "qa", qa: reworkVerdict(revision) },
+    });
+    expect(reworked.status).toBe(200);
+    expect(await phaseOfHandler(handler)).toBe("rework");
   });
 
   it("resumes a blocked card on the same thread and does not continue twice", async () => {

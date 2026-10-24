@@ -373,8 +373,8 @@ export const ReworkState = Schema.Struct({
     if (qaMatch !== true) {
       return qaMatch;
     }
-    // Runtime models are checked when qa is applied. Cards saved before those
-    // fields existed stay readable.
+    // Runtime models are checked when acceptance is applied. A stored rework
+    // card from before those fields existed stays readable.
     if (!sameRevision(state.qa.artifactRevision, state.reworkRevision)) {
       return "Rework records the revision that was reviewed.";
     }
@@ -404,8 +404,8 @@ export const AcceptedState = Schema.Struct({
     if (qaMatch !== true) {
       return qaMatch;
     }
-    // Runtime models are checked when qa is applied. Cards saved before those
-    // fields existed stay readable.
+    // Runtime models are checked when acceptance is applied. A stored accepted
+    // card from before those fields existed stays readable.
     if (!sameRevision(state.qa.acceptedRevision, state.qa.artifactRevision)) {
       return "Acceptance is bound to the exact artifact revision.";
     }
@@ -840,10 +840,6 @@ const applyQa = (
         commands: state.commands,
       };
     }
-    const checked = independentQa(state.run, qa);
-    if (checked !== true) {
-      return yield* reject(state, event, checked.reason, checked.detail);
-    }
     if (!sameRevision(qa.artifactRevision, state.completion.artifactRevision)) {
       return yield* reject(
         state,
@@ -872,6 +868,12 @@ const applyQa = (
         run: state.run,
         commands: state.commands,
       };
+    }
+    // Rework cannot approve the work, so an unknown or matching model does not
+    // block it. Acceptance is the only verdict that compares runtime actuals.
+    const checked = independentQa(state.run, qa);
+    if (checked !== true) {
+      return yield* reject(state, event, checked.reason, checked.detail);
     }
     return {
       phase: "accepted" as const,

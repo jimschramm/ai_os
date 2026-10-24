@@ -111,6 +111,12 @@ export interface BoardLaunchResult {
   readonly runId: string | null;
   readonly disposition: BoardLaunchDisposition;
   readonly summary: string | null;
+  /**
+   * Provider session on the launch projection.
+   * Omit both when the caller did not read one. A null actual is not the request.
+   */
+  readonly requestedModel?: string | null;
+  readonly actualModel?: string | null;
 }
 
 /**
@@ -255,6 +261,7 @@ export const liveRuns = Layer.effect(
             const assistant = result.projection.messages.findLast(
               (message) => message.role === "assistant" && message.text.length > 0,
             );
+            const view = threadViewFromProjection(result.threadId, result.projection);
             const disposition: BoardLaunchDisposition =
               status === "completed" ? "completed" : status === "failed" ? "failed" : "active";
             return {
@@ -262,6 +269,8 @@ export const liveRuns = Layer.effect(
               runId: run?.id ?? null,
               disposition,
               summary: assistant?.text ?? null,
+              requestedModel: view.requestedModel ?? null,
+              actualModel: view.actualModel ?? null,
             };
           }),
           Effect.mapError((error) => runError(errorDetail(error, "The run did not launch."))),
@@ -673,7 +682,14 @@ export const layer = Layer.unwrap(
       Effect.gen(function* () {
         const key = `${taskId}:${state.run.generation}`;
         const known = reviewerThreads.get(key);
-        if (known !== undefined) return known.threadId;
+        if (known !== undefined) {
+          return {
+            threadId: known.threadId,
+            recordFromLaunch: false,
+            requestedModel: null as string | null,
+            actualModel: null as string | null,
+          };
+        }
         const projectId = projectIdOf(state);
         if (projectId === null) return null;
         const launched = yield* runs
@@ -693,7 +709,13 @@ export const layer = Layer.unwrap(
           .pipe(Effect.catchTags({ BoardRunError: () => Effect.succeed(null) }));
         if (launched === null) return null;
         reviewerThreads.set(key, { threadId: launched.threadId });
-        return launched.threadId;
+        return {
+          threadId: launched.threadId,
+          recordFromLaunch:
+            launched.requestedModel !== undefined || launched.actualModel !== undefined,
+          requestedModel: launched.requestedModel ?? null,
+          actualModel: launched.actualModel ?? null,
+        };
       });
     const followLaunched = (
       outcome: KanbanMoveResult,
@@ -716,12 +738,48 @@ export const layer = Layer.unwrap(
         }
         if (state.phase === "awaiting_qa" && state.run.reviewerRuntime?.actual == null) {
           const awaiting = state;
-          const reviewerThread = yield* ensureReviewer(awaiting, taskId);
-          if (reviewerThread !== null) {
-            const viewed = yield* observeThread(awaiting, taskId, reviewerThread, book, changed);
-            state = viewed.state;
-            book = viewed.book;
-            changed = viewed.changed;
+          const reviewer = yield* ensureReviewer(awaiting, taskId);
+          if (reviewer !== null) {
+            // The launch projection already carries the provider session. Record it
+            // before a later read, and before any verdict, so a missing watch cannot
+            // drop Astra's actual model.
+            if (reviewer.recordFromLaunch) {
+              const planned = observationEvents({
+                taskId,
+                threadId: reviewer.threadId,
+                state: awaiting,
+                view: {
+                  threadId: reviewer.threadId,
+                  runId: null,
+                  status: "running",
+                  text: null,
+                  revision: null,
+                  requestedModel: reviewer.requestedModel,
+                  actualModel: reviewer.actualModel,
+                },
+                allowLapse: false,
+                workerId: awaiting.assignment.workerId,
+              });
+              for (const item of planned) {
+                const applied: KanbanMoveResult = yield* applyBoardWorkflowEvent(
+                  state,
+                  item.event,
+                  item.idempotencyKey,
+                  taskId,
+                  book,
+                );
+                if (applied._tag !== "Applied") break;
+                state = applied.state;
+                book = applied.ledger;
+                changed = changed || applied.changed;
+              }
+            }
+            if (state.phase === "awaiting_qa") {
+              const viewed = yield* observeThread(state, taskId, reviewer.threadId, book, changed);
+              state = viewed.state;
+              book = viewed.book;
+              changed = viewed.changed;
+            }
           }
         }
         return {
