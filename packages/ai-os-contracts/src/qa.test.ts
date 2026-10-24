@@ -27,6 +27,26 @@ it.effect("decodes waiting, rework, and acceptance verdicts", () =>
   }),
 );
 
+it.effect("accepts Astra reviewing Sol and rejects two Argon efforts", () =>
+  Effect.gen(function* () {
+    const independent = yield* decodeQaVerdictV1({
+      ...qaReworkExample,
+      qaModel: "gpt-6-astra",
+      implementerModel: "gpt-6-sol",
+    });
+    assert.strictEqual(independent.availability, "available");
+
+    const sameBase = yield* Effect.exit(
+      decodeQaVerdictV1({
+        ...qaReworkExample,
+        qaModel: "gemini-4-argon-medium",
+        implementerModel: "gemini-4-argon-high",
+      }),
+    );
+    assert.strictEqual(Exit.isFailure(sameBase), true);
+  }),
+);
+
 it.effect("rejects QA by the implementer's model", () =>
   Effect.gen(function* () {
     const sameModel = yield* Effect.exit(

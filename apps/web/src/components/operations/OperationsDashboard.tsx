@@ -19,6 +19,7 @@ import { useDialogCycle } from "./dialogFocus";
 import { CortexView } from "./CortexView";
 import { MemoryBrowser } from "./MemoryBrowser";
 import { UsageGauges } from "./UsageGauges";
+import { AdvisoryReviewSection } from "./AdvisoryReview";
 import { hasLiveBoard, tasksForBoard } from "./adapterBoard";
 import { KanbanBoard } from "./KanbanBoard";
 import { useAdapterBoard } from "./adapterFeed";
@@ -210,6 +211,7 @@ export function OperationsDashboard() {
       </main>
       <TaskDrawer
         task={selected}
+        live={selected !== null && cards.some((card) => card.taskId === selected.id)}
         onClose={() => setSelectedId(null)}
         onOpenRecord={(factId) => {
           if (selected !== null) setCurrentTaskId(selected.id);
@@ -508,10 +510,12 @@ function BlockerCard({
 
 function TaskDrawer({
   task,
+  live,
   onClose,
   onOpenRecord,
 }: {
   task: OperationsTask | null;
+  live: boolean;
   onClose: () => void;
   onOpenRecord: (factId: string) => void;
 }) {
@@ -542,6 +546,7 @@ function TaskDrawer({
         {task === null ? null : (
           <TaskDrawerBody
             task={task}
+            live={live}
             titleRef={titleRef}
             onClose={onClose}
             onOpenRecord={onOpenRecord}
@@ -554,11 +559,13 @@ function TaskDrawer({
 
 function TaskDrawerBody({
   task,
+  live,
   titleRef,
   onClose,
   onOpenRecord,
 }: {
   task: OperationsTask;
+  live: boolean;
   titleRef: RefObject<HTMLHeadingElement | null>;
   onClose: () => void;
   onOpenRecord: (factId: string) => void;
@@ -653,6 +660,7 @@ function TaskDrawerBody({
               </ul>
             )}
           </section>
+          <AdvisoryReviewSection task={task} live={live} />
           <section aria-labelledby="qa-heading">
             <h3 id="qa-heading" className="text-sm font-semibold">
               QA

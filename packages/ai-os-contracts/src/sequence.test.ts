@@ -115,6 +115,97 @@ it.effect("keeps a completion claim out of acceptance until independent QA", () 
   }),
 );
 
+it.effect("records an advisory review without creating a QA verdict", () =>
+  Effect.gen(function* () {
+    const executing = yield* applySequence(happyPathEvents.slice(0, 4));
+    assert.strictEqual(executing.phase, "executing");
+    const review = {
+      version: "v1" as const,
+      taskId: assignmentExample.taskId,
+      attemptId: assignmentExample.attemptId,
+      generation: 1,
+      leaseId: leaseIdFor(1),
+      mode: "advisory" as const,
+      commit: exampleRepoCommit,
+      model: {
+        requested: "gemini-4-argon-high",
+        actual: "gemini-4-argon-high",
+        unverified: false,
+      },
+      findings: [
+        {
+          commit: exampleRepoCommit,
+          files: ["src/page.tsx"],
+          evidence: "The page lists Saturday only.",
+          suggestedAction: "Add Sunday to the schedule.",
+        },
+      ],
+      artifacts: [],
+      evidence: [{ kind: "commit" as const, ref: exampleRepoCommit }],
+      sourcePath: "/tmp/source",
+      scratchPath: "/tmp/scratch",
+    };
+    const recorded = yield* applySequenceEvent(executing, { type: "record_advisory", review });
+    assert.strictEqual(recorded.phase, "executing");
+    if (recorded.phase !== "executing") return;
+    assert.deepStrictEqual(recorded.run.advisory?.model.requested, {
+      model: "gemini-4-argon-high",
+    });
+    assert.strictEqual(recorded.run.advisory?.findings.length, 1);
+    assert.equal("qa" in recorded, false);
+
+    const otherCommit = yield* failure(executing, {
+      type: "record_advisory",
+      review: { ...review, commit: "a".repeat(40), findings: [] },
+    });
+    assert.strictEqual(otherCommit.reason, "revision_mismatch");
+  }),
+);
+
+it.effect("treats Argon efforts as one base and keeps Sol and Astra distinct", () =>
+  Effect.gen(function* () {
+    const argon = yield* applySequence([
+      happyPathEvents[0]!,
+      happyPathEvents[1]!,
+      {
+        type: "assign",
+        assignment: { ...assignmentExample, implementerModel: "gemini-4-argon-high" },
+      },
+      { type: "start_execution" },
+      { type: "submit_completion", completion: completionExample },
+    ]);
+    const sameBase = yield* failure(argon, {
+      type: "qa",
+      qa: {
+        ...qaReworkExample,
+        qaModel: "gemini-4-argon-medium",
+        implementerModel: "gpt-6-sol",
+      },
+    });
+    assert.strictEqual(sameBase.reason, "qa_same_model");
+
+    const sol = yield* applySequence([
+      happyPathEvents[0]!,
+      happyPathEvents[1]!,
+      {
+        type: "assign",
+        assignment: { ...assignmentExample, implementerModel: "gpt-6-sol" },
+      },
+      { type: "start_execution" },
+      { type: "submit_completion", completion: completionExample },
+    ]);
+    const reviewed = yield* applySequenceEvent(sol, {
+      type: "qa",
+      qa: {
+        ...qaReworkExample,
+        qaModel: "gpt-6-astra",
+        implementerModel: "gpt-6-sol",
+      },
+    });
+    assert.strictEqual(reviewed.phase, "rework");
+  }),
+);
+
 it.effect("requires QA to use a different model than the assigned implementer", () =>
   Effect.gen(function* () {
     if (qaReworkExample.availability !== "available") {

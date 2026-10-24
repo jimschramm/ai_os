@@ -65,6 +65,24 @@ export const sameModelName = (left: ParsedModel | string, right: ParsedModel | s
   return leftName !== null && leftName === rightName;
 };
 
+// Antigravity exposes one base model at several efforts (`gemini-4-argon-high`
+// and `gemini-4-argon-medium` are the same model). QA independence compares
+// that base, so two efforts cannot review each other.
+const EFFORT_SUFFIX = /-(?:low|medium|high|xhigh|max)$/;
+
+export const baseModelName = (value: ParsedModel | string): string | null => {
+  const name = modelName(value);
+  if (name === null) return null;
+  const base = name.replace(EFFORT_SUFFIX, "");
+  return MODEL_SEGMENT.test(base) ? base : null;
+};
+
+export const sameBaseModel = (left: ParsedModel | string, right: ParsedModel | string): boolean => {
+  const leftName = baseModelName(left);
+  const rightName = baseModelName(right);
+  return leftName !== null && leftName === rightName;
+};
+
 const CanonicalModelSegment = Schema.String.check(
   Schema.isMaxLength(128),
   Schema.makeFilter((value: string) => {

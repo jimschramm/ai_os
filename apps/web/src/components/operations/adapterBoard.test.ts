@@ -2,7 +2,10 @@ import { assert, it } from "@effect/vitest";
 import {
   applySequence,
   assignmentExample,
+  completionExample,
+  exampleRepoCommit,
   intakeV2Example,
+  leaseIdFor,
   taskLinkFor,
 } from "@t3tools/ai-os-contracts";
 import * as Effect from "effect/Effect";
@@ -10,6 +13,7 @@ import * as Effect from "effect/Effect";
 import { encodeAdapterBoard } from "@t3tools/ai-os-adapter/board";
 
 import { tasksForBoard } from "./adapterBoard";
+import { findingsCount } from "./boardVisuals";
 import {
   applyAdapterBoardPayload,
   readAdapterBoardSnapshot,
@@ -218,5 +222,69 @@ it.effect("shows a requested task with no assignment", () =>
     assert.strictEqual(shown[0]?.assignment, null);
     assert.strictEqual(shown[0]?.agent, "Unassigned");
     assert.strictEqual(shown[0]?.projectId, "usba");
+  }),
+);
+
+it.effect("keeps advisory findings off the QA count", () =>
+  Effect.gen(function* () {
+    const review = {
+      version: "v1" as const,
+      taskId: assignmentExample.taskId,
+      attemptId: assignmentExample.attemptId,
+      generation: 1,
+      leaseId: leaseIdFor(1),
+      mode: "advisory" as const,
+      commit: exampleRepoCommit,
+      model: {
+        requested: "gemini-4-argon-high",
+        actual: null,
+        unverified: true,
+      },
+      findings: [
+        {
+          commit: exampleRepoCommit,
+          files: ["src/page.tsx"],
+          evidence: "The page lists Saturday only.",
+          suggestedAction: "Add Sunday to the schedule.",
+        },
+      ],
+      artifacts: [],
+      evidence: [{ kind: "commit" as const, ref: exampleRepoCommit }],
+      sourcePath: "/tmp/source",
+      scratchPath: "/tmp/scratch",
+    };
+    const reviewed = yield* applySequence([
+      { type: "intake", intake: intakeV2Example },
+      {
+        type: "acknowledge",
+        acknowledgment: {
+          version: "v1",
+          taskId: assignmentExample.taskId,
+          taskLink: taskLinkFor(assignmentExample.taskId),
+          durable: true,
+          receivedAt: at,
+        },
+      },
+      { type: "assign", assignment: assignmentExample },
+      { type: "start_execution" },
+      { type: "record_advisory", review },
+      { type: "submit_completion", completion: completionExample },
+    ]);
+    const shown = tasksForBoard("usba", [
+      {
+        taskId: assignmentExample.taskId,
+        title: "Advisory page",
+        state: reviewed,
+        threadId: null,
+        updatedAt: at,
+      },
+    ]);
+    const task = shown[0];
+    assert.strictEqual(task?.qa, null);
+    assert.strictEqual(task?.advisory?.findings.length, 1);
+    assert.strictEqual(task?.advisory?.model.actual, null);
+    assert.strictEqual(task?.advisory?.model.unverified, true);
+    if (task === undefined) return;
+    assert.strictEqual(findingsCount(task), 0);
   }),
 );

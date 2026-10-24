@@ -35,6 +35,26 @@ export {
   type T3ThreadView,
 } from "./t3Client.ts";
 export {
+  advisoryEnvironment,
+  advisoryUsage,
+  isAnthropicModel,
+  listAntigravityModels,
+  parseCliRun,
+  parseModelList,
+  resolveModelChoice,
+  reviewArguments,
+  runAdvisoryReview,
+  type AdvisoryExecution,
+  type AdvisorySuccess,
+  type AntigravityCatalog,
+  type CliSpawner,
+} from "./antigravity.ts";
+export {
+  CODEX_IMPLEMENTER_MODEL,
+  CODEX_QA_MODEL,
+  defaultRoleModelsAreIndependent,
+} from "./workerRoles.ts";
+export {
   WORKER_CAPABILITIES,
   hasCapability,
   requireCapability,

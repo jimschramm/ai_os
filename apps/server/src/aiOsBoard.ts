@@ -1,4 +1,5 @@
 import {
+  ADAPTER_ANTIGRAVITY_MODELS_PATH,
   ADAPTER_BOARD_EVENT_PATH,
   ADAPTER_BOARD_EVENTS_PATH,
   ADAPTER_BOARD_MOVE_PATH,
@@ -61,6 +62,7 @@ import {
   HttpServerRespondable,
 } from "effect/http";
 
+import { AntigravityReviews, applyAdvisoryExecution } from "./aiOsAntigravity.ts";
 import * as EnvironmentAuth from "./auth/EnvironmentAuth.ts";
 import {
   failEnvironmentAuthInvalid,
@@ -485,6 +487,7 @@ export const layer = Layer.unwrap(
     const fs = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
     const runs = yield* BoardRuns;
+    const reviews = yield* AntigravityReviews;
     const filePath = path.join(config.stateDir, BOARD_FILE);
     yield* fs.makeDirectory(path.dirname(filePath), { recursive: true }).pipe(Effect.ignore);
     const hub = makeAdapterBoardHub();
@@ -752,6 +755,38 @@ export const layer = Layer.unwrap(
                         queued,
                         ledger,
                       );
+                    }
+                    if (queued.assignment.instanceId === "antigravity") {
+                      if (queued.assignment.role !== "advisory") {
+                        return rejectedMove(
+                          "Only advisory review runs on Antigravity in this phase. The card stays Ready.",
+                          queued,
+                          ledger,
+                        );
+                      }
+                      const typed = stringField(body, "model")?.trim() ?? "";
+                      const requested =
+                        typed.length > 0
+                          ? typed
+                          : (queued.assignment.advisoryModel?.model ?? undefined);
+                      const reviewed = yield* reviews.review({
+                        projectId,
+                        taskId,
+                        generation: executionGeneration(queued),
+                        intake: queued.intake,
+                        context: queued.assignment.contextPackage,
+                        requestedModel: requested,
+                      });
+                      if (reviewed.status === "completed" || reviewed.status === "model_mismatch") {
+                        return yield* applyAdvisoryExecution({
+                          state: queued,
+                          taskId,
+                          ledger,
+                          execution: reviewed,
+                          workerId: queued.assignment.workerId,
+                        });
+                      }
+                      return rejectedMove(reviewed.detail ?? "The review stopped.", queued, ledger);
                     }
                     const launched = yield* asRun(
                       runs.launch({
@@ -1061,12 +1096,22 @@ export const layer = Layer.unwrap(
       Effect.andThen(Effect.sleep(BOARD_FOLLOW_INTERVAL)),
       Effect.forever,
     );
+    const models = Effect.gen(function* () {
+      yield* authorize(AuthOrchestrationReadScope);
+      const catalog = yield* reviews.listModels();
+      return json(200, {
+        source: catalog.source,
+        models: catalog.models.map((model) => ({ slug: model.slug, label: model.label })),
+        detail: catalog.detail,
+      });
+    }).pipe(Effect.catchTags(authResponse));
     return Layer.mergeAll(
       HttpRouter.add("GET", ADAPTER_BOARD_PATH, snapshot),
       HttpRouter.add("POST", ADAPTER_BOARD_PATH, replace),
       HttpRouter.add("GET", ADAPTER_BOARD_EVENTS_PATH, events),
       HttpRouter.add("POST", ADAPTER_BOARD_MOVE_PATH, move),
       HttpRouter.add("POST", ADAPTER_BOARD_EVENT_PATH, workflowEvent),
+      HttpRouter.add("GET", ADAPTER_ANTIGRAVITY_MODELS_PATH, models),
       Layer.effectDiscard(
         Effect.gen(function* () {
           if (!runs.followRuns) return;

@@ -92,6 +92,7 @@ const taskFromAdapterCard = (card: AdapterBoardCard): OperationsTask | null => {
     progress: report === null ? [] : [report],
     completion,
     qa: qaOf(state),
+    advisory: run?.advisory ?? null,
     revision: completion?.artifactRevision ?? null,
     facts: [],
     candidates: [],

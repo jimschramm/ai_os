@@ -1,6 +1,7 @@
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 
+import { AdvisoryReviewV1 } from "./advisory.ts";
 import { AssignmentV1, freezeSnapshot } from "./assignment.ts";
 import { CompletionSubmissionV1 } from "./completion.ts";
 import {
@@ -24,6 +25,8 @@ import {
   NonNegativeInt,
   PositiveInt,
   type ModelRef,
+  canonicalGitSha,
+  sameBaseModel,
   sameModelName,
   sameRevision,
   strictParse,
@@ -82,6 +85,7 @@ export const SequenceEvent = Schema.Union([
     leaseId: ContractId,
     measurement: UsageMeasurementV1,
   }),
+  Schema.Struct({ type: Schema.Literal("record_advisory"), review: AdvisoryReviewV1 }),
   Schema.Struct({ type: Schema.Literal("cancel"), command: CancelCommandV1 }),
   Schema.Struct({ type: Schema.Literal("continue"), command: ContinueCommandV1 }),
   Schema.Struct({ type: Schema.Literal("retry"), command: RetryCommandV1 }),
@@ -135,8 +139,8 @@ const independentQa = (
   assignment: AssignmentV1,
   qa: { readonly qaModel: ModelRef | string; readonly implementerModel: ModelRef | string },
 ): true | string => {
-  if (sameModelName(qa.qaModel, assignment.implementerModel)) {
-    return "QA must use a different model than the implementer.";
+  if (sameBaseModel(qa.qaModel, assignment.implementerModel)) {
+    return "QA must use a different base model than the implementer.";
   }
   return sameModelName(qa.implementerModel, assignment.implementerModel)
     ? true
@@ -191,6 +195,8 @@ export const RunV1 = Schema.Struct({
   retryCount: NonNegativeInt,
   retryLimit: PositiveInt,
   usage: Schema.Array(UsageMeasurementV1),
+  // Absent on runs recorded before advisory review existed.
+  advisory: Schema.optionalKey(AdvisoryReviewV1),
 }).check(
   Schema.makeFilter((run) => {
     if (run.retryCount > run.retryLimit) {
@@ -199,7 +205,15 @@ export const RunV1 = Schema.Struct({
     if (run.leaseId !== leaseIdFor(run.generation)) {
       return "The lease is bound to the generation.";
     }
-    return run.progress === null ? true : workerRecordMatchesRun(run, run.progress);
+    if (run.progress !== null) {
+      const progress = workerRecordMatchesRun(run, run.progress);
+      if (progress !== true) return progress;
+    }
+    if (run.advisory !== undefined) {
+      const advisory = workerRecordMatchesRun(run, run.advisory);
+      if (advisory !== true) return advisory;
+    }
+    return true;
   }),
 );
 export type RunV1 = typeof RunV1.Type;
@@ -410,6 +424,7 @@ export const LEGAL_EVENTS = {
     "heartbeat",
     "heartbeat_lapsed",
     "report_usage",
+    "record_advisory",
     "cancel",
     "fail",
     "operator_fail",
@@ -468,6 +483,8 @@ const contractFor = (event: SequenceEvent): ContractName => {
       return "progress";
     case "report_usage":
       return "usage";
+    case "record_advisory":
+      return "sequence";
     case "cancel":
     case "continue":
     case "retry":
@@ -727,12 +744,12 @@ const applyQa = (
         commands: state.commands,
       };
     }
-    if (sameModelName(qa.qaModel, state.assignment.implementerModel)) {
+    if (sameBaseModel(qa.qaModel, state.assignment.implementerModel)) {
       return yield* reject(
         state,
         event,
         "qa_same_model",
-        "QA must use a different model than the implementer.",
+        "QA must use a different base model than the implementer.",
       );
     }
     if (!sameModelName(qa.implementerModel, state.assignment.implementerModel)) {
@@ -970,6 +987,38 @@ const applyUsage = (
     return {
       ...state,
       run: { ...state.run, usage: [...state.run.usage, event.measurement] },
+    };
+  });
+
+const applyAdvisory = (
+  state: SequenceState,
+  event: Extract<SequenceEvent, { type: "record_advisory" }>,
+): Effect.Effect<SequenceState, ContractTransitionError> =>
+  Effect.gen(function* () {
+    if (state.phase !== "executing") {
+      return yield* reject(
+        state,
+        event,
+        "illegal_transition",
+        `Cannot record_advisory from ${state.phase}.`,
+      );
+    }
+    yield* matchesWork(state, event, event.review);
+    yield* requireLease(state, event, event.review);
+    const reviewed = canonicalGitSha(event.review.commit);
+    const assigned = canonicalGitSha(state.assignment.contextPackage.repoCommit);
+    if (reviewed === null || reviewed !== assigned) {
+      return yield* reject(
+        state,
+        event,
+        "revision_mismatch",
+        "The review is bound to the context package commit.",
+      );
+    }
+    // Findings stay on the run. They do not become the QA verdict.
+    return {
+      ...state,
+      run: { ...state.run, advisory: event.review },
     };
   });
 
@@ -1323,6 +1372,8 @@ const transition = (
         return yield* applyHeartbeatLapse(state, event);
       case "report_usage":
         return yield* applyUsage(state, event);
+      case "record_advisory":
+        return yield* applyAdvisory(state, event);
       case "cancel":
         return yield* applyCancel(state, event);
       case "continue":
@@ -1395,6 +1446,8 @@ const contractNameOf = (value: unknown): ContractName => {
       return "progress";
     case "report_usage":
       return "usage";
+    case "record_advisory":
+      return "sequence";
     case "cancel":
     case "continue":
     case "retry":

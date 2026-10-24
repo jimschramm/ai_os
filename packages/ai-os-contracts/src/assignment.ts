@@ -77,6 +77,10 @@ export const AssignmentV1 = Schema.Struct({
   implementerModel: ModelRef,
   // The provider instance the worker resolved. Absent on assignments recorded before it was stored.
   instanceId: Schema.optionalKey(InstanceId),
+  // Absent means the Codex implementer path. Advisory is the only Antigravity role in this phase.
+  role: Schema.optionalKey(Schema.Literals(["implementer", "qa", "advisory"])),
+  // Per-task Antigravity model. Codex assignments leave it unset.
+  advisoryModel: Schema.optionalKey(ModelRef),
   scope: ContractText,
   contextPackage: ContextPackageSnapshotV1,
 }).check(freezeDecoded);
