@@ -709,23 +709,47 @@ export const layer = Layer.unwrap(
             const watched = yield* reviews.watch(fresh.taskId);
             const decoded = yield* decodeState(fresh.state);
             if (decoded._tag === "Bad" || decoded.state.phase !== "executing") return;
+            // Bind before the nested generator. A closure does not keep the phase narrowing.
+            const executing = decoded.state;
             const outcome =
               watched === null
-                ? yield* applyBoardWorkflowEvent(
-                    decoded.state,
-                    {
-                      type: "lease_expired",
-                      lease: {
-                        taskId: fresh.taskId,
-                        attemptId: decoded.state.assignment.attemptId,
-                        generation: decoded.state.run.generation,
-                        leaseId: decoded.state.run.leaseId,
+                ? yield* Effect.gen(function* () {
+                    const generation = executing.run.generation;
+                    const attemptId = executing.assignment.attemptId;
+                    const canceled = yield* applyBoardWorkflowEvent(
+                      executing,
+                      {
+                        type: "cancel",
+                        command: {
+                          command: "cancel",
+                          taskId: fresh.taskId,
+                          attemptId,
+                          idempotencyKey: `agy-restart-c-${fresh.taskId}-${generation}`,
+                        },
                       },
-                    },
-                    `agy-recover-${fresh.taskId}-${decoded.state.run.generation}`,
-                    fresh.taskId,
-                    ledger,
-                  )
+                      `agy-restart-c-${fresh.taskId}-${generation}`,
+                      fresh.taskId,
+                      ledger,
+                    );
+                    if (canceled._tag !== "Applied" || canceled.state.phase !== "cancelled") {
+                      return canceled;
+                    }
+                    return yield* applyBoardWorkflowEvent(
+                      canceled.state,
+                      {
+                        type: "continue",
+                        command: {
+                          command: "continue",
+                          taskId: fresh.taskId,
+                          attemptId,
+                          idempotencyKey: `agy-restart-k-${fresh.taskId}-${generation}`,
+                        },
+                      },
+                      `agy-restart-k-${fresh.taskId}-${generation}`,
+                      fresh.taskId,
+                      canceled.ledger,
+                    );
+                  })
                 : watched.status === "running"
                   ? null
                   : yield* settleAdvisory(decoded.state, ledger, watched.execution, {

@@ -26,4 +26,4 @@ Agents writing to total-agent-memory must follow these node kinds and relationsh
 - Agents retrieve a context package of current (non-superseded, accepted) facts relevant to the task; they do not interpret the raw graph ad-hoc.
 - A Task carries `taskType`: `implementation` or `advisory`. QA follows that declaration.
 - Review delivered records the exact revision reviewed and the linked findings. It is not `ACCEPTED_BY` and does not satisfy independent QA.
-- An implementation is `VERIFIED_BY` only after QA by a different base model than the model that ran, on the exact submitted revision. A finding that asks for a change is a new implementation task, and that implementation goes through the same QA.
+- An implementation is `VERIFIED_BY` only after QA by a different base model than the assigned implementer, on the exact submitted revision. A finding that asks for a change is a new implementation task, and that implementation goes through the same QA.

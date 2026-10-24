@@ -15,18 +15,6 @@ import {
 } from "@t3tools/ai-os-contracts";
 
 import { renderPrompt as renderTaskPrompt } from "./grokT3.ts";
-import type { WorkerCapability } from "./worker.ts";
-
-/** What the advisory CLI worker actually implements. It does not resume or heartbeat. */
-export const ANTIGRAVITY_CAPABILITIES: ReadonlySet<WorkerCapability> = new Set([
-  "start",
-  "cancel",
-  "report_status",
-  "return_artifacts",
-  "report_usage",
-  "receive_context",
-  "idempotency",
-]);
 
 export interface AntigravityModel {
   readonly slug: string;

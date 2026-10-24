@@ -35,7 +35,6 @@ export {
   type T3ThreadView,
 } from "./t3Client.ts";
 export {
-  ANTIGRAVITY_CAPABILITIES,
   advisoryEnvironment,
   advisoryUsage,
   agyEnvironment,

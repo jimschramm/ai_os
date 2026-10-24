@@ -235,7 +235,7 @@ it.effect("delivers an advisory review without entering QA", () =>
   }),
 );
 
-it.effect("compares QA with the model that ran, not only the assigned model", () =>
+it.effect("keeps QA on the assigned implementer when usage names another model", () =>
   Effect.gen(function* () {
     const executing = yield* applySequence([
       happyPathEvents[0]!,
@@ -267,8 +267,17 @@ it.effect("compares QA with the model that ran, not only the assigned model", ()
       { type: "submit_completion", completion: completionExample },
     ]);
     if (executing.phase !== "awaiting_qa") return yield* Effect.die("Completion must wait for QA.");
-    assert.deepStrictEqual(executing.run.executedModel, { model: "gpt-6-astra-high" });
+    assert.strictEqual(executing.run.usage.length, 1);
     const sameBase = yield* failure(executing, {
+      type: "qa",
+      qa: {
+        ...qaReworkExample,
+        qaModel: "gpt-6-sol-medium",
+        implementerModel: "gpt-6-astra",
+      },
+    });
+    assert.strictEqual(sameBase.reason, "qa_same_model");
+    const reviewed = yield* applySequenceEvent(executing, {
       type: "qa",
       qa: {
         ...qaReworkExample,
@@ -276,36 +285,7 @@ it.effect("compares QA with the model that ran, not only the assigned model", ()
         implementerModel: "gpt-6-sol",
       },
     });
-    assert.strictEqual(sameBase.reason, "qa_same_model");
-    const namedAssignment = yield* failure(executing, {
-      type: "qa",
-      qa: {
-        ...qaReworkExample,
-        qaModel: "gemini-4-argon-high",
-        implementerModel: "gpt-6-sol",
-      },
-    });
-    assert.strictEqual(namedAssignment.reason, "implementer_mismatch");
-    const reviewed = yield* applySequenceEvent(executing, {
-      type: "qa",
-      qa: {
-        ...qaReworkExample,
-        qaModel: "gemini-4-argon-high",
-        implementerModel: "gpt-6-astra-high",
-      },
-    });
     assert.strictEqual(reviewed.phase, "rework");
-    const wrongRevision = yield* failure(executing, {
-      type: "qa",
-      qa: {
-        ...qaAcceptExample,
-        qaModel: "gemini-4-argon-high",
-        implementerModel: "gpt-6-astra-high",
-        artifactRevision: { type: "git", sha: "b".repeat(40) },
-        acceptedRevision: { type: "git", sha: "b".repeat(40) },
-      },
-    });
-    assert.strictEqual(wrongRevision.reason, "acceptance_revision_mismatch");
   }),
 );
 

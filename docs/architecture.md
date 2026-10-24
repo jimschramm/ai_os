@@ -58,7 +58,7 @@ Core preferences are shared only when that sharing is deliberate. Project knowle
 
 ## Contracts
 
-Every contract has a versioned schema, valid transitions, error behavior, examples, and executable contract tests. The first sequence is request, assignment, execution, independent QA, rework, accepted result. A task declares its type. An implementation still requires independent QA by a different base model than the model that ran, on the exact submitted revision. An advisory review finishes as Review delivered, with that revision and its findings. It does not enter QA, approve a change, or satisfy mandatory QA. A finding that asks for a change is a new implementation, and that implementation goes through the same QA.
+Every contract has a versioned schema, valid transitions, error behavior, examples, and executable contract tests. The first sequence is request, assignment, execution, independent QA, rework, accepted result. A task declares its type. An implementation still requires independent QA by a different base model than the assigned implementer, on the exact submitted revision. An advisory review finishes as Review delivered, with that revision and its findings. It does not enter QA, approve a change, or satisfy mandatory QA. A finding that asks for a change is a new implementation, and that implementation goes through the same QA.
 
 Build order starts here. Stage 1 begins with Intake, Assignment, Completion submission, and QA verdict/rework.
 
@@ -90,7 +90,7 @@ Workers run in isolated workspaces and worktrees. Agent-to-agent exchanges are t
 
 Code, including infrastructure-as-code, adapters, and ai_os itself, follows implement, verify, correct, reverify, accept.
 
-QA runs on a different base model from the model that actually ran. It receives the requirements and the actual artifacts, and it runs the checks. A finding is a defect, the evidence, and the expected behavior. Acceptance binds to the exact final revision. A later change reruns the affected checks. Unavailable QA is a visible wait. There is no bypass. Which adapter ran the task does not decide whether QA is required.
+QA runs on a different base model from the assigned implementer. It receives the requirements and the actual artifacts, and it runs the checks. A finding is a defect, the evidence, and the expected behavior. Acceptance binds to the exact final revision. A later change reruns the affected checks. Unavailable QA is a visible wait. There is no bypass. Which adapter ran the task does not decide whether QA is required.
 
 Evidence is diffs, commits, tests, browser checks, previews, deployment identities, and readbacks. A completion claim does not establish that the work happened. Agreement between models is not sufficient. Non-code deliverables get the verification that fits them.
 
@@ -133,19 +133,19 @@ No vector store is an authority.
 
 ## Agents, providers, and integrations
 
-| Kind               | Examples                                             | Role                                                                                                                                                                  |
-| ------------------ | ---------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Intake             | Grok Bot                                             | Only conversational intake. Records the task and returns progress.                                                                                                    |
-| Interactive worker | Codex in VS Code                                     | Update-only. Jim drives it, and it reports status and artifacts.                                                                                                      |
-| Controlled worker  | Independent Codex via T3                             | Fully controlled. T3 starts, cancels, resumes, and reads it.                                                                                                          |
-| Advisory worker    | Antigravity CLI (`agy`)                              | Advisory review only. It starts, cancels, returns findings, and reports token usage. It does not resume or heartbeat. A restart leaves the run in `recovery_pending`. |
-| Optional worker    | Hermes                                               | Not installed. The console does not depend on it.                                                                                                                     |
-| Custom worker      | OpenAI, xAI, Anthropic, DeepSeek, local Ollama       | Provider registry: model, auth reference, limits.                                                                                                                     |
-| Integrations       | GitHub, Drive, OneDrive, email, calendar, AWS, media | Connections with explicit capabilities.                                                                                                                               |
+| Kind               | Examples                                             | Role                                                                                                                                                                                                |
+| ------------------ | ---------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Intake             | Grok Bot                                             | Only conversational intake. Records the task and returns progress.                                                                                                                                  |
+| Interactive worker | Codex in VS Code                                     | Update-only. Jim drives it, and it reports status and artifacts.                                                                                                                                    |
+| Controlled worker  | Independent Codex via T3                             | Fully controlled. T3 starts, cancels, resumes, and reads it.                                                                                                                                        |
+| Advisory worker    | Antigravity CLI (`agy`)                              | Advisory review only. It starts, cancels, returns findings, and reports token usage. It does not resume or heartbeat. A restart returns the card to Ready, and In Progress starts the review again. |
+| Optional worker    | Hermes                                               | Not installed. The console does not depend on it.                                                                                                                                                   |
+| Custom worker      | OpenAI, xAI, Anthropic, DeepSeek, local Ollama       | Provider registry: model, auth reference, limits.                                                                                                                                                   |
+| Integrations       | GitHub, Drive, OneDrive, email, calendar, AWS, media | Connections with explicit capabilities.                                                                                                                                                             |
 
 Other Grok bots are external update-only workers, the same class as the VS Code Codex sidebar.
 
-An adapter declares the capabilities it implements: start, retrieve assignments, report status, cancel, resume, return artifacts, report usage, receive context, heartbeat, and idempotency. The console calls only capabilities the adapter declares. Antigravity declares start, cancel, report status, return artifacts, report usage, receive context, and idempotency.
+An adapter declares the capabilities it implements: start, retrieve assignments, report status, cancel, resume, return artifacts, report usage, receive context, heartbeat, and idempotency. The console calls only capabilities the adapter declares.
 
 Three paths have to be verified before a worker is trusted: Grok intake and automatic return, Codex interactive versus the independent T3 worker, and subscription versus API auth and billing.
 

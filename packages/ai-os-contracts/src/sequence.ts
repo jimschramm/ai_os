@@ -24,7 +24,6 @@ import {
   IsoDateTime,
   NonNegativeInt,
   PositiveInt,
-  ModelRef,
   canonicalGitSha,
   sameBaseModel,
   sameModelName,
@@ -141,21 +140,19 @@ const payloadMatches = (
     : "The payload attempt must match the assignment.";
 };
 
-const modelThatRan = (
-  assignment: AssignmentV1,
-  run: { readonly executedModel?: ModelRef | undefined },
-): ModelRef | string => run.executedModel ?? assignment.implementerModel;
-
 const independentQa = (
-  ran: ModelRef | string,
-  qa: { readonly qaModel: ModelRef | string; readonly implementerModel: ModelRef | string },
+  implementer: AssignmentV1["implementerModel"],
+  qa: {
+    readonly qaModel: AssignmentV1["implementerModel"];
+    readonly implementerModel: AssignmentV1["implementerModel"];
+  },
 ): true | string => {
-  if (sameBaseModel(qa.qaModel, ran)) {
-    return "QA must use a different base model than the model that ran.";
+  if (sameBaseModel(qa.qaModel, implementer)) {
+    return "QA must use a different base model than the implementer.";
   }
-  return sameModelName(qa.implementerModel, ran)
+  return sameModelName(qa.implementerModel, implementer)
     ? true
-    : "The QA payload names a different implementer than the model that ran.";
+    : "The QA payload names a different implementer than the assignment.";
 };
 
 const workerRecordMatchesRun = (
@@ -208,8 +205,6 @@ export const RunV1 = Schema.Struct({
   usage: Schema.Array(UsageMeasurementV1),
   // Absent on runs recorded before advisory review existed.
   advisory: Schema.optionalKey(AdvisoryReviewV1),
-  // Set from usage when the worker reports the model that ran. QA uses it.
-  executedModel: Schema.optionalKey(ModelRef),
 }).check(
   Schema.makeFilter((run) => {
     if (run.retryCount > run.retryLimit) {
@@ -328,7 +323,7 @@ export const ReworkState = Schema.Struct({
     if (qaMatch !== true) {
       return qaMatch;
     }
-    const models = independentQa(modelThatRan(state.assignment, state.run), state.qa);
+    const models = independentQa(state.assignment.implementerModel, state.qa);
     if (models !== true) {
       return models;
     }
@@ -361,7 +356,7 @@ export const AcceptedState = Schema.Struct({
     if (qaMatch !== true) {
       return qaMatch;
     }
-    const models = independentQa(modelThatRan(state.assignment, state.run), state.qa);
+    const models = independentQa(state.assignment.implementerModel, state.qa);
     if (models !== true) {
       return models;
     }
@@ -797,13 +792,13 @@ const applyQa = (
         commands: state.commands,
       };
     }
-    const ran = modelThatRan(state.assignment, state.run);
-    const independence = independentQa(ran, qa);
+    const implementer = state.assignment.implementerModel;
+    const independence = independentQa(implementer, qa);
     if (independence !== true) {
       return yield* reject(
         state,
         event,
-        sameBaseModel(qa.qaModel, ran) ? "qa_same_model" : "implementer_mismatch",
+        sameBaseModel(qa.qaModel, implementer) ? "qa_same_model" : "implementer_mismatch",
         independence,
       );
     }
@@ -1036,7 +1031,6 @@ const applyUsage = (
       run: {
         ...state.run,
         usage: [...state.run.usage, event.measurement],
-        executedModel: event.measurement.attribution.model,
       },
     };
   });

@@ -1365,11 +1365,16 @@ describe("ai-os board route", () => {
     expect(after?.state.phase).toBe("assigned");
   });
 
-  it("leaves an advisory run in recovery_pending when the process restarts", async () => {
-    const first = handlerFor(undefined, allowRuns, {
+  it("returns an advisory review to Ready after a restart and starts it again", async () => {
+    let starts = 0;
+    const reviews = {
       ...idleReviews,
-      start: () => Effect.succeed({ status: "running" as const, runId: "agy-run-1" }),
-    });
+      start: () => {
+        starts += 1;
+        return Effect.succeed({ status: "running" as const, runId: `agy-run-${starts}` });
+      },
+    };
+    const first = handlerFor(undefined, allowRuns, reviews);
     expect(
       (
         await postJson(first.handler, ADAPTER_BOARD_EVENT_PATH, {
@@ -1423,11 +1428,20 @@ describe("ai-os board route", () => {
     ).toBe(200);
     const running = (await readCards(first.handler)).find((item) => item.taskId === "task-agy");
     expect(running?.state.phase).toBe("executing");
-    const second = handlerFor(first.stateDir);
+    expect(starts).toBe(1);
+    const second = handlerFor(first.stateDir, allowRuns, reviews);
     const recovered = (await readCards(second.handler)).find((item) => item.taskId === "task-agy");
-    expect(recovered?.state.phase).toBe("recovery_pending");
-    expect(recovered?.state.phase === "recovery_pending" ? recovered.state.recoveryLabel : "").toBe(
-      "Execution status unknown",
-    );
+    expect(recovered?.state.phase).toBe("assigned");
+    expect(recovered?.threadId).toBeNull();
+    const again = await postJson(second.handler, ADAPTER_BOARD_MOVE_PATH, {
+      taskId: "task-agy",
+      column: "Running",
+      idempotencyKey: "run-agy-again",
+      model: "gemini-4-argon-high",
+    });
+    expect(again.status).toBe(200);
+    expect(starts).toBe(2);
+    const restarted = (await readCards(second.handler)).find((item) => item.taskId === "task-agy");
+    expect(restarted?.state.phase).toBe("executing");
   });
 });
