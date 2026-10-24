@@ -1,11 +1,12 @@
 // @effect-diagnostics nodeBuiltinImport:off - Recovery confirms one spawned review pid and removes its worktree.
-import { access, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 
 import {
   advisoryUsage,
   listAntigravityModels,
   resolveModelChoice,
   runAdvisoryReview,
+  sweepAdvisoryIsolation,
   type AdvisoryExecution,
   type AdvisorySuccess,
   type AntigravityCatalog,
@@ -46,6 +47,7 @@ export class AntigravityReviews extends Context.Service<
     readonly watch: (taskId: string) => Effect.Effect<AdvisoryWatch | null>;
     readonly cancel: (taskId: string) => Effect.Effect<"requested" | "already_stopped">;
     readonly recover: (taskId: string) => Effect.Effect<AdvisoryRecover>;
+    readonly sweep: (taskId: string) => Effect.Effect<void>;
   }
 >()("t3/aiOsAntigravity/AntigravityReviews") {}
 
@@ -400,11 +402,6 @@ export const liveAntigravity = Layer.effect(
         );
       }
     };
-    const removeReview = (taskId: string, isolationRoot: string) =>
-      Effect.promise(async () => {
-        await rm(isolationRoot, { recursive: true, force: true });
-        await rm(markerFor(taskId), { force: true });
-      });
     const listModels = () =>
       Effect.promise(() => listAntigravityModels({ configuredModel: configuredModel() }));
     const watch: AntigravityReviews["Service"]["watch"] = (taskId) =>
@@ -522,7 +519,10 @@ export const liveAntigravity = Layer.effect(
         }
         const marker = yield* readMarker(taskId);
         if (job !== undefined && job.execution !== null) {
-          if (marker !== null) yield* removeReview(taskId, marker.isolationRoot);
+          if (marker !== null) {
+            yield* Effect.promise(() => sweepAdvisoryIsolation({ root: marker.isolationRoot }));
+            yield* Effect.promise(() => rm(markerFor(taskId), { force: true }));
+          }
           jobs.delete(taskId);
           return { status: "stopped" as const };
         }
@@ -545,9 +545,31 @@ export const liveAntigravity = Layer.effect(
           yield* Effect.promise(() => rm(markerFor(taskId), { force: true }));
           return { status: "stopped" as const };
         }
-        yield* removeReview(taskId, marker.isolationRoot);
+        yield* Effect.promise(() => sweepAdvisoryIsolation({ root: marker.isolationRoot }));
+        yield* Effect.promise(() => rm(markerFor(taskId), { force: true }));
         return { status: "stopped" as const };
       });
-    return { listModels, start, watch, cancel, recover };
+    const sweep: AntigravityReviews["Service"]["sweep"] = (taskId) =>
+      Effect.gen(function* () {
+        const job = jobs.get(taskId);
+        if (job !== undefined && job.execution === null) return;
+        const marker = yield* readMarker(taskId);
+        const root = marker?.isolationRoot ?? path.join(config.stateDir, "antigravity", taskId);
+        const cleaned = yield* Effect.promise(() =>
+          sweepAdvisoryIsolation({ root, pid: marker?.pid ?? null }),
+        );
+        if (!cleaned) return;
+        yield* Effect.promise(() => rm(markerFor(taskId), { force: true }));
+        if (job !== undefined) jobs.delete(taskId);
+      });
+    const stored = yield* Effect.promise(async () => {
+      try {
+        return await readdir(path.join(config.stateDir, "antigravity"));
+      } catch {
+        return [] as string[];
+      }
+    });
+    for (const taskId of stored) yield* sweep(taskId);
+    return { listModels, start, watch, cancel, recover, sweep };
   }),
 );

@@ -58,7 +58,7 @@ Core preferences are shared only when that sharing is deliberate. Project knowle
 
 ## Contracts
 
-Every contract has a versioned schema, valid transitions, error behavior, examples, and executable contract tests. The first sequence is request, assignment, execution, independent QA, rework, accepted result. A task declares its type. An implementation still requires independent QA by a different base model than the implementer's actual runtime model, on the exact submitted revision. If either actual model is unknown, the work cannot be accepted. The assigned model is not a fallback, and nothing is substituted. An advisory review finishes as Review delivered, with that revision and its findings. It does not enter QA, approve a change, or satisfy mandatory QA. A finding that asks for a change is a new implementation, and that implementation goes through the same QA.
+Every contract has a versioned schema, valid transitions, error behavior, examples, and executable contract tests. The first sequence is request, assignment, execution, independent QA, rework, accepted result. A task declares its type. An implementation still requires independent QA by a different base model than the model that actually ran, on the exact submitted revision. The run records the requested model and one actual model, set from the worker's report. A usage measurement does not change it. If the worker did not report the actual model, QA uses the assigned implementer and records that fallback as unverified. An advisory review finishes as Review delivered, with that revision and its findings. It does not enter QA, approve a change, or satisfy mandatory QA. A finding that asks for a change is a new implementation, and that implementation goes through the same QA.
 
 Build order starts here. Stage 1 begins with Intake, Assignment, Completion submission, and QA verdict/rework.
 
@@ -90,7 +90,7 @@ Workers run in isolated workspaces and worktrees. Agent-to-agent exchanges are t
 
 Code, including infrastructure-as-code, adapters, and ai_os itself, follows implement, verify, correct, reverify, accept.
 
-QA runs on a different base model from the implementer's actual runtime model. It receives the requirements and the actual artifacts, and it runs the checks. If the implementer's actual model or the reviewer's actual model is unknown, QA cannot accept the work. A finding is a defect, the evidence, and the expected behavior. Acceptance binds to the exact final revision. A later change reruns the affected checks. Unavailable QA is a visible wait. There is no bypass. Which adapter ran the task does not decide whether QA is required.
+QA runs on a different base model from the model that actually ran. It receives the requirements and the actual artifacts, and it runs the checks. If the worker did not report that model, QA uses the assigned implementer and the comparison is recorded as unverified. A finding is a defect, the evidence, and the expected behavior. Acceptance binds to the exact final revision. A later change reruns the affected checks. Unavailable QA is a visible wait. There is no bypass. Which adapter ran the task does not decide whether QA is required.
 
 Evidence is diffs, commits, tests, browser checks, previews, deployment identities, and readbacks. A completion claim does not establish that the work happened. Agreement between models is not sufficient. Non-code deliverables get the verification that fits them.
 

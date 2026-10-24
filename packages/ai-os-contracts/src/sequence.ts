@@ -98,7 +98,6 @@ export const SequenceEvent = Schema.Union([
     attemptId: ContractId,
     generation: PositiveInt,
     leaseId: ContractId,
-    role: Schema.Literals(["implementer", "reviewer"]),
     requested: Schema.NullOr(ModelRef),
     actual: Schema.NullOr(ModelRef),
   }),
@@ -151,46 +150,32 @@ const payloadMatches = (
     : "The payload attempt must match the assignment.";
 };
 
+const modelThatRan = (
+  assignment: { readonly implementerModel: ModelRef | string },
+  run: { readonly actualModel?: { readonly model: ModelRef | null } | undefined },
+): ModelRef | string => run.actualModel?.model ?? assignment.implementerModel;
+
 const independentQa = (
-  run: {
-    readonly implementerRuntime?: { readonly actual: ModelRef | null } | undefined;
-    readonly reviewerRuntime?: { readonly actual: ModelRef | null } | undefined;
-  },
+  assignment: { readonly implementerModel: ModelRef | string },
+  run: { readonly actualModel?: { readonly model: ModelRef | null } | undefined },
   qa: {
     readonly qaModel: ModelRef | string;
     readonly implementerModel: ModelRef | string;
   },
 ):
   | true
-  | {
-      readonly reason: "qa_model_unknown" | "qa_same_model" | "implementer_mismatch";
-      readonly detail: string;
-    } => {
-  const implementer = run.implementerRuntime?.actual ?? null;
-  const reviewer = run.reviewerRuntime?.actual ?? null;
-  if (implementer === null || reviewer === null) {
-    return {
-      reason: "qa_model_unknown",
-      detail:
-        "Independent QA needs the implementer's actual model and the reviewer's actual model from the runtime.",
-    };
-  }
-  if (sameBaseModel(reviewer, implementer)) {
+  | { readonly reason: "qa_same_model" | "implementer_mismatch"; readonly detail: string } => {
+  const ran = modelThatRan(assignment, run);
+  if (sameBaseModel(qa.qaModel, ran)) {
     return {
       reason: "qa_same_model",
-      detail: "QA must use a different base model than the implementer that ran.",
+      detail: "QA must use a different base model than the model that actually ran.",
     };
   }
-  if (!sameModelName(qa.implementerModel, implementer)) {
+  if (!sameModelName(qa.implementerModel, ran)) {
     return {
       reason: "implementer_mismatch",
-      detail: "The QA payload names a different implementer than the runtime.",
-    };
-  }
-  if (!sameModelName(qa.qaModel, reviewer)) {
-    return {
-      reason: "implementer_mismatch",
-      detail: "The QA payload names a different reviewer than the runtime.",
+      detail: "The QA payload names a different implementer than the model that ran.",
     };
   }
   return true;
@@ -236,11 +221,14 @@ export const AcknowledgedState = Schema.Struct({
 }).check(Schema.makeFilter((state) => linked(state.acknowledgment)));
 export type AcknowledgedState = typeof AcknowledgedState.Type;
 
-export const RuntimeModelsV1 = Schema.Struct({
+/** The model the worker was asked to run, and the one model it reported running. */
+export const ActualModelV1 = Schema.Struct({
   requested: Schema.NullOr(ModelRef),
-  actual: Schema.NullOr(ModelRef),
+  model: Schema.NullOr(ModelRef),
+  // True only when the worker never reported a model and QA used the assignment.
+  unverified: Schema.Boolean,
 });
-export type RuntimeModelsV1 = typeof RuntimeModelsV1.Type;
+export type ActualModelV1 = typeof ActualModelV1.Type;
 
 export const RunV1 = Schema.Struct({
   generation: PositiveInt,
@@ -250,9 +238,8 @@ export const RunV1 = Schema.Struct({
   retryCount: NonNegativeInt,
   retryLimit: PositiveInt,
   usage: Schema.Array(UsageMeasurementV1),
-  // Recorded from provider runtime metadata. Absent until the runtime reports.
-  implementerRuntime: Schema.optionalKey(RuntimeModelsV1),
-  reviewerRuntime: Schema.optionalKey(RuntimeModelsV1),
+  // Set from the worker's reported model. Usage measurements do not write it.
+  actualModel: Schema.optionalKey(ActualModelV1),
   // Absent on runs recorded before advisory review existed.
   advisory: Schema.optionalKey(AdvisoryReviewV1),
 }).check(
@@ -373,7 +360,7 @@ export const ReworkState = Schema.Struct({
     if (qaMatch !== true) {
       return qaMatch;
     }
-    const models = independentQa(state.run, state.qa);
+    const models = independentQa(state.assignment, state.run, state.qa);
     if (models !== true) {
       return models.detail;
     }
@@ -406,7 +393,7 @@ export const AcceptedState = Schema.Struct({
     if (qaMatch !== true) {
       return qaMatch;
     }
-    const models = independentQa(state.run, state.qa);
+    const models = independentQa(state.assignment, state.run, state.qa);
     if (models !== true) {
       return models.detail;
     }
@@ -518,7 +505,7 @@ export const LEGAL_EVENTS = {
     "operator_fail",
     "transfer_ownership",
   ],
-  awaiting_qa: ["qa", "cancel", "record_runtime_models"],
+  awaiting_qa: ["qa", "cancel"],
   rework: ["start_execution", "cancel"],
   accepted: ["start_execution", "deliver"],
   review_delivered: [],
@@ -844,10 +831,11 @@ const applyQa = (
         commands: state.commands,
       };
     }
-    const checked = independentQa(state.run, qa);
+    const checked = independentQa(state.assignment, state.run, qa);
     if (checked !== true) {
       return yield* reject(state, event, checked.reason, checked.detail);
     }
+    const run = recordUnverifiedFallback(state.run, state.assignment);
     if (!sameRevision(qa.artifactRevision, state.completion.artifactRevision)) {
       return yield* reject(
         state,
@@ -873,7 +861,7 @@ const applyQa = (
         completion: state.completion,
         qa,
         reworkRevision: qa.artifactRevision,
-        run: state.run,
+        run,
         commands: state.commands,
       };
     }
@@ -884,7 +872,7 @@ const applyQa = (
       assignment: state.assignment,
       completion: state.completion,
       qa,
-      run: state.run,
+      run,
       commands: state.commands,
       deliveries: [],
     };
@@ -1124,81 +1112,64 @@ const mergeRuntimeModel = (
 };
 
 const mergedRuntime = (
-  current: RuntimeModelsV1 | undefined,
+  current: ActualModelV1 | undefined,
   event: Extract<SequenceEvent, { type: "record_runtime_models" }>,
-): RuntimeModelsV1 | "conflict" => {
+): ActualModelV1 | "conflict" => {
   const requested = mergeRuntimeModel(current?.requested, event.requested);
-  const actual = mergeRuntimeModel(current?.actual, event.actual);
-  if (requested === "conflict" || actual === "conflict") return "conflict";
-  return { requested, actual };
+  const model = mergeRuntimeModel(current?.model, event.actual);
+  if (requested === "conflict" || model === "conflict") return "conflict";
+  return { requested, model, unverified: false };
 };
+
+/** QA may use the assignment only when the worker never reported a model. */
+const recordUnverifiedFallback = (
+  run: RunV1,
+  assignment: { readonly implementerModel: ModelRef },
+): RunV1 =>
+  run.actualModel?.model != null
+    ? run
+    : {
+        ...run,
+        actualModel: {
+          requested: run.actualModel?.requested ?? null,
+          model: assignment.implementerModel,
+          unverified: true,
+        },
+      };
 
 const applyRuntimeModels = (
   state: SequenceState,
   event: Extract<SequenceEvent, { type: "record_runtime_models" }>,
 ): Effect.Effect<SequenceState, ContractTransitionError> =>
   Effect.gen(function* () {
-    if (event.role === "implementer") {
-      if (state.phase !== "executing") {
-        return yield* reject(
-          state,
-          event,
-          "illegal_transition",
-          `Cannot record_runtime_models for ${event.role} from ${state.phase}.`,
-        );
-      }
-      const executing = state;
-      yield* matchesWork(executing, event, event);
-      if (
-        event.generation !== executing.run.generation ||
-        event.leaseId !== executing.run.leaseId
-      ) {
-        return yield* reject(
-          executing,
-          event,
-          "stale_generation",
-          "The write names a stale generation or lease.",
-        );
-      }
-      const recorded = mergedRuntime(executing.run.implementerRuntime, event);
-      if (recorded === "conflict") {
-        return yield* reject(
-          executing,
-          event,
-          "illegal_transition",
-          "The runtime already reported a different model. Nothing was substituted.",
-        );
-      }
-      return { ...executing, run: { ...executing.run, implementerRuntime: recorded } };
-    }
-    if (state.phase !== "awaiting_qa") {
+    if (state.phase !== "executing") {
       return yield* reject(
         state,
         event,
         "illegal_transition",
-        `Cannot record_runtime_models for ${event.role} from ${state.phase}.`,
+        `Cannot record_runtime_models from ${state.phase}.`,
       );
     }
-    const awaiting = state;
-    yield* matchesWork(awaiting, event, event);
-    if (event.generation !== awaiting.run.generation || event.leaseId !== awaiting.run.leaseId) {
+    const executing = state;
+    yield* matchesWork(executing, event, event);
+    if (event.generation !== executing.run.generation || event.leaseId !== executing.run.leaseId) {
       return yield* reject(
-        awaiting,
+        executing,
         event,
         "stale_generation",
         "The write names a stale generation or lease.",
       );
     }
-    const recorded = mergedRuntime(awaiting.run.reviewerRuntime, event);
+    const recorded = mergedRuntime(executing.run.actualModel, event);
     if (recorded === "conflict") {
       return yield* reject(
-        awaiting,
+        executing,
         event,
         "illegal_transition",
         "The runtime already reported a different model. Nothing was substituted.",
       );
     }
-    return { ...awaiting, run: { ...awaiting.run, reviewerRuntime: recorded } };
+    return { ...executing, run: { ...executing.run, actualModel: recorded } };
   });
 
 const applyDeliverReview = (

@@ -719,6 +719,7 @@ export const layer = Layer.unwrap(
             ) {
               return;
             }
+            if (watched === null) yield* reviews.sweep(fresh.taskId);
             const outcome =
               watched === null
                 ? yield* applyBoardWorkflowEvent(

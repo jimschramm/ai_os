@@ -1,7 +1,7 @@
 // @effect-diagnostics nodeBuiltinImport:off globalTimers:off - This runner spawns the Antigravity CLI and arms a SIGKILL watchdog.
 import { execFile, spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { chmod, lstat, mkdir, readdir, rm, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import type { Stats } from "node:fs";
 import path from "node:path";
 import type { Readable } from "node:stream";
@@ -490,6 +490,108 @@ const restoreWritable = (root: string): Promise<void> =>
   walkTree(root, (abs, info) => chmod(abs, info.isDirectory() ? 0o755 : 0o644)).catch(
     () => undefined,
   );
+
+const childAlive = (pid: number): boolean => {
+  if (!Number.isInteger(pid) || pid <= 0 || pid === process.pid) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return typeof error === "object" && error !== null && "code" in error && error.code === "EPERM";
+  }
+};
+
+const stopRecordedChild = async (pid: number | null | undefined): Promise<boolean> => {
+  if (pid == null || !childAlive(pid)) return true;
+  try {
+    process.kill(pid, "SIGINT");
+  } catch {
+    // The pid exited between the check and the signal.
+  }
+  const waitUntil = async () => {
+    for (let tick = 0; tick < 20 && childAlive(pid); tick += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+  };
+  await waitUntil();
+  if (childAlive(pid)) {
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {
+      // The pid exited between the check and the signal.
+    }
+    await waitUntil();
+  }
+  return !childAlive(pid);
+};
+
+const mainRepoFromWorktree = async (source: string): Promise<string | null> => {
+  try {
+    const pointer = await readFile(path.join(source, ".git"), "utf8");
+    const match = /^gitdir:\s*(.+)$/m.exec(pointer);
+    const gitDir = match?.[1];
+    if (gitDir === undefined) return null;
+    const resolved = path.resolve(source, gitDir.trim());
+    const worktrees = path.dirname(resolved);
+    if (path.basename(worktrees) !== "worktrees") return null;
+    return path.dirname(path.dirname(worktrees));
+  } catch {
+    return null;
+  }
+};
+
+const attemptDirectories = async (root: string): Promise<string[]> => {
+  const found: string[] = [];
+  const walk = async (dir: string): Promise<void> => {
+    let entries;
+    try {
+      entries = await readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    if (entries.some((entry) => entry.isDirectory() && entry.name === "source")) {
+      found.push(dir);
+      return;
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory() || entry.name === "source" || entry.name === "scratch") continue;
+      if (entry.name === "home") continue;
+      await walk(path.join(dir, entry.name));
+    }
+  };
+  await walk(root);
+  return found;
+};
+
+/**
+ * Stop one recorded Antigravity child, restore the read-only checkout, and
+ * delete leftover attempt directories. A live child keeps its worktree.
+ */
+export const sweepAdvisoryIsolation = async (input: {
+  readonly root: string;
+  readonly pid?: number | null;
+  readonly git?: GitRunner;
+}): Promise<boolean> => {
+  const stopped = await stopRecordedChild(input.pid);
+  if (!stopped) return false;
+  const git = input.git ?? defaultGit;
+  const attempts = await attemptDirectories(input.root);
+  const repos = new Set<string>();
+  for (const attempt of attempts) {
+    const source = path.join(attempt, "source");
+    await restoreWritable(source);
+    const repo = await mainRepoFromWorktree(source);
+    if (repo !== null) {
+      repos.add(repo);
+      await git.run(["worktree", "remove", "--force", source], repo);
+    }
+  }
+  for (const repo of repos) await git.run(["worktree", "prune"], repo);
+  for (const attempt of attempts) {
+    await rm(attempt, { recursive: true, force: true }).catch(() => undefined);
+  }
+  return true;
+};
 
 const gitFailure = (result: GitResult, command: string): string => {
   const detail = (result.stderr || result.stdout).trim();

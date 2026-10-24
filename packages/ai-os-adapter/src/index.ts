@@ -47,6 +47,7 @@ export {
   resolveModelChoice,
   reviewArguments,
   runAdvisoryReview,
+  sweepAdvisoryIsolation,
   type AdvisoryExecution,
   type AdvisorySuccess,
   type AntigravityCatalog,

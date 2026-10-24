@@ -54,7 +54,7 @@ An open attempt has a generation and a lease id minted for that generation (`lea
 | `verdict: rework`           | Moves to `rework`. Findings are required. The reviewed revision is recorded.                                                           |
 | `verdict: accept`           | Moves to `accepted`. `acceptedRevision` must equal `artifactRevision`, and that revision must be the one in the completion submission. |
 
-QA compares the implementer's actual base model with the reviewer's actual base model. Both come from runtime metadata, not from the assignment and not from a usage measurement. If either actual is unknown, the verdict is `qa_model_unknown` and the work cannot be accepted. Nothing is substituted. A model is `{ provider?, model }`. Provider is attribution (`openai/gpt-5.4` and `azure/gpt-5.4` are the same model, and so is a bare `gpt-5.4`). The schema check compares the two model names on the verdict. The transition compares the runtime actuals. It rejects the same base (`qa_same_model`) and a payload that names a different model than the runtime (`implementer_mismatch`). Acceptance compares canonical revisions, so a full git id matches regardless of case. An unavailable verdict cannot also carry an acceptance. There is no event that skips QA.
+QA compares its model with the one actual model on the run. That field is set from the worker's reported model, together with the model that was requested. A usage measurement does not change it. If the actual model is unknown, QA uses the assigned implementer and records that fallback as unverified. Nothing is substituted over a model the worker already reported. A model is `{ provider?, model }`. Provider is attribution (`openai/gpt-5.4` and `azure/gpt-5.4` are the same model, and so is a bare `gpt-5.4`). The schema check compares the two model names on the verdict. The transition compares the QA model with the model that ran. It rejects the same base (`qa_same_model`) and a payload that names a different implementer (`implementer_mismatch`). Acceptance compares canonical revisions, so a full git id matches regardless of case. An unavailable verdict cannot also carry an acceptance. There is no event that skips QA.
 
 ## Progress
 
@@ -101,9 +101,8 @@ Invalid payloads fail schema decode. These transition errors are `ContractTransi
 | `illegal_transition`                  | The event is not legal for the phase.                                                                              |
 | `task_mismatch`                       | The payload task or usage project is not the acknowledged work.                                                    |
 | `attempt_mismatch`                    | The payload attempt is not the open assignment.                                                                    |
-| `implementer_mismatch`                | QA names a different implementer or reviewer than the runtime.                                                     |
-| `qa_same_model`                       | The reviewer's actual base model is the implementer's actual base model.                                           |
-| `qa_model_unknown`                    | The implementer's actual model or the reviewer's actual model was not reported by the runtime.                     |
+| `implementer_mismatch`                | QA names a different implementer than the model that ran.                                                          |
+| `qa_same_model`                       | QA uses the same base model as the model that ran.                                                                 |
 | `revision_mismatch`                   | Rework submits the same artifact revision again.                                                                   |
 | `acceptance_revision_mismatch`        | QA or acceptance names a revision other than the submitted one, or the revision already sent back for rework.      |
 | `recovery_pending_not_ready`          | Any event other than `resolve_recovery` while recovery is pending.                                                 |

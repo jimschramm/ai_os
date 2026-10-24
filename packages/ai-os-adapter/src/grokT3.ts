@@ -160,7 +160,7 @@ const runtimeObservation = (input: {
 }): ObservationEvent | null => {
   const requested = modelRef(input.view.requestedModel);
   const actual = modelRef(input.view.actualModel);
-  const stored = input.state.run.implementerRuntime;
+  const stored = input.state.run.actualModel;
   const requestedConflict =
     stored !== undefined &&
     requested !== null &&
@@ -169,8 +169,8 @@ const runtimeObservation = (input: {
   const actualConflict =
     stored !== undefined &&
     actual !== null &&
-    stored.actual !== null &&
-    !sameReportedModel(stored.actual, input.view.actualModel ?? null);
+    stored.model !== null &&
+    !sameReportedModel(stored.model, input.view.actualModel ?? null);
   const nextRequested =
     stored === undefined
       ? requested
@@ -178,15 +178,11 @@ const runtimeObservation = (input: {
         ? requested
         : null;
   const nextActual =
-    stored === undefined ? actual : !actualConflict && stored.actual === null ? actual : null;
+    stored === undefined ? actual : !actualConflict && stored.model === null ? actual : null;
   if (nextRequested === null && nextActual === null) return null;
   const run = input.state.run;
   const suffix =
-    stored === undefined
-      ? "implementer"
-      : nextActual !== null
-        ? "implementer-actual"
-        : "implementer-requested";
+    stored === undefined ? "model" : nextActual !== null ? "model-actual" : "model-requested";
   return {
     idempotencyKey: `runtime-${input.taskId}-${run.generation}-${suffix}`,
     event: {
@@ -195,7 +191,6 @@ const runtimeObservation = (input: {
       attemptId: input.attemptId,
       generation: run.generation,
       leaseId: run.leaseId,
-      role: "implementer",
       requested: nextRequested,
       actual: nextActual,
     },

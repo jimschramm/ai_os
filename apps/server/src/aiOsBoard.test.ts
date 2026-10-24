@@ -49,6 +49,7 @@ const idleReviews: AiOsAntigravity.AntigravityReviews["Service"] = {
   watch: () => Effect.succeed(null),
   cancel: () => Effect.succeed("already_stopped"),
   recover: () => Effect.succeed({ status: "stopped" as const }),
+  sweep: () => Effect.void,
 };
 
 const allowRuns: AiOsBoard.BoardRuns["Service"] = {
@@ -1172,7 +1173,7 @@ describe("ai-os board route", () => {
         });
       },
     });
-    for (const [index, event] of happyPathEvents.slice(0, 9).entries()) {
+    for (const [index, event] of happyPathEvents.slice(0, 8).entries()) {
       const posted = await postJson(handler, ADAPTER_BOARD_EVENT_PATH, {
         taskId: "task-usba-page",
         title: "Tournament page",
@@ -1371,8 +1372,13 @@ describe("ai-os board route", () => {
     let processRunning = true;
     let worktree = true;
     let stopSignals = 0;
+    let swept = 0;
     const reviews = {
       ...idleReviews,
+      sweep: () => {
+        swept += 1;
+        return Effect.void;
+      },
       start: () => {
         starts += 1;
         return Effect.succeed({ status: "running" as const, runId: `agy-run-${starts}` });
@@ -1446,6 +1452,7 @@ describe("ai-os board route", () => {
     const recovered = (await readCards(second.handler)).find((item) => item.taskId === "task-agy");
     expect(recovered?.state.phase).toBe("recovery_pending");
     expect(recovered?.threadId).toBeNull();
+    expect(swept).toBe(1);
     expect(stopSignals).toBe(0);
     expect(worktree).toBe(true);
     const blocked = await postJson(second.handler, ADAPTER_BOARD_MOVE_PATH, {

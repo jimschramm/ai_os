@@ -1,5 +1,5 @@
 // @effect-diagnostics nodeBuiltinImport:off
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { lstatSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { mkdtemp, mkdir, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -18,6 +18,7 @@ import {
   resolveModelChoice,
   reviewArguments,
   runAdvisoryReview,
+  sweepAdvisoryIsolation,
   type CliSpawner,
   type SpawnedCli,
 } from "./antigravity.ts";
@@ -405,6 +406,55 @@ describe("antigravity advisory review", () => {
       expect(second.status).toBe("completed");
       expect(await git(["worktree", "list", "--porcelain"], repo)).not.toContain(isolation);
       expect(await readdir(isolation).catch(() => [])).toEqual([]);
+    });
+  });
+
+  it("sweeps a leftover read-only worktree and stops the recorded child", async () => {
+    await withRepo(async ({ repo, sha }) => {
+      const isolation = path.join(path.dirname(repo), "isolation");
+      const attempt = path.join(isolation, "attempt01");
+      const source = path.join(attempt, "source");
+      await git(["worktree", "add", "--detach", source, sha], repo);
+      await new Promise<void>((resolve, reject) => {
+        execFile("chmod", ["-R", "a-w", source], (error) => (error ? reject(error) : resolve()));
+      });
+      const pid = await new Promise<number>((resolve, reject) => {
+        const parent = spawn(
+          process.execPath,
+          [
+            "-e",
+            "const {spawn}=require('node:child_process'); const child=spawn(process.execPath,['-e','setInterval(()=>{},1e9)'],{detached:true,stdio:'ignore'}); child.unref(); process.stdout.write(String(child.pid));",
+          ],
+          { stdio: ["ignore", "pipe", "ignore"] },
+        );
+        let out = "";
+        parent.stdout?.on("data", (chunk: Buffer) => {
+          out += chunk.toString();
+        });
+        parent.on("exit", (code) => {
+          const parsed = Number(out.trim());
+          if (code === 0 && Number.isInteger(parsed)) resolve(parsed);
+          else reject(new Error("The orphan child did not start."));
+        });
+      });
+      try {
+        expect(await sweepAdvisoryIsolation({ root: isolation, pid })).toBe(true);
+        let alive = true;
+        try {
+          process.kill(pid, 0);
+        } catch {
+          alive = false;
+        }
+        expect(alive).toBe(false);
+        expect(await git(["worktree", "list", "--porcelain"], repo)).not.toContain(source);
+        expect(await readdir(isolation).catch(() => [])).toEqual([]);
+      } finally {
+        try {
+          process.kill(pid, "SIGKILL");
+        } catch {
+          // The sweep already stopped it.
+        }
+      }
     });
   });
 
